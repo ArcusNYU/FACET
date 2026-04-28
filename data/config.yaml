@@ -1,0 +1,13 @@
+datasets:
+  - name: openvid
+    # TODO: config hyper-params
+    # config: data/openvid/config.yaml
+    # split: data/openvid/splits/train.json
+    train_per_epoch: 1.0 # ratio
+    valid_per_epoch: 0.4 # ratio
+    weight: 1.0
+  # - name: another_xxx
+  #   config: data/another_xxx/config.yaml
+  #   split: data/another_xxx/splits/train.json
+  #   weight: 0.3
+
