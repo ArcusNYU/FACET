@@ -3,9 +3,11 @@ Video / mask / ref-image transforms.
 
 Keypoints:
 - VideoTfm:  numpy [T,H,W,3] uint8 -> torch [T,3,H,W] float in [-1, 1]
+             aspect-ratio preserving resize + black pad (handles portrait sources)
 - MaskPerturb: numpy [T,H,W]  uint8  -> torch [T,1,H,W] float in {0,1}
+               same perturb params shared across all T frames
 - RefTfm:    numpy [H,W,3]  uint8  -> torch [3,H,W] float in [-1, 1]
-- ref background enhancement is placed in RefSampler, here only does geometry + normalization
+- ref background augmentation lives in RefSampler, here only geometry + normalization
 """
 
 from __future__ import annotations
@@ -16,10 +18,7 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-# TODO: 写一个constants.py在work_root 即 Facet文件夹里面
-# 里面放一些针对视频的长宽值以及帧数 fps 等 例如默认视频需要被normalized到h=480 w=832 
-# 然后对于reference image 默认normalized到h=480 w=480 square 符合OmniControl的风格
-# 另外 transform需要的超参数 就放置在 data文件夹中 因为好像处理mask和video的transform是共享的
+
 
 def _norm(t: torch.Tensor) -> torch.Tensor:
     """uint8 [0, 255] -> float [-1, 1].
@@ -29,9 +28,44 @@ def _norm(t: torch.Tensor) -> torch.Tensor:
     return t.float().div_(127.5).sub_(1.0)
 
 
+def _fit_pad(x: torch.Tensor, th: int, tw: int, mode: str) -> torch.Tensor:
+    """Aspect-ratio preserving resize to fit inside (th, tw), then center-pad with 0.
+
+    Args:
+        x:  [N, C, H, W] float tensor
+        th, tw: target height / width
+        mode: "bilinear" for video/ref, "nearest" for mask
+    Returns:
+        [N, C, th, tw] float tensor, 0-padded on the short side
+    """
+    _, _, h, w = x.shape
+    if h == th and w == tw:
+        return x
+    # choose the larger scale that still fits inside the target box
+    # resulting in padding instead of cropping  
+    s = min(th / h, tw / w)  # larger side has smaller scaling factor
+    nh, nw = int(round(h * s)), int(round(w * s))
+    # avoid 0-sized edges from extreme ratios:
+    nh = max(nh, 1)
+    nw = max(nw, 1)
+    if mode == "bilinear": # for video/ref  
+        x = F.interpolate(x, (nh, nw), mode="bilinear", align_corners=False, antialias=True)
+    else:                  # for mask
+        x = F.interpolate(x, (nh, nw), mode="nearest")
+    # center pad to (th, tw)
+    pad_h = th - nh
+    pad_w = tw - nw
+    top = pad_h // 2
+    bot = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
+    # F.pad order is (left, right, top, bottom)
+    return F.pad(x, (left, right, top, bot), mode="constant", value=0.0)
+
+
 class VideoTfm:
     """[T,H,W,3] uint8 -> [T,3,H,W] float in [-1,1].
-       transform video from uint8 [0, 255] to float [-1, 1] & resize
+       transform video from uint8 [0, 255] to float [-1, 1] & resize (aspect ratio preserved).
     """
 
     def __init__(self, h: int, w: int):
@@ -46,10 +80,7 @@ class VideoTfm:
         t = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()  # [T, H, W, 3] uint8 -> [T,3,H,W] uint8
         # F.interpolate requires contiguous tensor:
         if t.shape[-2] != self.h or t.shape[-1] != self.w:
-            t = F.interpolate(t.float(), size=(self.h, self.w),
-                              mode="bilinear", align_corners=False, antialias=True)
-        # FIXME: 替换掉F.interpolate 因为视频resize的过程中要尽量保持长宽比 然后再pad到target size 
-        # 否则内容产生严重形变
+            t = _fit_pad(t.float(), self.h, self.w, mode="bilinear")
         else:
             t = t.float()
         return _norm(t)
@@ -66,22 +97,18 @@ class MaskPerturb:
          ensuring that the perturbation amplitude of the black area is continuous when the person walks far away / turns,
          without [flickering] between frames.
     """
+    #NOTE: Mask Perturbation is for simulating user-drawn UI mask imprecision
     def __init__(
         # share the same parameters for all T frames
         self,
         h: int, w: int,
         p_dilate: float = 0.5, # probability of dilating the mask
         p_erode:  float = 0.5, # probability of eroding the mask
-        dilate_range: Tuple[int, int] = (3, 11), # range of dilate kernel size
-        erode_range:  Tuple[int, int] = (3, 7), # range of erode kernel size
+        dilate_range: Tuple[int, int] = (3, 7),  # max ~7px expansion
+        erode_range:  Tuple[int, int] = (3, 5),  # max ~5px shrink
         p_elastic: float = 0.3, # probability of elastic deformation
-        elastic_alpha: float = 30.0, # alpha parameter for elastic deformation
-        elastic_sigma: float = 6.0, # sigma parameter for elastic deformation
-        # FIXME: 超参数的选择是否合理未知 
-        # 需要设置相对较小的值 略微对mask进行扰动 所以需要cursor预设一个较小的值
-        # 所以alpha需要小 sigma偏大 产生轻微的形变就可以了 要不然mask形变太离谱了
-        # 试想一个场景 用户在使用我的模型想要更换一个视频中人物的衣物 它在UI界面通过涂抹选择了区域
-        # 这个区域不会很离谱 但肯定不会完全与衣物的轮廓接口 所以这里的mask perturbation就是在模拟这种情况
+        elastic_alpha: float = 8.0,   # amplitude -> small for mild distortion
+        elastic_sigma: float = 12.0,  # smoothness -> large for smooth distortion
     ):
         self.h, self.w = h, w
         self.p_dilate, self.p_erode = p_dilate, p_erode
@@ -99,7 +126,7 @@ class MaskPerturb:
         # FIXME: 本身mask就已经是在resize后的基础上进行扰动的 这里再resize一次是否合理? 似乎不需要了
         # 不过如果尺寸相同的话 也不会触发resize 所以先暂时保留
         if m.shape[-2] != self.h or m.shape[-1] != self.w:
-            m = F.interpolate(m, size=(self.h, self.w), mode="nearest")
+            m = _fit_pad(m, self.h, self.w, mode="nearest")
 
         if random.random() < self.p_dilate:
             m = self._dilate(m, self._odd(random.randint(*self.dilate_range)))
@@ -177,7 +204,8 @@ class MaskPerturb:
 
 class RefTfm:
     """[H,W,3] uint8 -> [3,H,W] float in [-1,1]. 
-       default size: 480x480 square
+       default size: 480x480 square.
+       input is expected to be RGB (alpha already consumed upstream by RefSampler).
     """
 
     def __init__(self, size: int = 480):
@@ -186,8 +214,7 @@ class RefTfm:
     def __call__(self, arr: np.ndarray) -> torch.Tensor:
         t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()  # [H,W,3] -> [3,H,W]
         if t.shape[-1] != self.size or t.shape[-2] != self.size:
-            t = F.interpolate(t.unsqueeze(0), size=(self.size, self.size),
-                              mode="bilinear", align_corners=False).squeeze(0)
+            t = _fit_pad(t.unsqueeze(0), self.size, self.size, mode="bilinear").squeeze(0)
         return _norm(t)
 
 

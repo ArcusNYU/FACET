@@ -6,8 +6,8 @@ source: openvid
 # actual data path on the server
 data_root: /mnt/highspeed/users/Arcus/openvid
 
-# split file (train / val)
-split_file: data/openvid/train.json
+# BaseVideoDataset picks {split_dir}/{split}.json based on the split argument.
+split_dir: data/openvid/splits
 
 # video parameters (consistent with prepare.py)
 height: 480
@@ -18,18 +18,17 @@ fps: 24
 # ref parameters (consistent with prepare.py)
 ref_size: 480
 ref_per_clip: 3       # candidate ref number (prepare.py max limit)
-ref_format: jpg       # storage format
+ref_format: png       # RGBA png; alpha=0 on padding, alpha=255 on bbox fg
 
 # mask boundary perturbation (shared across sequences)
 mask_perturb:
-# FIXME: 以下参数除了概率值之外需要调小使得效果更加温和
   p_dilate: 0.5
   p_erode: 0.5
-  dilate_range: [3, 11]
-  erode_range:  [3, 7]
+  dilate_range: [3, 7]
+  erode_range:  [3, 5]
   p_elastic: 0.3
-  elastic_alpha: 30.0 #FIXME: 调小
-  elastic_sigma: 6.0 #FIME: 调大
+  elastic_alpha: 8.0
+  elastic_sigma: 12.0
 
 # reference image background augmentation (within RefSampler during training)
 ref_aug:
@@ -52,18 +51,19 @@ prepare:
   # ==== a. Parsing ====
   # parsing model:
   schp_model: weights/SCHP/schp.pth
-  # schp_dataset: lip FIXME: 不需要这个 无关 
   schp_size: 473
   lip_label_ids: [5, 7]          # Upper-clothes(5), Coat(7); merged into single mask
   temporal_smooth_k: 3           # mask temporal median filter window
 
   # ==== b. Caption ====
   # caption filtering model:
-  nli_model: weights/NLI/onnx/model.onnx
+  nli_model_dir: weights/NLI
+  nli_onnx: model.onnx
+  nli_batch_size: 128            # caption batch per onnx run (A100 up)
 
   # ==== c. Reference Image ====
   ref_candidates_k: 3            # stored ref jpg number
-  ref_pad_ratio: 0.20            # bbox outer padding ratio FIXME: 调小
+  ref_pad_ratio: 0.10            # bbox outer padding ratio (then square pad then resize)
   # 1) computer vision Metrics:
   cv_min_size:                   # ref candidate 1st layer filter: bbox minimum side
     face:          96
@@ -73,18 +73,16 @@ prepare:
     hat:           64
     person:        192
   cv_mask_ratio:                 # ref candidate 1st layer filter: mask ratio within bbox
-    # FIXME: 以下内容的上限调整至 0.95???? 或者甚至1??? 这些值的推荐范围是否合理
     face:          [0.30, 0.90]
     upper_clothes: [0.20, 0.85]   
     pants:         [0.20, 0.85]
     dress:         [0.25, 0.90]
     hat:           [0.15, 0.80]
     person:        [0.30, 0.90]
-  # 2) quality evaluation model:
-  iqa_model: weights/CLIP-IQA/CLIP-IQA.pth
-  iqa_thresh: 0.10               # CLIP-IQA quality score threshold
+  # 2) quality evaluation model (pyiqa + MANIQA):
+  iqa_metric: maniqa
+  iqa_model: weights/MANIQA/maniqa.pt
+  iqa_thresh: 0.30               # MANIQA score threshold; empirically ~0.3 is a safe floor
   # 3) semantic analysis model:
   vlm_dir: weights/Qwen8B
-  vlm_prompt: data/openvid/prompt.txt
- 
-  
+  vlm_prompt: data/openvid/pipeline/prompt.txt

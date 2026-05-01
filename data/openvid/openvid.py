@@ -3,13 +3,13 @@ OpenVidDataset: https://huggingface.co/datasets/Owen777/HQ-OpenHumanVid/tree/mai
 
 Dataset Layout (dataset_root):
     clips/{part}/{ab}/{cd}/{clip_id}/
-        {clip_id}.mp4    raw normalized video (832x480, 24fps, >=81f, not blacked out)
+        {clip_id}.mp4    raw normalized video (832x480 target, aspect-preserving + pad, 24fps, >=81f, not blacked out)
         masks.npz        uint8 [T,H,W] binary mask
         meta.json        caption / category / ref_candidates / scores
         ref_imgs/
-            *.jpg        tight bbox + pad + square pad + resize to 480x480
+            *.png        RGBA: bbox fg alpha=255, padding region alpha=0; 480x480
 
-train.json / val.json schema:
+splits/train.json, splits/val.json schema:
     {
       "clips": [
         {"id": "f605...", "part": "part_001"}, the first 4 characters of clip_id are 2 hash index
@@ -37,12 +37,12 @@ class OpenVid(BaseVideoDataset):
     def _build_index(self) -> List[Dict[str, str]]:
         """index list of the dataset clips
            e.g. [{"id": "f605...", "part": "part_001"}, ...]
+        split_dir holds {train.json, val.json}; 
         """
-        with open(self.cfg.split_file, "r", encoding="utf-8") as f:
+        split_path = Path(self.cfg.split_dir) / f"{self.split}.json"
+        with open(split_path, "r", encoding="utf-8") as f:
             split = json.load(f)
         return split["clips"]
-        # NOTE: 这里的split_file到底是train.json还是val.json还是manifest.json????
-        # 意味着在训练和验证的时候 需要使用不同的split_file? 然后通过BaseVideoDataset类实例化一个 train_dataset和val_dataset?
 
     def _load(self, idx: int) -> Dict[str, Any]: # idx -> from global sampler index
         item = self.items[idx]  
@@ -53,14 +53,16 @@ class OpenVid(BaseVideoDataset):
             meta = json.load(f)
 
         video = self._read_video(d / f"{cid}.mp4", self.cfg.num_frames)  # [T,H,W,3] uint8
+        # masks.npz is a zip archive produced by np.savez_compressed(path, mask=arr);
+        # np.load returns an NpzFile mapping, so ["mask"] pulls the array back out.
+        # zlib-compressed .npz beats per-frame png sequence on both inode count and IO.
         mask  = np.load(d / "masks.npz")["mask"]                         # [T,H,W] uint8
-        # TODO: 这里为什么会有一个["mask"]索引?
         T = video.shape[0]
         if mask.shape[0] != T:
             # mask & video shape mismatch: truncate mask to video length
             mask = mask[:T]
 
-        ref_pool = sorted((d / "ref_imgs").glob("*.jpg"))
+        ref_pool = sorted((d / "ref_imgs").glob("*.png"))
 
         out: Dict[str, Any] = {
             "clip_id": cid,
@@ -84,6 +86,7 @@ class OpenVid(BaseVideoDataset):
         p = Path(self.cfg.latent_cache_dir) / cid[:2] / cid[2:4] / f"{cid}.pt"
         if not p.exists():
             return {}
+        # weights_only=True: safe load since cache only contains tensors.
         d = torch.load(p, map_location="cpu", weights_only=True)
         return {"tgt_latent": d.get("tgt_latent"), "t5_emb": d.get("t5_emb")}
 

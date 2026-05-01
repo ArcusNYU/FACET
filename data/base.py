@@ -17,8 +17,15 @@ from data.ref_sampler import RefSampler
 
 
 class BaseVideoDataset(Dataset):
-    def __init__(self, cfg, transforms: TfmBundle, ref_sampler: RefSampler):
+    def __init__(
+        self,
+        cfg,
+        transforms: TfmBundle,
+        ref_sampler: RefSampler,
+        split: str = "train",
+    ):
         self.cfg = cfg
+        self.split = split
         self.tfm = transforms                      # mask perturb + resize + normalize
         self.ref_sampler = ref_sampler             # reference image sampling strategy
         self.items: List[Any] = self._build_index()# List[clip_id]
@@ -29,8 +36,6 @@ class BaseVideoDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         meta = self._load(idx)
         video = self.tfm.video(meta["video"])           # [T,3,H,W] in [-1,1], clean target
-        #FIXME: 在使用prepare.py对数据盘中数据集进行转换的时候 可能已经进行了resize 但是不一定转成[-1,1]
-        #所以这里依然可以保留 因为进入self.tfm.video的时候会自动跳过resize
         mask  = self.tfm.mask(meta["mask"])             # [T,1,H,W] in {0,1} unified perturbated mask sequence
         masked_video = video * (1.0 - mask)             # [T,3,H,W] on-time mask
 
@@ -64,20 +69,20 @@ class BaseVideoDataset(Dataset):
 
     def _load(self, idx: int) -> Dict[str, Any]:
         """
-        子类返回原始资产字典:
+        subclass returns raw asset dictionary:
             {
               "clip_id": str, "source": str, "path": str,
               "video":   np.ndarray [T,H,W,3] uint8,
               "mask":    np.ndarray [T,H,W]   uint8,
-              "ref_pool":List[Path],            # 候选 ref jpg 路径
+              "ref_pool":List[Path],            # candidate ref jpg paths
               "caption": str,
               "category":str,
-              # 可选: "tgt_latent": Tensor, "t5_emb": Tensor
+              # optional: "tgt_latent": Tensor, "t5_emb": Tensor
             }
         """
         raise NotImplementedError
 
-    # ---- 缓存可选 ---------------------------------------------------------
+    # ---- optional cache loading ---------------------------------------------------------
     def _load_cache(self, cid: str) -> Dict[str, Any]:
-        """latent_cache 默认空; 子类可覆盖, 命中则返回 {tgt_latent, t5_emb}."""
+        """latent_cache is empty by default; subclass can override, return {tgt_latent, t5_emb} if hit."""
         return {}

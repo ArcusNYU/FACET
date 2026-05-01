@@ -2,6 +2,8 @@
 CLIP-IQA/
 DiffSynth/
 OminiControl/
-SCHP/
+# SCHP/
 WAN/
 weights/
+
+schp_results/
