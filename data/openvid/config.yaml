@@ -32,9 +32,8 @@ mask_perturb:
 
 # reference image background augmentation (within RefSampler during training)
 ref_aug:
-  p_keep: 0.4
-  p_solid: 0.3
-  p_distract: 0.3
+  p_solid: 0.5
+  p_distract: 0.5
 
 # latent cache 
 latent_cache: True
@@ -46,12 +45,13 @@ prepare:
   raw_video_root: /mnt/highspeed/users/Arcus/OPENVID_DATA  
   out_root: /mnt/highspeed/users/Arcus/openvid             # = data_root
   index_file: index.jsonl
-  category: upper_clothes        # MVP: upper clothes TODO: 后期实验继续添加???
+  category: upper_clothes        # TODO: 后期实验继续添加 MVP: upper clothes  
   
   # ==== a. Parsing ====
   # parsing model:
   schp_model: weights/SCHP/schp.pth
-  schp_size: 473
+  # schp_size: 473
+  schp_batch: 32                 # frames per SCHP forward; A100 80GB can take 81 if memory permits
   lip_label_ids: [5, 7]          # Upper-clothes(5), Coat(7); merged into single mask
   temporal_smooth_k: 3           # mask temporal median filter window
 
@@ -63,7 +63,7 @@ prepare:
 
   # ==== c. Reference Image ====
   ref_candidates_k: 3            # stored ref jpg number
-  ref_pad_ratio: 0.10            # bbox outer padding ratio (then square pad then resize)
+  ref_pad_ratio: 0.2            # bbox outer padding ratio (then square pad then resize)
   # 1) computer vision Metrics:
   cv_min_size:                   # ref candidate 1st layer filter: bbox minimum side
     face:          96

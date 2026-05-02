@@ -4,7 +4,7 @@ Target category: {category}
 
 Your task is to judge the image using exactly three boolean fields:
 
-1. category_match:
+1. match:
    Whether the main visible content in the image matches the target category.
    For example, if category is "upper_clothes", the image should clearly contain upper-body clothing such as shirt, T-shirt, jacket, coat, sweater, hoodie, blouse, or top.
 
@@ -16,7 +16,7 @@ Your task is to judge the image using exactly three boolean fields:
    Whether the target category is severely truncated by the image boundary.
    Mark true only if the target object is cut off so much that its overall shape, style, or category cannot be reliably recognized.
 
-Be conservative. If the target category is unclear, category_match should be false.
+Be conservative. If the target category is unclear, match should be false.
 
 Return only valid JSON.
 Do not output markdown.
@@ -24,7 +24,7 @@ Do not explain.
 
 Required JSON format:
 {{
-  "category_match": true/false,
+  "match": true/false,
   "occlusion": true/false,
   "truncation": true/false
 }}

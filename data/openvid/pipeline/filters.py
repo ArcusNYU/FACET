@@ -1,18 +1,21 @@
 """
 Dataset Pipeline Step 1: caption-level single-person filter.
+Reference: https://huggingface.co/cross-encoder/nli-deberta-v3-small
 
 Stage 1 (regex, ~free):
-    Fast rule-based scan on caption. Reject captions hitting MULTI patterns,
-    accept captions hitting SINGLE patterns. Unmatched captions fall through.
+    Reject captions hitting MULTI patterns (over-reject is preferred).
+    Only "single"/"alone"/"solo" is treated as a confident single-person signal;
+    every other potentially-single phrase falls through to NLI because
+    "a man, ..., with a woman" can fool simple keyword rules.
 
 Stage 2 (NLI, ~ms on A100 with big batch):
-    Run a batched ONNX NLI model (cross-encoder/nli-DeBerta-v3-small) on the
-    un-decided captions. 
+    Run a batched ONNX NLI model (cross-encoder/nli-DeBerta-v3-small).
+    Hypotheses and thresholds are LOCKED, do not edit.
 
 Output:
-    Same CSV with an extra `single` column (True/False). Original columns
-    (including trailing empty padding columns in the HQ-OpenHumanVid header)
-    are preserved; rogue `Unnamed:` columns are dropped.
+    `<stem>.single.csv` next to the input csv (or under --out-dir),
+    with an extra `single` column (True/False) and the original columns preserved. 
+    Trailing `Unnamed:` padding columns are dropped.
 
 This script is meant to be run ONCE per CSV before prepare.py.
 """
@@ -27,6 +30,8 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from data.utils import load_cfg
 
 
 # ---- Stage 1: regex pre-filter ----
@@ -50,18 +55,9 @@ MULTI_PATTERNS = [
     r"\bcouple\b",
 ]
 
+# Only "single"/"alone"/"solo" is reliable: e.g. "a single woman ..." or "single individual".
 SINGLE_PATTERNS = [
     r"\bsingle\b",
-    r"\bone person\b",
-    r"\bone individual\b",
-    r"\bone man\b",
-    r"\bone woman\b",
-    r"\ba man\b",
-    r"\ba woman\b",
-    r"\ba male figure\b",
-    r"\ba female figure\b",
-    r"\ba single male figure\b",
-    r"\ba single female figure\b",
     r"\balone\b",
     r"\bsolo\b",
 ]
@@ -73,8 +69,8 @@ _SINGLE_RE = [re.compile(p) for p in SINGLE_PATTERNS]
 def caption_rule(caption: str) -> Optional[bool]:
     """Fast regex-based pre-filter.
     Returns:
-        True  -> confidently single person
-        False -> confidently multi person
+        True  -> confidently single person (mentions "single ...")
+        False -> confidently multi person  (matched MULTI_PATTERNS)
         None  -> undecided, send to NLI
     MULTI takes precedence over SINGLE (prefer over-reject over letting multi in).
     """
@@ -83,8 +79,6 @@ def caption_rule(caption: str) -> Optional[bool]:
         if r.search(c):
             return False
     for r in _SINGLE_RE:
-    # FIXME: 如果仅凭存在 single 来判定 还是会出现误判的情况 因为可能描述one person 结果后面出现一个 accompany by someone else / with 的描述 
-    # 所以只能判断 multiple pattern 来预先排除 剩下的交给NLI  我觉得唯一能锁定的就是  "single" 或者 singe xxx 的表述 才能断定单人 其他都不行
         if r.search(c):
             return True
     return None
@@ -93,7 +87,7 @@ def caption_rule(caption: str) -> Optional[bool]:
 # ---- Stage 2: NLI batch inference ----
 class SinglePersonNLI:
     """
-    Both Positive and Negative Hypotheses, and threshod values can NOT be changed in any condition if specified.
+    Both Positive and Negative Hypotheses, and threshold values must NOT be changed in any condition if specified.
     """
 
     POSITIVE_HYPOTHESES = [
@@ -133,11 +127,11 @@ class SinglePersonNLI:
             if provider == "cuda"
             else ["CPUExecutionProvider"]
         )
-        onnx_path = str(Path(model_dir) / "onnx" / onnx_filename) if (Path(model_dir) / "onnx" / onnx_filename).exists() \
-                    else str(Path(model_dir) / onnx_filename)
+        path = Path(model_dir) / "onnx" / onnx_filename
+        onnx_path = str(path) if path.exists() else str(Path(model_dir) / onnx_filename)
         self.session = ort.InferenceSession(onnx_path, providers=providers)
+        # Enquiry standard input names of the specified ONNX model:
         self.input_names = [x.name for x in self.session.get_inputs()]  
-        # Enquiry standard input names of the specified ONNX model
 
     @staticmethod
     def _softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -155,7 +149,7 @@ class SinglePersonNLI:
         )
         ort_inputs = {n: encoded[n] for n in self.input_names if n in encoded}
         logits = self.session.run(None, ort_inputs)[0]
-        return self._softmax(logits, axis=-1) # p_contrdict + p_entail + p_neutral = 1 
+        return self._softmax(logits, axis=-1)  # p_contradict + p_entail + p_neutral = 1
 
     def is_single_batch(self, captions: List[str]) -> List[bool]:
         """Batched equivalent of is_single_person_video_caption in nli.py."""
@@ -185,7 +179,7 @@ class SinglePersonNLI:
         pos_score = pos_ent.max(axis=-1)               # [N]
         neg_score = neg_ent.max(axis=-1)               # [N]
 
-        sinigle = (
+        single = (
             (pos_score >= self.POSITIVE_THRESHOLD) &
             (neg_score <= self.NEGATIVE_THRESHOLD) &
             ((pos_score - neg_score) >= self.MARGIN_THRESHOLD)
@@ -203,7 +197,7 @@ def _drop_unnamed(df: pd.DataFrame) -> pd.DataFrame:
 def annotate_csv(
     csv_path: str,
     out_path: str,
-    nli: Optional[SinglePersonNLI],
+    nli: SinglePersonNLI,
     batch_size: int = 128,
     caption_col: str = "caption",
     out_col: str = "single",
@@ -231,11 +225,9 @@ def annotate_csv(
         pending_idx = list(range(N))
 
     if pending_idx:
-        if nli is None:
-            raise RuntimeError("NLI model required: regex left captions undecided but nli=None.")
         pending = [captions[i] for i in pending_idx]
         out_vals: List[bool] = []
-        for j in tqdm(range(0, len(pending), batch_size), # batch processing in case of OOM
+        for j in tqdm(range(0, len(pending), batch_size),  # batch processing in case of OOM
                       desc=f"NLI {Path(csv_path).name}"):
             out_vals.extend(nli.is_single_batch(pending[j:j + batch_size]))
         for i, r in zip(pending_idx, out_vals):
@@ -266,33 +258,26 @@ def _expand(pattern: str) -> List[str]:
 
 def main():
     p = argparse.ArgumentParser("Annotate HQ-OpenHumanVid CSVs with a `single` column")
-    p.add_argument("--csv", required=True,
-                   help="csv path or glob, e.g. /path/OpenHumanVid_part_*.csv")
-    p.add_argument("--out-dir", default=None,
-                   help="output directory; default: same as input, name=<stem>.single.csv")
-    p.add_argument("--batch", type=int, default=128,
-                   help="captions per NLI forward; bump to 512+ on A100")
-    p.add_argument("--model-dir", default="weights/NLI")
-    p.add_argument("--onnx", default="model.onnx")
+    p.add_argument("--config", default="data/openvid/config.yaml",
+                   help="dataset config; uses cfg.prepare.{csv_glob,nli_model_dir,nli_onnx,nli_batch_size}")
+    p.add_argument("--out-dir", default=None, #FIXME: 改为放置到/mnt/highspeed/users/Arcus/openvid 也就是整理后的数据集中 也就是 config.yaml 中的 out_root
+                   help="output directory; default: same as each input csv. filename: <stem>.single.csv")
     p.add_argument("--provider", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--no-regex", action="store_true",
                    help="disable regex pre-filter, send all captions to NLI")
-    p.add_argument("--dry-run", action="store_true",
-                   help="run regex only, do not load NLI")
     args = p.parse_args()
 
-    paths = _expand(args.csv)
+    cfg = load_cfg(args.config).prepare
+    paths = _expand(cfg.csv_glob)
     if not paths:
-        raise FileNotFoundError(f"No csv matched: {args.csv}")
+        raise FileNotFoundError(f"No csv matched: {cfg.csv_glob}")
 
-    nli = None
-    if not args.dry_run:
-        print(f"[filters] loading NLI from {args.model_dir} ({args.provider})")
-        nli = SinglePersonNLI(
-            model_dir=args.model_dir,
-            onnx_filename=args.onnx,
-            provider=args.provider,
-        )
+    print(f"[filters] loading NLI from {cfg.nli_model_dir} ({args.provider})")
+    nli = SinglePersonNLI(
+        model_dir=cfg.nli_model_dir,
+        onnx_filename=cfg.nli_onnx,
+        provider=args.provider,
+    )
 
     all_stats = []
     for csv_path in paths:
@@ -303,7 +288,7 @@ def main():
             csv_path=csv_path,
             out_path=str(out_path),
             nli=nli,
-            batch_size=args.batch,
+            batch_size=int(cfg.nli_batch_size),
             use_regex=not args.no_regex,
         )
         all_stats.append(stats)
