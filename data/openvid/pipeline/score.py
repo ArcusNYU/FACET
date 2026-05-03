@@ -2,14 +2,14 @@
 Dataset Pipeline Step 3 (per-clip): ref-frame candidate scoring.
 Reference: https://github.com/chaofengc/IQA-PyTorch, https://github.com/iigroup/maniqa, https://github.com/QwenLM/Qwen3-VL
 
-3 Layers workflow:
-L1 cv_check       : pure rule check on bbox size + mask coverage. zero model.
-L2 IqaScorer      : pyiqa + MANIQA (loaded from local weights/MANIQA/maniqa.pt).
-                    HF env vars are forced to OFFLINE before pyiqa import to
-                    prevent it from trying to fetch default weights at runtime.
-L3 VlmFilter      : Qwen3-VL-8B-Instruct judge on (image, category) -> dict.
-                    Prompt is loaded once from data/openvid/pipeline/prompt.txt
-                    and `{category}` is interpolated per-call.
+3 Layers workflow: applied in order per random-sampled candidate frame.
+L1 cv_check  : pure-rule check on bbox side + mask coverage ratio. zero model.
+L2 IqaScorer : pyiqa + MANIQA (loaded from local weights/MANIQA/maniqa.pt).  
+               HF env vars are forced OFFLINE before pyiqa import so it doesn't 
+               try to fetch the upstream MANIQA weight at runtime.
+L3 VlmFilter : Qwen3-VL-8B-Instruct judge. Prompt template loaded once from
+               data/openvid/pipeline/prompt.txt; `{category}` is interpolated
+               per-call so the same VLM can serve multiple target categories.
 
 All three components are stateful classes; instantiate once per process.
 """
@@ -24,9 +24,8 @@ os.environ.setdefault("TIMM_USE_OLD_CACHE", "1")
 
 import json
 import re
-import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 from PIL import Image
@@ -55,7 +54,7 @@ def cv_check(
 
 # ---- L2: IQA via pyiqa MANIQA ----
 class IqaScorer:
-    """pyiqa + MANIQA wrapper. score(rgb_uint8) -> float in [0,1]."""
+    """pyiqa + MANIQA wrapper. score(rgb_uint8) -> float."""
 
     def __init__(
         self,
@@ -67,39 +66,24 @@ class IqaScorer:
         import torch
         import pyiqa
 
-        custom_opts = {"test_sample": test_sample, "pretrained": False}
-        self.metric = pyiqa.create_metric(metric, device=torch.device(device), **custom_opts)
-
-        ckpt = torch.load(str(weight_path), map_location="cpu", weights_only=False)
-        weight_keys = self._infer_weight_keys(ckpt)
-        self.metric.load_weights(str(weight_path), weight_keys=weight_keys)
+        self.device = torch.device(device)
+        self.metric = pyiqa.create_metric(
+            metric, device=self.device, test_sample=test_sample, pretrained=False,
+        )
+        # Original MANIQA release weights are a flat state_dict (no pyiqa wrapper) -> weight_keys=None.
+        self.metric.load_weights(str(weight_path), weight_keys=None)
         self.metric.eval()
 
-    @staticmethod
-    def _infer_weight_keys(ckpt) -> Optional[str]:
-        """Detect which top-level key holds the state_dict in a pyiqa-trained ckpt.
-        Falls back to None when ckpt itself is already a flat state_dict.
-        """
-        if isinstance(ckpt, dict):
-            for key in ["params", "state_dict", "model", "net"]:
-                if key in ckpt and isinstance(ckpt[key], dict):
-                    return key
-        return None
-
     def score(self, img: np.ndarray | str | Path) -> float:
-        """Accept either an [H,W,3] uint8 array or a path-like to an image file."""
+        """Accept either an [H,W,3] uint8 RGB array or a path-like to an image file."""
         import torch
         if isinstance(img, np.ndarray):
-            # MANIQA internally crops to 224x224
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                tmp = f.name
-            try:
-                Image.fromarray(img).save(tmp) # pyiqa.metric() requires a path input
-                with torch.inference_mode():
-                    s = self.metric(tmp)
-            finally:
-                try: os.unlink(tmp)
-                except OSError: pass
+            # [H,W,3] uint8 -> [1,3,H,W] float in [0,1]
+            t = (torch.from_numpy(img)
+                    .float().permute(2, 0, 1).unsqueeze(0).div_(255.0)  #TODO: ?????
+                    .to(self.device))
+            with torch.inference_mode():
+                s = self.metric(t)
         else:
             with torch.inference_mode():
                 s = self.metric(str(img))

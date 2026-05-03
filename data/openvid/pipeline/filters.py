@@ -259,9 +259,11 @@ def _expand(pattern: str) -> List[str]:
 def main():
     p = argparse.ArgumentParser("Annotate HQ-OpenHumanVid CSVs with a `single` column")
     p.add_argument("--config", default="data/openvid/config.yaml",
-                   help="dataset config; uses cfg.prepare.{csv_glob,nli_model_dir,nli_onnx,nli_batch_size}")
-    p.add_argument("--out-dir", default=None, #FIXME: 改为放置到/mnt/highspeed/users/Arcus/openvid 也就是整理后的数据集中 也就是 config.yaml 中的 out_root
-                   help="output directory; default: same as each input csv. filename: <stem>.single.csv")
+                   help="dataset config; uses cfg.prepare.{csv_glob, weight_dir, "
+                        "nli_model_dir, nli_onnx, nli_batch_size, out_root}")
+    p.add_argument("--out-dir", default=None,
+                   help="output directory for the <stem>.single.csv files. "
+                        "Default: cfg.prepare.out_root (dataset_root on server).")
     p.add_argument("--provider", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--no-regex", action="store_true",
                    help="disable regex pre-filter, send all captions to NLI")
@@ -272,18 +274,23 @@ def main():
     if not paths:
         raise FileNotFoundError(f"No csv matched: {cfg.csv_glob}")
 
-    print(f"[filters] loading NLI from {cfg.nli_model_dir} ({args.provider})")
+    weight_dir = Path(cfg.weight_dir)
+    nli_model_dir = str(weight_dir / cfg.nli_model_dir)
+
+    print(f"[filters] loading NLI from {nli_model_dir} ({args.provider})")
     nli = SinglePersonNLI(
-        model_dir=cfg.nli_model_dir,
+        model_dir=nli_model_dir,
         onnx_filename=cfg.nli_onnx,
         provider=args.provider,
     )
 
+    out_dir_default = Path(args.out_dir) if args.out_dir else Path(cfg.out_root)
+    out_dir_default.mkdir(parents=True, exist_ok=True)
+
     all_stats = []
     for csv_path in paths:
         stem = Path(csv_path).stem
-        out_dir = Path(args.out_dir) if args.out_dir else Path(csv_path).parent
-        out_path = out_dir / f"{stem}.single.csv"
+        out_path = out_dir_default / f"{stem}.single.csv"
         stats = annotate_csv(
             csv_path=csv_path,
             out_path=str(out_path),

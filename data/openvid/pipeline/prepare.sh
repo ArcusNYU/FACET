@@ -13,3 +13,6 @@ python -m data.openvid.pipeline.filters \
 # Stage 2: per-clip preprocessing -> dataset_root/clips/{part}/{ab}/{cd}/{cid}/...
 python -m data.openvid.pipeline.prepare \
     --config "$CFG"
+
+# Stage 2 smoke test:
+python -m data.openvid.pipeline.prepare --config "$CFG" --limit 50

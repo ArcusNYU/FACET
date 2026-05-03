@@ -1,40 +1,56 @@
 """
 Dataset Pipeline Step 4: per-clip materialization.
 
-Reads `<stem>.single.csv` produced by filters.py, keeps rows with `single == True`,
-For each clip:
-  1. resolve raw mp4 path
-       csv path = "clips/{part}/{ab}/{cd}/{cid}"
-       file     = {raw_video_root}/{part}/{ab}/{cd}/{cid}.mp4
-  2. read >=81 frames with decord, take the first num_frames
-  3. resize each frame to (height, width) with aspect-preserving + black pad
-  4. SCHP parse + temporal majority smoothing -> binary mask [T,H,W]
-  5. pick top-K reference frames via cv_check -> IQA -> VLM cascade
-  6. for each kept ref: bbox crop with `ref_pad_ratio` pad, resize and save as RGBA png
-  7. write {cid}.mp4 (raw normalized, NOT masked) + masks.npz + meta.json
-  8. atomic append to index.jsonl, supports resume via existing entries.
+Reads `<stem>.single.csv` produced by filters.py from cfg.out_root,
+keeps rows with `single == True`. For each clip:
+
+  1. Resolve raw mp4 path:
+         csv path = "clips/{part}/{ab}/{cd}/{cid}"     (no extension)
+         file     = {raw_video_root}/{part}/{ab}/{cd}/{cid}.mp4
+  2. Read up to `num_frames * 2` raw frames with decord; first `num_frames`
+     form the tgt segment, the remainder is the ref candidate pool.
+     If the clip only has exactly `num_frames` frames, fall back to sampling
+     ref from the tgt segment itself (noted risk: ref appears in tgt).
+  3. Run SCHP on the RAW frames (not fit-padded), so the parser sees the
+     original content without the black pad region. Then derive binary mask
+     via lip_label_ids + temporal majority smoothing.
+  4. Pick up to `ref_candidates_k` reference frames via cascade:
+         L1 cv_check        (bbox size + mask ratio range)
+         L2 IQA >= iqa_thresh
+         L3 VLM judge       (match=True, occlusion=False, truncation=False)
+     Rejection sampling on random post-tgt indices, cap at ref_max_tries.
+  5. fit_pad the first num_frames of raw video AND raw mask to (height, width)
+     -> tgt video.mp4 (raw normalized, NOT masked) + masks.npz
+  6. Save ref_imgs/{frame_idx:04d}.png (RGBA).
+  7. Write minimal meta.json (no internal QA scores, no scores copy).
+  8. Atomic append to index.jsonl (resume-friendly).
+
+Resume: clip_ids already in index.jsonl are skipped on restart.
+Failure classes (missing_src / short / empty_mask / no_ref / error) are
+counted on stdout but not recorded; they will be re-attempted on restart.
+Model loading cost is amortized over the whole run, so retrying is cheap.
 """
-# TODO: 检查csv读取的位置  检查转出的文件结构是否正确
-# FIXME: 不是对top-k reference frames进行筛选 而是先crop出来然后再进行判断
+
 # TODO: 可能涉及fps重采样
 # TODO: 运行后书写脚本进行数据集特征统计 因为数据分布可能直接训练模型性能
+# TODO: 其他数据集在构建prepare pipeline的时候可能也需要下面某些通用性强的helper函数 到时候需要将它们移动至 /data/helpers.py
+
+# TODO: 检查ref images的resize链路
  
 from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
+import random
 import subprocess
 import sys
-import tempfile
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
-import torch
 from PIL import Image
 from tqdm import tqdm
 
@@ -106,27 +122,33 @@ def write_mp4(frames_rgb: np.ndarray, out_path: Path, fps: int) -> None:
         raise RuntimeError(f"ffmpeg failed: {err.decode(errors='ignore')[:400]}")
 
 
-def read_video(path: Path, num_frames: int, fps: float) -> Optional[np.ndarray]:
-    """Read first num_frames frames as RGB uint8 [T,H,W,3]. Returns None if short / unreadable.
+def read_video(path: Path, min_frames: int, max_frames: int) -> Optional[np.ndarray]:
+    """Read up to max_frames frames as RGB uint8 [T,H,W,3] from the head of the video.
+    Returns None if the video has < min_frames total (too short to provide a tgt).
 
-    fps mismatch: DO NOT resample. The caller is expected to filter on fps
-    via metadata later if needed; HQ-OpenHumanVid is mostly already 24fps-ish.
+    TODO fps resample note:
+        We currently pull frames at the source fps, not the target cfg.fps.
+        HQ-OpenHumanVid clips are mostly ~24fps so the bias is small; a precise
+        fix would either (a) stride-sample int(round(src_fps / target_fps)) or
+        (b) pre-pipe through `ffmpeg -vf fps=target`. Deferred to a later pass.
     """
+    # TODO: 在此添加fps重采样逻辑
     from decord import VideoReader, cpu
     try:
         vr = VideoReader(str(path), ctx=cpu(0))
     except Exception:
         return None
     n = len(vr)
-    if n < num_frames:
+    if n < min_frames:
         return None
-    return vr.get_batch(list(range(num_frames))).asnumpy()
+    take = min(n, max_frames)
+    return vr.get_batch(list(range(take))).asnumpy()
 
 
-def laplacian_sharpness(rgb: np.ndarray) -> float:
-    """Variance of Laplacian on the V channel of HSV; higher = sharper."""
-    g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+# def laplacian_sharpness(rgb: np.ndarray) -> float:
+#     """Variance of Laplacian on the V channel of HSV; higher = sharper."""
+#     g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+#     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 
 # ============================================================
@@ -158,15 +180,16 @@ def build_ref_rgba(
     mask_2d: np.ndarray,           # [H,W]  uint8 in {0,1}
     pad_ratio: float,
     ref_size: int,
-) -> Optional[Tuple[np.ndarray, Tuple[int, int]]]:
+) -> Optional[np.ndarray]:
     """
-    Build the 480x480 RGBA ref image:
+    Build the 480x480 RGBA ref image on [RAW] video:
+    Using raw video and raw mask:
         - tight bbox on mask + outer pad_ratio
         - crop frame and mask
         - square pad (short side -> long side, center, value=0)
         - resize to (ref_size, ref_size)
         - RGB = resized frame; A = resized mask (255 fg, 0 bg)
-    Returns (rgba [H,W,4] uint8, bbox_hw_after_expand) or None when mask is empty.
+    Returns rgba [ref_size,ref_size,4] uint8, or None when the bbox is empty.
     """
     H, W = mask_2d.shape
     bb = mask_bbox(mask_2d)
@@ -174,8 +197,6 @@ def build_ref_rgba(
         return None
     y0, y1, x0, x1 = expand_bbox(bb, H, W, pad_ratio)
     bh, bw = y1 - y0, x1 - x0
-    if bh < 4 or bw < 4:
-        return None
 
     crop_rgb  = frame_rgb[y0:y1, x0:x1]                # [bh, bw, 3]
     crop_mask = mask_2d[y0:y1, x0:x1]                  # [bh, bw]
@@ -194,8 +215,7 @@ def build_ref_rgba(
         sq_rgb   = cv2.resize(sq_rgb,   (ref_size, ref_size), interpolation=cv2.INTER_AREA)
         sq_alpha = cv2.resize(sq_alpha, (ref_size, ref_size), interpolation=cv2.INTER_NEAREST)
 
-    rgba = np.dstack([sq_rgb, sq_alpha])               # [ref_size, ref_size, 4]
-    return rgba, (bh, bw)
+    return np.dstack([sq_rgb, sq_alpha])               # [ref_size, ref_size, 4]
 
 
 # ============================================================
@@ -203,8 +223,8 @@ def build_ref_rgba(
 # ============================================================
 def resolve_raw_mp4(raw_root: Path, csv_path_field: str) -> Path:
     """
-    csv `path` field: "clips/part_001/f6/05/f605b8e9..."
-    raw layout      : {raw_root}/part_001/f6/05/f605b8e9.mp4 (no `clips/` prefix)
+    csv `path` field: "clips/part_001/f6/05/f605b8e9xxx"
+    raw layout      : {raw_root}/part_001/f6/05/f605b8e9xxx.mp4 (no `clips/` prefix)
     """
     rel = csv_path_field
     if rel.startswith("clips/"):
@@ -229,6 +249,7 @@ def out_clip_dir(out_root: Path, part: str, cid: str) -> Path:
 #                       index.jsonl helpers
 # ============================================================
 def read_done_clips(index_path: Path) -> set:
+    """For breakpoint resume support."""
     if not index_path.exists():
         return set()
     done = set()
@@ -249,68 +270,76 @@ def append_jsonl(path: Path, obj: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, ensure_ascii=False) + "\n"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(line)
-        f.flush()
-        os.fsync(f.fileno())
+        f.write(line) # write to python buffer
+        f.flush()     # to OS buffer
+        os.fsync(f.fileno()) # write to disk
 
 
+# TODO: 这里的raw video是否是 [0, 2*n_frames]长度裁剪后的原视频
 # ============================================================
-#                    Per-clip pipeline
+#                    Ref frame rejection sampling
 # ============================================================
-def _ref_pool_for_clip(
-    parsing: np.ndarray,                # [T,H,W] uint8 class ids
-    mask_seq: np.ndarray,               # [T,H,W] uint8 in {0,1}
-    video: np.ndarray,                  # [T,H,W,3] uint8
+def _pick_refs(
+    video_raw: np.ndarray,          # [T_total, H_raw, W_raw, 3] uint8
+    mask_raw: np.ndarray,           # [T_total, H_raw, W_raw]    uint8 in {0,1}
+    candidate_idx: List[int],       # frame indices eligible for ref sampling
     cfg_prepare,
     iqa: IqaScorer,
     vlm: VlmFilter,
+    max_tries: int,
+    target_hw: Tuple[int, int],     # (H_target, W_target), for cv_min_size rescaling  
 ) -> List[Dict[str, Any]]:
-    """Run the L1->L2->L3 cascade across all T frames; return up to ref_candidates_k accepted refs.
-
-    Each accepted entry is a dict with bbox metadata + an in-memory RGBA crop.
+    """Random-sample from candidate_idx until we accept k_keep refs or exhaust max_tries using L1->L2->L3 cascade evaluation.
+    Normally candidate_idx should be an id sequence.
+    Returns list of dicts {"frame_idx": int, "rgba": np.ndarray[H,W,4] uint8}.
     """
-    T, H, W = mask_seq.shape
     cat = cfg_prepare.category
-    ref_size = int(cfg_prepare.ref_size if hasattr(cfg_prepare, "ref_size") else 480)
+    ref_size = int(cfg_prepare.get("ref_size", 480))
     pad_ratio = float(cfg_prepare.ref_pad_ratio)
     k_keep = int(cfg_prepare.ref_candidates_k)
     iqa_thresh = float(cfg_prepare.iqa_thresh)
 
-    cv_min = dict(cfg_prepare.cv_min_size)
+    # cv_min_size is calibrated at target resolution; scale it up to raw resolution
+    # so the "min bbox in target space" semantic holds regardless of raw aspect ratio.
+    Ht, Wt = target_hw
+    Hr, Wr = mask_raw.shape[1:3]
+    s = min(Ht / Hr, Wt / Wr)
+    # cfg.cv_min_size is set for target resolution, scale it up to raw resolution:
+    # this step is necessary cause raw videos can have a variety of aspect ratios and sizes.
+    # so the uniform standards can only be set on target size.
+    raw_cv_min = {k: max(1, int(round(int(v) / max(s, 1e-6))))
+                  for k, v in dict(cfg_prepare.cv_min_size).items()}
+    
     cv_ratio = {k: list(v) for k, v in dict(cfg_prepare.cv_mask_ratio).items()}
+    # candidate_idx is a list of frame indices eligible for ref sampling.
+    # --- L1: cv_check ---
+    accepted: List[Dict[str, Any]] = []
+    pool = list(candidate_idx)
+    random.shuffle(pool)
+    tries = 0
+    for idx in pool:
+        if len(accepted) >= k_keep:
+            break
+        if tries >= max_tries:
+            break
+        tries += 1
 
-    # --- L1: cv_check + sharpness sort ---
-    pre: List[Tuple[int, float, Tuple[int, int, int, int]]] = []  # (idx, sharpness, bbox)
-    for t in range(T):
-        m = mask_seq[t]
+        m = mask_raw[idx]
         bb = mask_bbox(m)
         if bb is None:
             continue
         y0, y1, x0, x1 = bb
         bh, bw = y1 - y0, x1 - x0
-        bbox_pixels = max(bh * bw, 1)
-        mask_pixels = int(m[y0:y1, x0:x1].sum())
-        ratio = mask_pixels / bbox_pixels
-        if not cv_check((bh, bw), ratio, cat, cv_min, cv_ratio):
+        ratio = int(m[y0:y1, x0:x1].sum()) / max(bh * bw, 1)
+        if not cv_check((bh, bw), ratio, cat, raw_cv_min, cv_ratio):
             continue
-        sharp = laplacian_sharpness(video[t])
-        pre.append((t, sharp, (y0, y1, x0, x1)))
 
-    if not pre:
-        return []
-    pre.sort(key=lambda x: x[1], reverse=True)
-    # cap pre-pool to ~3x final K to bound IQA + VLM cost
-    pre = pre[:max(k_keep * 3, k_keep)]
-
-    accepted: List[Dict[str, Any]] = []
-    for idx, sharp, _bb in pre:
-        rgba_meta = build_ref_rgba(video[idx], mask_seq[idx], pad_ratio, ref_size)
-        if rgba_meta is None:
+        rgba = build_ref_rgba(video_raw[idx], m, pad_ratio, ref_size)
+        if rgba is None:
             continue
-        rgba, bbox_hw = rgba_meta
-
         # L2 IQA on RGB only
         rgb_only = rgba[..., :3]
+
         try:
             iqa_score = iqa.score(rgb_only)
         except Exception:
@@ -322,25 +351,24 @@ def _ref_pool_for_clip(
         try:
             v = vlm.judge(rgb_only, category=cat)
         except Exception:
-            v = {"category_match": False, "occlusion": True, "truncation": True}
-        if not v["category_match"] or v["occlusion"] or v["truncation"]:
+            v = {"match": False, "occlusion": True, "truncation": True}
+        if not v["match"] or v["occlusion"] or v["truncation"]:
             continue
 
         accepted.append({
             "frame_idx": int(idx),
-            "sharpness": float(sharp),
-            "iqa": float(iqa_score),
+            "iqa": float(iqa_score), # 不需要
             "bbox_hw": [int(bbox_hw[0]), int(bbox_hw[1])],
-            "vlm": v,
             "rgba": rgba,
         })
-        if len(accepted) >= k_keep:
-            break
 
     return accepted
 
 
-def prepare_one_clip(
+# ============================================================
+#                    Per-clip pipeline
+# ============================================================
+def prepare_clip(
     row: pd.Series,
     cfg,                             # full top-level cfg (for height/width/num_frames/fps)
     cfg_prepare,                     # cfg.prepare
@@ -360,26 +388,37 @@ def prepare_one_clip(
 
     H, W = int(cfg.height), int(cfg.width)
     NF, FPS = int(cfg.num_frames), int(cfg.fps)
+    max_tries = int(cfg_prepare.get("ref_max_tries", 15))
 
-    # 1. read raw video, first NF frames
-    video_raw = read_video(src, NF, fps=FPS)
+    # 1. read raw video -> up to NF*2 frames; tgt = first NF, ref pool = the rest
+    video_raw = read_video(src, min_frames=NF, max_frames=NF * 2)
     if video_raw is None:
         return {"_status": "short_or_unreadable", "clip_id": cid, "path": csv_path_field}
+    T_total = video_raw.shape[0]
 
-    # 2. resize + pad to (H, W)
-    video = fit_pad_video(video_raw, H, W)
-
-    # 3. SCHP parse + binary mask + temporal smooth
-    parsing = schp.parse_video(video)
+    # 2. SCHP on RAW frames (no black pad interference).
+    #    Then fit_pad derived masks so downstream tgt stays at target resolution.
+    parsing_raw = schp.parse_video(video_raw)                            # [T,H_raw,W_raw]
     keep_ids = list(map(int, cfg_prepare.lip_label_ids))
-    mask_seq = SchpParser.select(parsing, keep_ids)
-    mask_seq = SchpParser.smooth(mask_seq, k=int(cfg_prepare.temporal_smooth_k))
+    mask_raw = SchpParser.select(parsing_raw, keep_ids)
+    mask_raw = SchpParser.smooth(mask_raw, k=int(cfg_prepare.temporal_smooth_k))
 
-    if mask_seq.sum() == 0:
+    # 3. fit_pad tgt video + tgt mask (ref crops still come from raw for fidelity)
+    tgt_video = fit_pad_video(video_raw[:NF], H, W)                      # [NF,H,W,3]
+    tgt_mask  = fit_pad_mask(mask_raw[:NF], H, W)                        # [NF,H,W]
+    if tgt_mask.sum() == 0:
         return {"_status": "empty_mask", "clip_id": cid, "path": csv_path_field}
 
-    # 4. pick refs via cascade
-    refs = _ref_pool_for_clip(parsing, mask_seq, video, cfg_prepare, iqa, vlm)
+    # 4. pick refs via random sampling on post-tgt frames;
+    #    fall back to tgt frames if total length == NF (ref appears in tgt risk).
+    if T_total > NF:
+        ref_candidate_idx = list(range(NF, T_total))
+    else:
+        ref_candidate_idx = list(range(NF))
+    refs = _pick_refs(
+        video_raw, mask_raw, ref_candidate_idx,
+        cfg_prepare, iqa, vlm, max_tries=max_tries, target_hw=(H, W),
+    )
     if not refs:
         return {"_status": "no_ref", "clip_id": cid, "path": csv_path_field}
 
@@ -388,12 +427,12 @@ def prepare_one_clip(
     cdir.mkdir(parents=True, exist_ok=True)
 
     # 5.1 video.mp4 (raw normalized, NOT masked)
-    write_mp4(video, cdir / f"{cid}.mp4", fps=FPS)
+    write_mp4(tgt_video, cdir / f"{cid}.mp4", fps=FPS)
 
-    # 5.2 masks.npz
-    np.savez_compressed(cdir / "masks.npz", mask=mask_seq.astype(np.uint8))
+    # 5.2 masks.npz (target space, zlib)
+    np.savez_compressed(cdir / "masks.npz", mask=tgt_mask.astype(np.uint8))
 
-    # 5.3 ref_imgs/{idx:04d}.png (RGBA)
+    # 5.3 ref_imgs/{idx:04d}.png (RGBA, 480x480)
     rdir = cdir / "ref_imgs"
     rdir.mkdir(exist_ok=True)
     ref_meta = []
@@ -401,34 +440,29 @@ def prepare_one_clip(
         Image.fromarray(r["rgba"], mode="RGBA").save(rdir / f"{r['frame_idx']:04d}.png")
         ref_meta.append({
             "frame_idx": r["frame_idx"],
-            "sharpness": r["sharpness"],
-            "iqa":       r["iqa"],
+            "iqa":       r["iqa"], 
             "bbox_hw":   r["bbox_hw"],
-            "vlm":       r["vlm"],
         })
 
-    # 5.4 meta.json
+    # 5.4 meta.json 
+    rel_path = f"clips/{part}/{cid[:2]}/{cid[2:4]}/{cid}"
     meta = {
-        "clip_id":   cid,
-        "source":    "openvid",
-        "part":      part,
-        "src_path":  str(src),
-        "csv_path":  csv_path_field,
-        "n_frames":  NF,
-        "fps":       FPS,
-        "height":    H,
-        "width":     W,
-        "caption":   str(row.get("caption", "")),
-        "category":  cfg_prepare.category,
-        "lip_label_ids": keep_ids,
-        "ref_candidates": ref_meta,
-        "scores": {                                              # carried over from csv if present
+        "clip_id":         cid,
+        "source":          "openvid",
+        "part":            part,
+        "path":            rel_path,        # relative to cfg.data_root
+        "fps":             FPS,
+        "height":          H,
+        "width":           W,
+        "caption":         str(row.get("caption", "")),
+        "category":        cfg_prepare.category,
+        "ref_candidates":  ref_meta,        # frame indices of stored ref pngs
+        "scores": {  # carried over from csv if present
             k: float(row[k]) for k in (
                 "luminance_min", "luminance_max",
                 "blur_min", "blur_max",
                 "aesthetic", "technical_score", "global_motion",
-            ) if k in row and pd.notna(row[k])
-        },
+            ) if k in row and pd.notna(row[k])}
     }
     with open(cdir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -438,7 +472,7 @@ def prepare_one_clip(
         "clip_id": cid,
         "part":    part,
         "n_refs":  len(refs),
-        "path":    f"clips/{part}/{cid[:2]}/{cid[2:4]}/{cid}",
+        "path":    rel_path,
     }
 
 
@@ -466,33 +500,41 @@ def main():
     cfg = cfg_top.prepare
     raw_root = Path(cfg.raw_video_root)
     out_root = Path(cfg.out_root)
+    weight_dir = Path(cfg.weight_dir)
     index_path = out_root / cfg.index_file
 
-    # find single.csv files based on csv_glob
-    csv_pattern = cfg.csv_glob
-    if csv_pattern.endswith(".csv"):
-        single_pattern = csv_pattern[:-len(".csv")] + ".single.csv"
+    # filters.py writes `<stem>.single.csv` under cfg.out_root.
+    csv_pattern_name = Path(cfg.csv_glob).name
+    if csv_pattern_name.endswith(".csv"):
+        single_name = csv_pattern_name[:-4] + ".single.csv"
     else:
-        single_pattern = csv_pattern + ".single.csv"
+        single_name = csv_pattern_name + ".single.csv"
+    single_pattern = str(out_root / single_name)
     csv_paths = _expand_csv_glob(single_pattern)
     if not csv_paths:
         print(f"[prepare] no .single.csv found for pattern {single_pattern}; "
               f"run filters.py first.", file=sys.stderr)
         sys.exit(1)
 
-    # load models once
-    print(f"[prepare] loading SCHP from {cfg.schp_model}")
+    # ---- load models once (resolve all paths against weight_dir) ----
+    schp_path = str(weight_dir / cfg.schp_model)
+    iqa_path  = str(weight_dir / cfg.iqa_model)
+    vlm_path  = str(weight_dir / cfg.vlm_dir)
+
+    print(f"[prepare] loading SCHP from {schp_path}")
     schp = SchpParser(
-        weight_path=cfg.schp_model,
+        weight_path=schp_path,
         device=args.device,
         batch_size=int(args.schp_batch or cfg.get("schp_batch", 32)),
     )
-    print(f"[prepare] loading IQA ({cfg.iqa_metric}) from {cfg.iqa_model}")
-    iqa = IqaScorer(weight_path=cfg.iqa_model, metric=cfg.iqa_metric, device=args.device)
-    print(f"[prepare] loading VLM from {cfg.vlm_dir}")
-    vlm = VlmFilter(model_dir=cfg.vlm_dir, prompt_file=cfg.vlm_prompt)
 
-    # resume support
+    print(f"[prepare] loading IQA ({cfg.iqa_metric}) from {iqa_path}")
+    iqa = IqaScorer(weight_path=iqa_path, metric=cfg.iqa_metric, device=args.device)
+
+    print(f"[prepare] loading VLM from {vlm_path}")
+    vlm = VlmFilter(model_dir=vlm_path, prompt_file=cfg.vlm_prompt)
+
+    # ---- resume ----
     done = read_done_clips(index_path)
     print(f"[prepare] resume: {len(done)} clips already in {index_path}")
 
@@ -511,7 +553,7 @@ def main():
 
         for _, row in tqdm(df.iterrows(), total=len(df), desc=Path(csv_path).name):
             try:
-                res = prepare_one_clip(row, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
+                res = prepare_clip(row, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
             except Exception as e:
                 res = {
                     "_status": "error",
