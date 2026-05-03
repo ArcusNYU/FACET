@@ -1,5 +1,5 @@
 """
-Dataset Pipeline Step 4: per-clip materialization.
+Dataset Pipeline entry point (formerly prepare.py).
 
 Reads `<stem>.single.csv` produced by filters.py from cfg.out_root,
 keeps rows with `single == True`. For each clip:
@@ -22,7 +22,7 @@ keeps rows with `single == True`. For each clip:
   5. fit_pad the first num_frames of raw video AND raw mask to (height, width)
      -> tgt video.mp4 (raw normalized, NOT masked) + masks.npz
   6. Save ref_imgs/{frame_idx:04d}.png (RGBA).
-  7. Write minimal meta.json (no internal QA scores, no scores copy).
+  7. Write minimal meta.json.
   8. Atomic append to index.jsonl (resume-friendly).
 
 Resume: clip_ids already in index.jsonl are skipped on restart.
@@ -33,7 +33,7 @@ Model loading cost is amortized over the whole run, so retrying is cheap.
 
 # TODO: 可能涉及fps重采样
 # TODO: 运行后书写脚本进行数据集特征统计 因为数据分布可能直接训练模型性能
-# TODO: 其他数据集在构建prepare pipeline的时候可能也需要下面某些通用性强的helper函数 到时候需要将它们移动至 /data/helpers.py
+# TODO: 其他数据集在构建pipeline的时候可能也需要下面某些通用性强的helper函数 到时候需要将它们移动至 /data/helpers.py
 
 
 from __future__ import annotations
@@ -142,12 +142,6 @@ def read_video(path: Path, min_frames: int, max_frames: int) -> Optional[np.ndar
         return None
     take = min(n, max_frames)
     return vr.get_batch(list(range(take))).asnumpy()
-
-
-# def laplacian_sharpness(rgb: np.ndarray) -> float:
-#     """Variance of Laplacian on the V channel of HSV; higher = sharper."""
-#     g = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-#     return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
 
 # ============================================================
@@ -265,7 +259,7 @@ def read_done_clips(index_path: Path) -> set:
 
 
 def append_jsonl(path: Path, obj: dict) -> None:
-    """Atomic append to a jsonl file: write to a temp adjacent, then rename via os.replace."""
+    """Append a jsonl line with fsync. Single-process, no locking needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, ensure_ascii=False) + "\n"
     with open(path, "a", encoding="utf-8") as f:
@@ -287,9 +281,10 @@ def _pick_refs(
     max_tries: int,
     target_hw: Tuple[int, int],     # (H_target, W_target), for cv_min_size rescaling  
 ) -> List[Dict[str, Any]]:
-    """Random-sample from candidate_idx until we accept k_keep refs or exhaust max_tries using L1->L2->L3 cascade evaluation.
-    Normally candidate_idx should be an id sequence.
-    Returns list of dicts {"frame_idx": int, "rgba": np.ndarray[H,W,4] uint8}.
+    """Random-sample from candidate_idx until we accept k_keep refs or exhaust max_tries
+    using the L1 (cv_check) -> L2 (IQA) -> L3 (VLM) cascade.
+
+    Returns list of dicts {"frame_idx", "iqa", "bbox_hw", "rgba"}.
     """
     cat = cfg_prepare.category
     ref_size = int(cfg_prepare.get("ref_size", 480))
@@ -302,15 +297,10 @@ def _pick_refs(
     Ht, Wt = target_hw
     Hr, Wr = mask_raw.shape[1:3]
     s = min(Ht / Hr, Wt / Wr)
-    # cfg.cv_min_size is set for target resolution, scale it up to raw resolution:
-    # this step is necessary cause raw videos can have a variety of aspect ratios and sizes.
-    # so the uniform standards can only be set on target size.
     raw_cv_min = {k: max(1, int(round(int(v) / max(s, 1e-6))))
                   for k, v in dict(cfg_prepare.cv_min_size).items()}
-    
     cv_ratio = {k: list(v) for k, v in dict(cfg_prepare.cv_mask_ratio).items()}
-    # candidate_idx is a list of frame indices eligible for ref sampling.
-    # --- L1: cv_check ---
+
     accepted: List[Dict[str, Any]] = []
     pool = list(candidate_idx)
     random.shuffle(pool)
@@ -355,9 +345,9 @@ def _pick_refs(
 
         accepted.append({
             "frame_idx": int(idx),
-            "iqa": float(iqa_score), # 不需要
-            "bbox_hw": [int(bbox_hw[0]), int(bbox_hw[1])],
-            "rgba": rgba,
+            "iqa":       float(iqa_score),
+            "bbox_hw":   [int(bh), int(bw)],
+            "rgba":      rgba,
         })
 
     return accepted
@@ -438,7 +428,7 @@ def prepare_clip(
         Image.fromarray(r["rgba"], mode="RGBA").save(rdir / f"{r['frame_idx']:04d}.png")
         ref_meta.append({
             "frame_idx": r["frame_idx"],
-            "iqa":       r["iqa"], 
+            "iqa":       r["iqa"],
             "bbox_hw":   r["bbox_hw"],
         })
 
@@ -454,7 +444,7 @@ def prepare_clip(
         "width":           W,
         "caption":         str(row.get("caption", "")),
         "category":        cfg_prepare.category,
-        "ref_candidates":  ref_meta,        # frame indices of stored ref pngs
+        "ref_candidates":  ref_meta,
         "scores": {  # carried over from csv if present
             k: float(row[k]) for k in (
                 "luminance_min", "luminance_max",

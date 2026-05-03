@@ -1,13 +1,25 @@
+# Multi-dataset training registry.
+#
+# Per entry:
+#   name             : directory name under data/ (also the registry key).
+#                      build_datasets() will lazily import data.{name}.{name}
+#                      to trigger the @register("{name}") side-effect.
+#   config           : (optional) sub-config path; defaults to data/{name}/config.yaml
+#   train_per_epoch  : float in (0, 1]  -> ratio of the full train split size
+#                      int   >= 1       -> absolute sample count per epoch
+#                      YAML distinguishes 1.0 (float) from 1 (int);
+#                      use 1.0 to mean "100% of the split".
+#   valid_per_epoch  : same semantics, applied to the val split.
+#
+# The per-epoch quotas drive data/sampler.py::MultiSampler, which draws quota[i]
+# indices from sub-dataset i per epoch, shuffles the union, and shards for DDP.
+
 datasets:
   - name: openvid
-    # TODO: config hyper-params
-    # config: data/openvid/config.yaml
-    # split: data/openvid/splits/train.json
-    train_per_epoch: 1.0 # ratio
-    valid_per_epoch: 0.4 # ratio
-    weight: 1.0
-  # - name: another_xxx
-  #   config: data/another_xxx/config.yaml
-  #   split: data/another_xxx/splits/train.json
-  #   weight: 0.3
+    train_per_epoch: 1.0   # 100% of openvid train split every epoch
+    valid_per_epoch: 0.4   # 40% of openvid val split every epoch
 
+  # Placeholder for the next dataset. Uncomment + register when prepared:
+  # - name: ubcfashion
+  #   train_per_epoch: 500   # int: 500 clips per epoch (absolute)
+  #   valid_per_epoch: 50

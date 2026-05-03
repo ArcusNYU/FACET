@@ -24,6 +24,7 @@ os.environ.setdefault("TIMM_USE_OLD_CACHE", "1")
 
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -78,12 +79,15 @@ class IqaScorer:
         """Accept either an [H,W,3] uint8 RGB array or a path-like to an image file."""
         import torch
         if isinstance(img, np.ndarray):
-            # [H,W,3] uint8 -> [1,3,H,W] float in [0,1]
-            t = (torch.from_numpy(img)
-                    .float().permute(2, 0, 1).unsqueeze(0).div_(255.0)  #TODO: ?????
-                    .to(self.device))
-            with torch.inference_mode():
-                s = self.metric(t)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                tmp = f.name
+            try:
+                Image.fromarray(img).save(tmp)
+                with torch.inference_mode():
+                    s = self.metric(tmp)
+            finally:
+                try: os.unlink(tmp)
+                except OSError: pass
         else:
             with torch.inference_mode():
                 s = self.metric(str(img))

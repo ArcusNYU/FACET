@@ -28,8 +28,10 @@ import torch
 from decord import VideoReader, cpu
 
 from data.base import BaseVideoDataset
+from data.datasets import register
 
 
+@register("openvid")
 class OpenVid(BaseVideoDataset):
     SOURCE = "openvid"
 
