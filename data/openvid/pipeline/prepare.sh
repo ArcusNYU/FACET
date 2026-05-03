@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd /nvmedata/workspace2/users/Arcus/Facet
 
-CFG=data/openvid/config.yaml
+CFG=./data/openvid/config.yaml
 
 # Stage 1: caption single-person filter (writes <stem>.single.csv next to each input csv).
 python -m data.openvid.pipeline.filters \
@@ -16,3 +16,4 @@ python -m data.openvid.pipeline.prepare \
 
 # Stage 2 smoke test:
 python -m data.openvid.pipeline.prepare --config "$CFG" --limit 50
+

@@ -35,8 +35,7 @@ Model loading cost is amortized over the whole run, so retrying is cheap.
 # TODO: 运行后书写脚本进行数据集特征统计 因为数据分布可能直接训练模型性能
 # TODO: 其他数据集在构建prepare pipeline的时候可能也需要下面某些通用性强的helper函数 到时候需要将它们移动至 /data/helpers.py
 
-# TODO: 检查ref images的resize链路
- 
+
 from __future__ import annotations
 import argparse
 import json
@@ -275,7 +274,6 @@ def append_jsonl(path: Path, obj: dict) -> None:
         os.fsync(f.fileno()) # write to disk
 
 
-# TODO: 这里的raw video是否是 [0, 2*n_frames]长度裁剪后的原视频
 # ============================================================
 #                    Ref frame rejection sampling
 # ============================================================

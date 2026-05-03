@@ -19,6 +19,10 @@ Output:
 
 This script is meant to be run ONCE per CSV before prepare.py.
 """
+import os
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 from __future__ import annotations
 import argparse
@@ -205,7 +209,7 @@ def annotate_csv(
 ) -> dict:
     """Read a CSV, append a `single` bool column, write it out.
     Returns a stats dict."""
-    df = _drop_unnamed(pd.read_csv(csv_path))
+    df = _drop_unnamed(pd.read_csv(csv_path, encoding="utf-8", encoding_errors="ignore", low_memory=False))
     if caption_col not in df.columns:
         raise KeyError(f"caption column '{caption_col}' not in {csv_path}; got {list(df.columns)}")
 
