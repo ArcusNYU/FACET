@@ -134,7 +134,7 @@ class SchpParser:
         weight_path: str | Path,
         device: torch.device | str = "cuda",
         batch_size: int = 81,
-        amp_dtype: str = "bfloat16",
+        amp_dtype: str = "float16",
     ):
         # SCHP/networks lives at the repo root; importing here avoids work_root sys.path issues
         # when this module is imported by something that doesn't need SCHP.
@@ -142,14 +142,20 @@ class SchpParser:
 
         self.device = torch.device(device)
         self.batch_size = int(batch_size)
-        self.amp_dtype = {
+        _dtype_map = {
             "bfloat16": torch.bfloat16,
             "float16":  torch.float16,
             "float32":  torch.float32,
-        }[amp_dtype]
+        }
+        requested = _dtype_map[amp_dtype]
+        # BFloat16 requires Ampere (sm_80+); fall back to float16 if not supported.
+        if requested == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            print("[SCHP] BFloat16 not supported on this GPU, falling back to float16")
+            requested = torch.float16
+        self.amp_dtype = requested
 
         model = init_model(_ARCH, num_classes=_NUM_CLASSES, pretrained=None)
-        ckpt = torch.load(str(weight_path), map_location="cpu")
+        ckpt = torch.load(str(weight_path), map_location="cpu", weights_only=False)
         state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
         new_state = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
         model.load_state_dict(new_state, strict=True)

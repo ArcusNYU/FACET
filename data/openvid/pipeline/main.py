@@ -40,6 +40,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0") # for A100
+import warnings
+warnings.filterwarnings(
+    'ignore',
+    message='.*timm.models.layers is deprecated.*',
+    category=FutureWarning,
+)
+
 import random
 import subprocess
 import sys
@@ -121,9 +130,12 @@ def write_mp4(frames_rgb: np.ndarray, out_path: Path, fps: int) -> None:
         raise RuntimeError(f"ffmpeg failed: {err.decode(errors='ignore')[:400]}")
 
 
-def read_video(path: Path, min_frames: int, max_frames: int) -> Optional[np.ndarray]:
+def read_video(path: Path, min_frames: int, max_frames: int) -> "tuple[Optional[np.ndarray], str]":
     """Read up to max_frames frames as RGB uint8 [T,H,W,3] from the head of the video.
-    Returns None if the video has < min_frames total (too short to provide a tgt).
+
+    Returns (frames, reason) where:
+        frames  : np.ndarray [T,H,W,3] on success, None on failure.
+        reason  : "" on success | "unreadable:<exc>" if decord fails | "short:<n>/<min>" if too few frames.
 
     TODO fps resample note:
         We currently pull frames at the source fps, not the target cfg.fps.
@@ -135,13 +147,13 @@ def read_video(path: Path, min_frames: int, max_frames: int) -> Optional[np.ndar
     from decord import VideoReader, cpu
     try:
         vr = VideoReader(str(path), ctx=cpu(0))
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"unreadable:{type(e).__name__}: {e}"
     n = len(vr)
     if n < min_frames:
-        return None
+        return None, f"short:{n}/{min_frames}"
     take = min(n, max_frames)
-    return vr.get_batch(list(range(take))).asnumpy()
+    return vr.get_batch(list(range(take))).asnumpy(), ""
 
 
 # ============================================================
@@ -279,7 +291,6 @@ def _pick_refs(
     iqa: IqaScorer,
     vlm: VlmFilter,
     max_tries: int,
-    target_hw: Tuple[int, int],     # (H_target, W_target), for cv_min_size rescaling  
 ) -> List[Dict[str, Any]]:
     """Random-sample from candidate_idx until we accept k_keep refs or exhaust max_tries
     using the L1 (cv_check) -> L2 (IQA) -> L3 (VLM) cascade.
@@ -292,13 +303,10 @@ def _pick_refs(
     k_keep = int(cfg_prepare.ref_candidates_k)
     iqa_thresh = float(cfg_prepare.iqa_thresh)
 
-    # cv_min_size is calibrated at target resolution; scale it up to raw resolution
-    # so the "min bbox in target space" semantic holds regardless of raw aspect ratio.
-    Ht, Wt = target_hw
-    Hr, Wr = mask_raw.shape[1:3]
-    s = min(Ht / Hr, Wt / Wr)
-    raw_cv_min = {k: max(1, int(round(int(v) / max(s, 1e-6))))
-                  for k, v in dict(cfg_prepare.cv_min_size).items()}
+    # cv_min_size in config is calibrated against raw video resolution
+    # (HQ-OpenHumanVid is mostly 720p / occasionally 1080p), so it's used as-is.
+    # cv_mask_ratio is dimensionless and resolution-invariant, also used as-is.
+    cv_min = {k: int(v) for k, v in dict(cfg_prepare.cv_min_size).items()}
     cv_ratio = {k: list(v) for k, v in dict(cfg_prepare.cv_mask_ratio).items()}
 
     accepted: List[Dict[str, Any]] = []
@@ -319,7 +327,7 @@ def _pick_refs(
         y0, y1, x0, x1 = bb
         bh, bw = y1 - y0, x1 - x0
         ratio = int(m[y0:y1, x0:x1].sum()) / max(bh * bw, 1)
-        if not cv_check((bh, bw), ratio, cat, raw_cv_min, cv_ratio):
+        if not cv_check((bh, bw), ratio, cat, cv_min, cv_ratio):
             continue
 
         rgba = build_ref_rgba(video_raw[idx], m, pad_ratio, ref_size)
@@ -379,9 +387,11 @@ def prepare_clip(
     max_tries = int(cfg_prepare.get("ref_max_tries", 15))
 
     # 1. read raw video -> up to NF*2 frames; tgt = first NF, ref pool = the rest
-    video_raw = read_video(src, min_frames=NF, max_frames=NF * 2)
+    video_raw, read_reason = read_video(src, min_frames=NF, max_frames=NF * 2)
     if video_raw is None:
-        return {"_status": "short_or_unreadable", "clip_id": cid, "path": csv_path_field}
+        # read_reason is either "short:<n>/<min>" or "unreadable:<exc>"
+        kind = "short" if read_reason.startswith("short:") else "unreadable"
+        return {"_status": kind, "clip_id": cid, "path": csv_path_field, "reason": read_reason}
     T_total = video_raw.shape[0]
 
     # 2. SCHP on RAW frames (no black pad interference).
@@ -405,7 +415,7 @@ def prepare_clip(
         ref_candidate_idx = list(range(NF))
     refs = _pick_refs(
         video_raw, mask_raw, ref_candidate_idx,
-        cfg_prepare, iqa, vlm, max_tries=max_tries, target_hw=(H, W),
+        cfg_prepare, iqa, vlm, max_tries=max_tries,
     )
     if not refs:
         return {"_status": "no_ref", "clip_id": cid, "path": csv_path_field}
@@ -530,7 +540,7 @@ def main():
     counters: Dict[str, int] = {}
 
     for csv_path in csv_paths:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, low_memory=False)
         df = df[df["single"].astype(str).str.lower() == "true"]
         df = df[~df["clip_id"].astype(str).isin(done)]
         if 0 <= args.limit <= total_processed:
@@ -551,6 +561,13 @@ def main():
                 }
             status = res.get("_status", "unknown")
             counters[status] = counters.get(status, 0) + 1
+            if status != "ok" and counters[status] <= 3:
+                cid_log = res.get("clip_id", "")
+                if status == "error":
+                    print(f"\n[{status}] clip={cid_log} {res.get('error','')}\n{res.get('trace','')}", flush=True)
+                else:
+                    reason = res.get("reason", res.get("path", ""))
+                    print(f"\n[{status}] clip={cid_log} {reason}", flush=True)
             if status == "ok":
                 # only success entries land in index.jsonl
                 entry = {k: v for k, v in res.items() if not k.startswith("_")}
