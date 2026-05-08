@@ -22,7 +22,7 @@ imported from main.py to avoid drift.
 from __future__ import annotations
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3") 
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
 import warnings
 warnings.filterwarnings(
@@ -160,14 +160,13 @@ def _pick_refs_verbose(
         cv_min_v = cv_min.get(cat, 0)
         lo, hi = cv_ratio.get(cat, [0.0, 1.0])
         cv_pass = cv_check((bh, bw), ratio, cat, cv_min, cv_ratio)
-        cv_msg = (f"CV: bh={bh} bw={bw} min(bh,bw)={min(bh,bw)} "
-                  f"vs cv_min={cv_min_v} | ratio={ratio:.3f} vs [{lo},{hi}] "
-                  f"-> {'PASS' if cv_pass else 'FAIL'}")
+        cv_msg = (f"CV: bh={bh} bw={bw} min(bh,bw)={min(bh,bw)} vs cv_min={cv_min_v}",
+                  f"ratio={ratio:.3f} vs [{lo},{hi}] -> {'PASS' if cv_pass else 'FAIL'}")
         if not cv_pass:
-            print(f"  [try {tries:02d}] frame={idx:04d} REJECT@CV  {cv_msg}")
+            print(f"  [try {tries:02d}] frame={idx:04d} REJECT@CV  {cv_msg[0]} | {cv_msg[1]}")
             _show_or_save(
                 _annotate(video_raw[idx], m, bb,
-                          [f"frame={idx} REJECT@CV", cv_msg], (0, 0, 255)),
+                          [f"frame={idx} REJECT@CV", *cv_msg], (0, 0, 255)),
                 debug_dir / f"cv_fail_{idx:04d}.png",
             )
             continue
@@ -190,7 +189,7 @@ def _pick_refs_verbose(
             print(f"  [try {tries:02d}] frame={idx:04d} REJECT@IQA {iqa_msg}")
             _show_or_save(
                 _annotate(video_raw[idx], m, bb,
-                          [f"frame={idx} REJECT@IQA", cv_msg, iqa_msg], (0, 165, 255)),
+                          [f"frame={idx} REJECT@IQA", *cv_msg, iqa_msg], (0, 165, 255)),
                 debug_dir / f"iqa_fail_{idx:04d}.png",
             )
             continue
@@ -205,19 +204,19 @@ def _pick_refs_verbose(
         vlm_pass = v["match"] and not v["occlusion"] and not v["truncation"]
 
         if not vlm_pass:
-            print(f"  [try {tries:02d}] frame={idx:04d} REJECT@VLM {cv_msg} | {iqa_msg} | {vlm_msg}")
+            print(f"  [try {tries:02d}] frame={idx:04d} REJECT@VLM {cv_msg[0]} | {iqa_msg} | {vlm_msg}")
             _show_or_save(
                 _annotate(video_raw[idx], m, bb,
-                          [f"frame={idx} REJECT@VLM", cv_msg, iqa_msg, vlm_msg], (0, 255, 255)),
+                          [f"frame={idx} REJECT@VLM", *cv_msg, iqa_msg, vlm_msg], (0, 255, 255)),
                 debug_dir / f"vlm_fail_{idx:04d}.png",
             )
             continue
 
         # accepted
-        print(f"  [try {tries:02d}] frame={idx:04d} ACCEPT  {cv_msg} | {iqa_msg} | {vlm_msg}")
+        print(f"  [try {tries:02d}] frame={idx:04d} ACCEPT  {cv_msg[0]} | {iqa_msg} | {vlm_msg}")
         _show_or_save(
             _annotate(video_raw[idx], m, bb,
-                      [f"frame={idx} ACCEPT", cv_msg, iqa_msg, vlm_msg], (0, 255, 0)),
+                      [f"frame={idx} ACCEPT", *cv_msg, iqa_msg, vlm_msg], (0, 255, 0)),
             debug_dir / f"accept_{idx:04d}.png",
         )
         accepted.append({
@@ -362,6 +361,10 @@ def main():
                        "error": f"{type(e).__name__}: {e}",
                        "trace": traceback.format_exc(limit=4)}
                 print(f"[error] {res['error']}\n{res['trace']}", flush=True)
+                # OOM / cuda errors leave fragmented memory; release before next clip.
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             counters[res["_status"]] = counters.get(res["_status"], 0) + 1
             seen += 1
             if 0 <= args.limit <= seen:

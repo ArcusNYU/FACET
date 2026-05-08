@@ -40,7 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0" 
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0") # for A100
 import warnings
 warnings.filterwarnings(
@@ -337,7 +337,7 @@ def _pick_refs(
         rgb_only = rgba[..., :3]
 
         try:
-            iqa_score = iqa.score(rgb_only)
+            iqa_score = iqa.score(rgb_only)  # NOTE: iqa依然能够看到背景区域 因为原始背景区域的rgb像素并未被置0
         except Exception:
             iqa_score = -1.0
         if iqa_score < iqa_thresh:

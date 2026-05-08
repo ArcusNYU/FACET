@@ -71,14 +71,14 @@ prepare:
   # stays consistent across portrait / landscape / mixed sources.
   cv_min_size:
     face:          48
-    upper_clothes: 72
+    upper_clothes: 100
     pants:         72
     dress:         96
     hat:           32
     person:        120
   cv_mask_ratio:
     face:          [0.30, 0.90]
-    upper_clothes: [0.20, 0.85]
+    upper_clothes: [0.35, 0.85]
     pants:         [0.20, 0.85]
     dress:         [0.25, 0.90]
     hat:           [0.15, 0.80]
