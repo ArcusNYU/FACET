@@ -7,6 +7,7 @@ Differences vs main.py:
     overlay PNG so you can see exactly which stage rejected a candidate.
   - Annotated images go to {out_root}/_debug/{cid}/{stage}_{idx:04d}.png
     e.g. cv_fail_0123.png / iqa_fail_0123.png / vlm_fail_0123.png / accept_0123.png
+  - VLM rejection criterion: match=True AND occlusion=False (same as main.py).
   - If $DISPLAY is set (e.g. ssh -X / X11 forwarding from Windows VcXsrv),
     each annotated frame is also shown via cv2.imshow with a wait of ~600ms.
     Otherwise it just saves to disk; preview the folder in VSCode Remote.
@@ -195,13 +196,15 @@ def _pick_refs_verbose(
             continue
 
         # --- L3: VLM ---
+        # Reject criterion: match=True AND occlusion=False.
+        # truncation is NOT used as a reject criterion (mirrors main.py behaviour);
         try:
             v = vlm.judge(rgb_only, category=cat)
         except Exception as e:
             v = {"match": False, "occlusion": True, "truncation": True}
             print(f"  [try {tries:02d}] frame={idx:04d} VLM exception: {type(e).__name__}: {e}")
-        vlm_msg = (f"VLM: match={v['match']} occlusion={v['occlusion']} truncation={v['truncation']}")
-        vlm_pass = v["match"] and not v["occlusion"] and not v["truncation"]
+        vlm_msg = f"VLM: match={v['match']} occlusion={v['occlusion']} truncation={v['truncation']}"
+        vlm_pass = v["match"] and not v["occlusion"]   # truncation excluded from rejection
 
         if not vlm_pass:
             print(f"  [try {tries:02d}] frame={idx:04d} REJECT@VLM {cv_msg[0]} | {iqa_msg} | {vlm_msg}")
@@ -212,11 +215,14 @@ def _pick_refs_verbose(
             )
             continue
 
-        # accepted
-        print(f"  [try {tries:02d}] frame={idx:04d} ACCEPT  {cv_msg[0]} | {iqa_msg} | {vlm_msg}")
+        # accepted — flag truncation=True clips with a distinct label for inspection
+        trunc_flag = " [trunc]" if v.get("truncation") else ""
+        print(f"  [try {tries:02d}] frame={idx:04d} ACCEPT{trunc_flag}  {cv_msg[0]} | {iqa_msg} | {vlm_msg}")
+        accept_label = f"frame={idx} ACCEPT{trunc_flag}"
+        accept_color = (0, 200, 100) if trunc_flag else (0, 255, 0)  # slightly dimmer green for truncated
         _show_or_save(
             _annotate(video_raw[idx], m, bb,
-                      [f"frame={idx} ACCEPT", *cv_msg, iqa_msg, vlm_msg], (0, 255, 0)),
+                      [accept_label, *cv_msg, iqa_msg, vlm_msg], accept_color),
             debug_dir / f"accept_{idx:04d}.png",
         )
         accepted.append({

@@ -142,7 +142,7 @@ def encode_video(vae: Wan2_2_VAE,
 # ============================================================
 def main():
     p = argparse.ArgumentParser("Cache T5 caption embeddings + Wan VAE video latents")
-    p.add_argument("--config", default="data/openvid/config.yaml") #FIXME: ./parent/parent/config.yaml
+    p.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
     p.add_argument("--limit", type=int, default=-1,
                    help="optional cap on total clips to cache (debug); -1 = all")
     p.add_argument("--device", default="cuda")

@@ -20,22 +20,6 @@ ref_size: 480
 ref_per_clip: 3       # candidate ref number (prepare.py max limit)
 ref_format: png       # RGBA png; alpha=0 on padding, alpha=255 on bbox fg
 
-# mask boundary perturbation (shared across sequences)
-mask_perturb:
-  p_dilate: 0.5
-  p_erode: 0.5
-  dilate_range: [3, 7]
-  erode_range:  [3, 5]
-  p_elastic: 0.3
-  elastic_alpha: 8.0
-  elastic_sigma: 12.0
-
-# reference image background augmentation (within RefSampler during training)
-# Solid branch rejection-samples a grayscale value that contrasts the garment.
-ref_aug:
-  p_solid: 0.5
-  p_distract: 0.5
-
 # latent cache 
 latent_cache: True
 latent_cache_dir: /mnt/highspeed/users/Arcus/openvid/latents

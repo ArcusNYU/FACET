@@ -262,7 +262,8 @@ def _expand(pattern: str) -> List[str]:
 
 def main():
     p = argparse.ArgumentParser("Annotate HQ-OpenHumanVid CSVs with a `single` column")
-    p.add_argument("--config", default="data/openvid/config.yaml",
+    p.add_argument("--config",
+                   default=str(Path(__file__).parent.parent / "config.yaml"),
                    help="dataset config; uses cfg.prepare.{csv_glob, weight_dir, "
                         "nli_model_dir, nli_onnx, nli_batch_size, out_root}")
     p.add_argument("--out-dir", default=None,

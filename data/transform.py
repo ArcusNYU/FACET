@@ -227,9 +227,16 @@ class TfmBundle:
         self.ref = ref
 
     @classmethod
-    def from_cfg(cls, cfg) -> "TfmBundle":
+    def from_cfg(cls, cfg, shared) -> "TfmBundle":
+        """
+        Args:
+            cfg:    per-dataset cfg (data/{name}/config.yaml DotDict).
+                    Reads height / width / ref_size.
+            shared: top-level cfg (data/config.yaml DotDict).
+                    Reads mask_perturb block (cross-dataset shared).
+        """
         h, w = cfg.height, cfg.width
-        mp = cfg.mask_perturb
+        mp = shared["mask_perturb"]
         return cls(
             video=VideoTfm(h, w),
             mask=MaskPerturb(

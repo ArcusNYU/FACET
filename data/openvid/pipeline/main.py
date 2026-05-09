@@ -490,7 +490,7 @@ def _expand_csv_glob(pattern: str) -> List[str]:
 
 def main():
     p = argparse.ArgumentParser("OpenVid per-clip preprocessing")
-    p.add_argument("--config", default="data/openvid/config.yaml") #FIXME: ./parent/parent/config.yaml
+    p.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
     p.add_argument("--limit", type=int, default=-1,
                    help="optional cap on total clips (debug); -1 = no cap")
     p.add_argument("--device", default="cuda")

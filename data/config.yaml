@@ -1,6 +1,6 @@
-# Multi-dataset training registry.
+# Multi-dataset training registry + shared transform/augmentation hyper-params.
 #
-# Per entry:
+# A. datasets[]:
 #   name             : directory name under data/ (also the registry key).
 #                      build_datasets() will lazily import data.{name}.{name}
 #                      to trigger the @register("{name}") side-effect.
@@ -11,7 +11,7 @@
 #                      use 1.0 to mean "100% of the split".
 #   valid_per_epoch  : same semantics, applied to the val split.
 #
-# The per-epoch quotas drive data/sampler.py::MultiSampler, which draws quota[i]
+# Per-epoch quotas drive data/sampler.py::MultiSampler, which draws quota[i]
 # indices from sub-dataset i per epoch, shuffles the union, and shards for DDP.
 
 datasets:
@@ -23,3 +23,29 @@ datasets:
   # - name: ubcfashion
   #   train_per_epoch: 500   # int: 500 clips per epoch (absolute)
   #   valid_per_epoch: 50
+
+# B. Shared transform /Aaugmentation params
+#   mask_perturb / ref_aug:
+#   These are CROSS-DATASET shared knobs read by data/transform.py::TfmBundle
+#   and data/ref_sampler.py::RefSampler, instantiated once per (cfg, shared)
+#   pair inside build_datasets(). Putting them here avoids dragging duplicate
+#   blocks into every per-dataset yaml.
+
+# 1) Mask boundary perturbation (consistent across the T frames of a clip).
+# Simulates the imprecision of a user-drawn UI mask at inference time.
+mask_perturb:
+  p_dilate: 0.5
+  p_erode: 0.5
+  dilate_range: [3, 7]   # max ~7px expansion
+  erode_range:  [3, 5]   # max ~5px shrink
+  p_elastic: 0.3
+  elastic_alpha: 8.0     # amplitude
+  elastic_sigma: 12.0    # smoothness
+
+# 2) Reference image background augmentation, applied inside __getitem__.
+# Solid branch rejection-samples a grayscale value that contrasts the garment;
+# distract branch fills bg with low-frequency RGB noise. Together they prevent
+# the model from learning a fixed-background shortcut.
+ref_aug:
+  p_solid: 0.5
+  p_distract: 0.5

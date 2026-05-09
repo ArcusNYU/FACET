@@ -87,7 +87,7 @@ def build_datasets(
         train_quotas : List[int], per-epoch absolute quota per sub-dataset
         val_quotas   : List[int], same for val
     """
-    cfg = load_cfg(cfg_path)
+    cfg = load_cfg(cfg_path)  # top-level cfg (data/config.yaml)
     train_dss: List[Dataset] = []
     val_dss: List[Dataset] = []
     train_quotas: List[int] = []
@@ -101,8 +101,8 @@ def build_datasets(
         _lazy_import(name)
         cls = _REGISTRY[name]
 
-        tfm = TfmBundle.from_cfg(sub_cfg)
-        refs = RefSampler.from_cfg(sub_cfg)
+        tfm = TfmBundle.from_cfg(sub_cfg, shared=cfg)
+        refs = RefSampler.from_cfg(shared=cfg)
 
         ds_train = cls(sub_cfg, tfm, refs, split="train")
         ds_val   = cls(sub_cfg, tfm, refs, split="val")

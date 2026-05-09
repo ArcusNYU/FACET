@@ -119,8 +119,9 @@ class RefSampler:
         return out
 
     @classmethod
-    def from_cfg(cls, cfg) -> "RefSampler":
-        a = cfg.ref_aug
+    def from_cfg(cls, shared) -> "RefSampler":
+        """ref_aug is dataset-agnostic, read from data/config.yaml shared block."""
+        a = shared["ref_aug"]
         return cls(
             p_solid=a["p_solid"],
             p_distract=a["p_distract"],
