@@ -1,5 +1,5 @@
 """
-Dataset Pipeline Step 1: caption-level single-person filter.
+Dataset Pipeline Stage 1: caption-level single-person filter.
 Reference: https://huggingface.co/cross-encoder/nli-deberta-v3-small
 
 Stage 1 (regex, ~free):

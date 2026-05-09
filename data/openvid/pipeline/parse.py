@@ -1,5 +1,5 @@
 """
-Dataset Pipeline Step 2 (per-clip): SCHP human parsing for a video clip.
+Dataset Pipeline Stage 2 Step 1 (per-clip): SCHP human parsing for a video clip.
 Reference: https://github.com/GoGoDuck912/Self-Correction-Human-Parsing
 
 API:

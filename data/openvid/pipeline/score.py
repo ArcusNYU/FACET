@@ -1,5 +1,5 @@
 """
-Dataset Pipeline Step 3 (per-clip): ref-frame candidate scoring.
+Dataset Pipeline Stage 2 Step 2 (per-clip): ref-frame candidate scoring.
 Reference: https://github.com/chaofengc/IQA-PyTorch, https://github.com/iigroup/maniqa, https://github.com/QwenLM/Qwen3-VL
 
 3 Layers workflow: applied in order per random-sampled candidate frame.

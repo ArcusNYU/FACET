@@ -47,7 +47,7 @@ class OpenVid(BaseVideoDataset):
         return split["clips"]
 
     def _load(self, idx: int) -> Dict[str, Any]: # idx -> from global sampler index
-        item = self.items[idx]  
+        item = self.items[idx]
         cid, part = item["id"], item["part"]
         d = self._clip_dir(part, cid)
 
@@ -76,16 +76,20 @@ class OpenVid(BaseVideoDataset):
             "caption": meta["caption"],
             "category": meta.get("category", "upper_clothes"),
         }
-        out.update(self._load_cache(cid))
+        out.update(self._load_cache(part, cid)) #FIXME: 如果直接返回caption embedding 那么caption本身不需要了
         return out
 
     def _clip_dir(self, part: str, cid: str) -> Path:
         return Path(self.cfg.data_root) / "clips" / part / cid[:2] / cid[2:4] / cid
 
-    def _load_cache(self, cid: str) -> Dict[str, Any]:
+    def _load_cache(self, part: str, cid: str) -> Dict[str, Any]:
+        """Load cache produced by data/openvid/pipeline/cache.py.
+           Layout: {latent_cache_dir}/{part}/{ab}/{cd}/{cid}.pt
+                   = {tgt_latent: [48,T',H',W'], t5_emb: [L,4096]}, both bf16 by default.
+        """
         if not getattr(self.cfg, "latent_cache", False):
             return {}
-        p = Path(self.cfg.latent_cache_dir) / cid[:2] / cid[2:4] / f"{cid}.pt"
+        p = Path(self.cfg.latent_cache_dir) / part / cid[:2] / cid[2:4] / f"{cid}.pt"
         if not p.exists():
             return {}
         # weights_only=True: safe load since cache only contains tensors.

@@ -83,6 +83,9 @@ class BaseVideoDataset(Dataset):
         raise NotImplementedError
 
     # ---- optional cache loading ---------------------------------------------------------
-    def _load_cache(self, cid: str) -> Dict[str, Any]:
-        """latent_cache is empty by default; subclass can override, return {tgt_latent, t5_emb} if hit."""
+    def _load_cache(self, part: str, cid: str) -> Dict[str, Any]:
+        """latent_cache is empty by default; subclass can override, return
+        {tgt_latent, t5_emb} if hit. `part` is included in the signature so
+        cache layouts that bucket by source-shard (e.g. part_001/{ab}/{cd}/{cid}.pt)
+        can resolve the path without per-clip metadata round-trips."""
         return {}
