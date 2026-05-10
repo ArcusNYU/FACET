@@ -463,16 +463,29 @@ def prepare_clip(
 # ============================================================
 #                            CLI
 # ============================================================
-def _expand_csv_glob(pattern: str) -> List[str]:
-    import glob as _g
-    if any(c in pattern for c in "*?["):
-        return sorted(_g.glob(pattern))
-    return [pattern]
+def _resolve_single_csv(cfg_csv_glob: str, out_root: Path, part: int) -> Path:
+    """
+    e.g. cfg.csv_glob = ".../OpenHumanVid_part_*.csv", part = 1
+         -> out_root / "OpenHumanVid_part_001.single.csv"
+    """
+    name = Path(cfg_csv_glob).name
+    if "*" not in name:
+        raise ValueError(f"cfg.csv_glob must contain a single '*' placeholder; got {name}")
+    name = name.replace("*", f"{part:03d}")
+    if name.endswith(".csv"):
+        single_name = name[:-4] + ".single.csv"
+    else:
+        single_name = name + ".single.csv"
+    return out_root / single_name
 
 
 def main():
     p = argparse.ArgumentParser("OpenVid per-clip preprocessing")
     p.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
+    p.add_argument("--part", type=int, required=True,
+                   help="which OpenHumanVid part csv to process (e.g. 1, 2). "
+                        "Substituted into cfg.prepare.csv_glob's '*'. "
+                        "Run multiple parts in parallel by launching multiple processes.")
     p.add_argument("--limit", type=int, default=-1,
                    help="optional cap on total clips (debug); -1 = no cap")
     p.add_argument("--device", default="cuda")
@@ -487,18 +500,13 @@ def main():
     weight_dir = Path(cfg.weight_dir)
     index_path = out_root / cfg.index_file
 
-    # filters.py writes `<stem>.single.csv` under cfg.out_root.
-    csv_pattern_name = Path(cfg.csv_glob).name
-    if csv_pattern_name.endswith(".csv"):
-        single_name = csv_pattern_name[:-4] + ".single.csv"
-    else:
-        single_name = csv_pattern_name + ".single.csv"
-    single_pattern = str(out_root / single_name)
-    csv_paths = _expand_csv_glob(single_pattern)
-    if not csv_paths:
-        print(f"[prepare] no .single.csv found for pattern {single_pattern}; "
-              f"run filters.py first.", file=sys.stderr)
+    # Resolve the single .single.csv for this part.
+    csv_path = _resolve_single_csv(cfg.csv_glob, out_root, args.part)
+    if not csv_path.exists():
+        print(f"[prepare] .single.csv not found: {csv_path}; run filters.py first.",
+              file=sys.stderr)
         sys.exit(1)
+    print(f"[prepare] part={args.part} csv={csv_path}")
 
     # ---- load models once (resolve all paths against weight_dir) ----
     schp_path = str(weight_dir / cfg.schp_model)
@@ -522,46 +530,40 @@ def main():
     done = read_done_clips(index_path)
     print(f"[prepare] resume: {len(done)} clips already in {index_path}")
 
-    total_processed = 0
     counters: Dict[str, int] = {}
 
-    for csv_path in csv_paths:
-        df = pd.read_csv(csv_path, low_memory=False)
-        df = df[df["single"].astype(str).str.lower() == "true"]
-        df = df[~df["clip_id"].astype(str).isin(done)]
-        if 0 <= args.limit <= total_processed:
-            break
-        if args.limit > 0:
-            remain = args.limit - total_processed
-            df = df.head(remain)
+    df = pd.read_csv(csv_path, low_memory=False)
+    df = df[df["single"].astype(str).str.lower() == "true"]
+    df = df[~df["clip_id"].astype(str).isin(done)]
+    if args.limit > 0:
+        df = df.head(args.limit)
 
-        for _, row in tqdm(df.iterrows(), total=len(df), desc=Path(csv_path).name):
-            try:
-                res = prepare_clip(row, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
-            except Exception as e:
-                res = {
-                    "_status": "error",
-                    "clip_id": str(row.get("clip_id", "")),
-                    "error": f"{type(e).__name__}: {e}",
-                    "trace": traceback.format_exc(limit=4),
-                }
-            status = res.get("_status", "unknown")
-            counters[status] = counters.get(status, 0) + 1
-            if status != "ok" and counters[status] <= 3:
-                cid_log = res.get("clip_id", "")
-                if status == "error":
-                    print(f"\n[{status}] clip={cid_log} {res.get('error','')}\n{res.get('trace','')}", flush=True)
-                else:
-                    reason = res.get("reason", res.get("path", ""))
-                    print(f"\n[{status}] clip={cid_log} {reason}", flush=True)
-            if status == "ok":
-                # only success entries land in index.jsonl
-                entry = {k: v for k, v in res.items() if not k.startswith("_")}
-                append_jsonl(index_path, entry)
-                done.add(entry["clip_id"])
-            total_processed += 1
+    for _, row in tqdm(df.iterrows(), total=len(df), desc=csv_path.name):
+        try:
+            res = prepare_clip(row, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
+        except Exception as e:
+            res = {
+                "_status": "error",
+                "clip_id": str(row.get("clip_id", "")),
+                "error": f"{type(e).__name__}: {e}",
+                "trace": traceback.format_exc(limit=4),
+            }
+        status = res.get("_status", "unknown")
+        counters[status] = counters.get(status, 0) + 1
+        if status != "ok" and counters[status] <= 3:
+            cid_log = res.get("clip_id", "")
+            if status == "error":
+                print(f"\n[{status}] clip={cid_log} {res.get('error','')}\n{res.get('trace','')}", flush=True)
+            else:
+                reason = res.get("reason", res.get("path", ""))
+                print(f"\n[{status}] clip={cid_log} {reason}", flush=True)
+        if status == "ok":
+            # only success entries land in index.jsonl
+            entry = {k: v for k, v in res.items() if not k.startswith("_")}
+            append_jsonl(index_path, entry)
+            done.add(entry["clip_id"])
 
-    print(f"\n[prepare] done. counters: {counters}")
+    print(f"\n[prepare] done. part={args.part} counters: {counters}")
 
 
 if __name__ == "__main__":

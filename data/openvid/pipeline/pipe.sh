@@ -11,11 +11,15 @@ python -m data.openvid.pipeline.filters \
     --provider cuda
 
 # Stage 2: per-clip preprocessing -> dataset_root/clips/{part}/{ab}/{cd}/{cid}/...
-python -m data.openvid.pipeline.main \
-    --config "$CFG"
+# main.py only processes one part at a time. On a single 80GB A100 card, SCHP+IQA+VLM consumes only ~25GB,
+# allowing two parts to be run in parallel to fully utilize the card 
+# (index.jsonl is append-only, atomic line writes, shared safely).
+python -m data.openvid.pipeline.main --config "$CFG" --part 1 &
+python -m data.openvid.pipeline.main --config "$CFG" --part 2 &
+wait
 
 # Stage 2 smoke test (comment the full run above when iterating):
-# python -m data.openvid.pipeline.main --config "$CFG" --limit 50
+# python -m data.openvid.pipeline.main --config "$CFG" --part 1 --limit 50
 
 # Stage 3: T5 caption + Wan VAE video latent cache
 #         -> dataset_root/latents/{part}/{ab}/{cd}/{cid}.pt
