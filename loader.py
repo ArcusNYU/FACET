@@ -12,7 +12,6 @@ Usage in train.py / eval.py:
         train_sampler.set_epoch(epoch)
         for batch in train_loader:
             x       = batch["masked_video"]   # List[Tensor [T,3,H,W]] in [-1,1]
-            masks   = batch["mask"]           # List[Tensor [T,1,H,W]] in {0,1}
             ref_imgs = batch["ref_img"]       # List[Tensor [3,H,W]]   in [-1,1]
             context = batch["t5_emb"]         # List[Tensor [L,4096]]  or List[None]
             tgt     = batch["tgt_latent"]     # List[Tensor [48,T',H',W']] or List[None]

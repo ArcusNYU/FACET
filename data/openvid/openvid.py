@@ -68,15 +68,15 @@ class OpenVid(BaseVideoDataset):
 
         out: Dict[str, Any] = {
             "clip_id": cid,
-            "source": self.SOURCE,
-            "path": f"clips/{part}/{cid[:2]}/{cid[2:4]}/{cid}",
             "video": video,
             "mask": mask,
             "ref_pool": ref_pool,
-            "caption": meta["caption"],
             "category": meta.get("category", "upper_clothes"),
+            # "caption": meta["caption"],
+            # "source": self.SOURCE,
+            #"path": f"clips/{part}/{cid[:2]}/{cid[2:4]}/{cid}",
         }
-        out.update(self._load_cache(part, cid)) #FIXME: 如果直接返回caption embedding 那么caption本身不需要了
+        out.update(self._load_cache(part, cid)) #TODO: 在直接返回caption embedding的情况下 caption本身不再被需要
         return out
 
     def _clip_dir(self, part: str, cid: str) -> Path:

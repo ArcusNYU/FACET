@@ -52,7 +52,6 @@ warnings.filterwarnings(
 )
 
 import random
-import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -67,6 +66,7 @@ from tqdm import tqdm
 from data.utils import load_cfg
 from data.openvid.pipeline.parse import SchpParser
 from data.openvid.pipeline.score import IqaScorer, VlmFilter, cv_check
+from utils import write_mp4
 
 
 # ============================================================
@@ -111,25 +111,7 @@ def fit_pad_mask(mask: np.ndarray, th: int, tw: int) -> np.ndarray:
     return out
 
 
-def write_mp4(frames_rgb: np.ndarray, out_path: Path, fps: int) -> None:
-    """Pipe RGB frames to ffmpeg libx264 yuv420p crf18. Raises on failure."""
-    T, H, W, _ = frames_rgb.shape
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{W}x{H}", "-r", str(fps),
-        "-i", "-",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-        "-an",
-        str(out_path),
-    ] # -i -: read from stdin;  
-    # -c:v encoder H.264; -pix_fmt pixel format YUV 4:2:0
-    # -crf: constant rate factor; -an: audio none
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    _, err = proc.communicate(frames_rgb.tobytes())
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {err.decode(errors='ignore')[:400]}")
+# write_mp4 imported from utils (shared with loader_visual.py)
 
 
 def read_video(path: Path, min_frames: int, max_frames: int) -> "tuple[Optional[np.ndarray], str]":
