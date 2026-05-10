@@ -9,13 +9,12 @@ Dataset Layout (dataset_root):
         ref_imgs/
             *.png        RGBA: bbox fg alpha=255, padding region alpha=0; 480x480
 
-splits/train.json, splits/val.json schema:
-    {
-      "clips": [
-        {"id": "f605...", "part": "part_001"}, the first 4 characters of clip_id are 2 hash index
-        ...
-      ]
-    }
+splits/train.jsonl, splits/val.jsonl schema:
+    one JSON object per line, same shape as a row in index.jsonl, e.g.
+        {"clip_id": "f605...", "part": "part_001", "n_refs": 3,
+         "path": "clips/part_001/f6/05/f605..."}
+    Only `clip_id` and `part` are read at training time; extra fields (n_refs,
+    path, ...) are ignored, kept for forward-compat with downstream tools.
 """
 
 from __future__ import annotations
@@ -37,18 +36,22 @@ class OpenVid(BaseVideoDataset):
 
     # self.items = self._build_index() automatically called in BaseVideoDataset.__init__
     def _build_index(self) -> List[Dict[str, str]]:
-        """index list of the dataset clips
-           e.g. [{"id": "f605...", "part": "part_001"}, ...]
-        split_dir holds {train.json, val.json}; 
+        """Read split_dir / {split}.jsonl.
+           i.e. {"clip_id": "f605...", "part": "part_001", ...}.
         """
-        split_path = Path(self.cfg.split_dir) / f"{self.split}.json"
+        split_path = Path(self.cfg.split_dir) / f"{self.split}.jsonl"
+        items: List[Dict[str, str]] = []
         with open(split_path, "r", encoding="utf-8") as f:
-            split = json.load(f)
-        return split["clips"]
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                items.append(json.loads(line))
+        return items
 
     def _load(self, idx: int) -> Dict[str, Any]: # idx -> from global sampler index
         item = self.items[idx]
-        cid, part = item["id"], item["part"]
+        cid, part = item["clip_id"], item["part"]
         d = self._clip_dir(part, cid)
 
         with open(d / "meta.json", "r", encoding="utf-8") as f:
@@ -76,7 +79,7 @@ class OpenVid(BaseVideoDataset):
             # "source": self.SOURCE,
             #"path": f"clips/{part}/{cid[:2]}/{cid[2:4]}/{cid}",
         }
-        out.update(self._load_cache(part, cid)) #TODO: 在直接返回caption embedding的情况下 caption本身不再被需要
+        out.update(self._load_cache(part, cid))
         return out
 
     def _clip_dir(self, part: str, cid: str) -> Path:

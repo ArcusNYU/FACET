@@ -102,14 +102,20 @@ class MaskPerturb:
         # share the same parameters for all T frames
         self,
         h: int, w: int,
-        p_dilate: float = 0.5, # probability of dilating the mask
-        p_erode:  float = 0.5, # probability of eroding the mask
+        p_dilate: float = 0.4, # probability of dilating the mask
+        p_erode:  float = 0.4, # probability of eroding the mask
         dilate_range: Tuple[int, int] = (3, 7),  # max ~7px expansion
         erode_range:  Tuple[int, int] = (3, 5),  # max ~5px shrink
         p_elastic: float = 0.3, # probability of elastic deformation
         elastic_alpha: float = 8.0,   # amplitude -> small for mild distortion
         elastic_sigma: float = 12.0,  # smoothness -> large for smooth distortion
     ):
+        # dilate / erode are MUTUALLY EXCLUSIVE branches of one categorical
+        # draw {dilate, erode, no-op}, so their probabilities must sum to <= 1.
+        if p_dilate < 0 or p_erode < 0 or p_dilate + p_erode > 1.0 + 1e-6:
+            raise ValueError(
+                f"require p_dilate + p_erode <= 1.0 (got {p_dilate} + {p_erode})"
+            )
         self.h, self.w = h, w
         self.p_dilate, self.p_erode = p_dilate, p_erode
         self.dilate_range, self.erode_range = dilate_range, erode_range
@@ -123,15 +129,20 @@ class MaskPerturb:
             m = m.div_(255.0) # if uint8, normalize to [0, 1]
         m = m.unsqueeze(1)  # [T,H,W] -> [T,1,H,W]
 
-        # FIXME: 本身mask就已经是在resize后的基础上进行扰动的 这里再resize一次是否合理? 似乎不需要了
-        # 不过如果尺寸相同的话 也不会触发resize 所以先暂时保留
         if m.shape[-2] != self.h or m.shape[-1] != self.w:
             m = _fit_pad(m, self.h, self.w, mode="nearest")
 
-        if random.random() < self.p_dilate:
+        # Single uniform draw partitions [0, 1) into three buckets:
+        #   [0, p_dilate)                        -> dilate
+        #   [p_dilate, p_dilate + p_erode)       -> erode
+        #   [p_dilate + p_erode, 1)              -> no-op
+        # (e.g. with p_dilate = p_erode = 0.5, both ran 25% of the time).
+        r = random.random()
+        if r < self.p_dilate:
             m = self._dilate(m, self._odd(random.randint(*self.dilate_range)))
-        if random.random() < self.p_erode:
+        elif r < self.p_dilate + self.p_erode:
             m = self._erode(m, self._odd(random.randint(*self.erode_range)))
+        # elastic is independent and stacks on top of the chosen branch
         if random.random() < self.p_elastic:
             m = self._warp(m, self._elastic_grid(self.h, self.w))
 
@@ -203,7 +214,7 @@ class MaskPerturb:
 
 
 class RefTfm:
-    """[H,W,3] uint8 -> [3,H,W] float in [-1,1]. 
+    """[h,w,3] uint8 -> [3,h,w] float in [-1,1]. 
        default size: 480x480 square.
        input is expected to be RGB (alpha already consumed upstream by RefSampler).
     """
@@ -212,7 +223,7 @@ class RefTfm:
         self.size = size
 
     def __call__(self, arr: np.ndarray) -> torch.Tensor:
-        t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()  # [H,W,3] -> [3,H,W]
+        t = torch.from_numpy(arr).permute(2, 0, 1).contiguous().float()  # [h,w,3] -> [3,h,w]
         if t.shape[-1] != self.size or t.shape[-2] != self.size:
             t = _fit_pad(t.unsqueeze(0), self.size, self.size, mode="bilinear").squeeze(0)
         return _norm(t)
@@ -227,15 +238,14 @@ class TfmBundle:
         self.ref = ref
 
     @classmethod
-    def from_cfg(cls, cfg, shared) -> "TfmBundle":
+    def from_cfg(cls, shared) -> "TfmBundle":
         """
         Args:
-            cfg:    per-dataset cfg (data/{name}/config.yaml DotDict).
-                    Reads height / width / ref_size.
             shared: top-level cfg (data/config.yaml DotDict).
                     Reads mask_perturb block (cross-dataset shared).
         """
-        h, w = cfg.height, cfg.width
+        vs = shared["video_size"]
+        h, w = vs["height"], vs["width"]
         mp = shared["mask_perturb"]
         return cls(
             video=VideoTfm(h, w),
@@ -248,5 +258,5 @@ class TfmBundle:
                 elastic_alpha=mp["elastic_alpha"],
                 elastic_sigma=mp["elastic_sigma"],
             ),
-            ref=RefTfm(size=cfg.ref_size),
+            ref=RefTfm(size=int(shared["ref_size"])),
         )

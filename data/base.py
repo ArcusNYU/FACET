@@ -41,6 +41,9 @@ class BaseVideoDataset(Dataset):
 
         ref_img = self.ref_sampler.pick(meta["ref_pool"], meta["mask"])
         ref_img = self.tfm.ref(ref_img)                 # [3,H,W] in [-1,1]
+        #NOTE: difference of ref_sampler and ref_tfm:
+        # ref_sampler: pick one reference image from the pool and implement random augmentation on the padding region.
+        # ref_tfm: resize the reference image to the target size and normalize to [-1,1] (for VAE encoding).
 
         return {
             "clip_id":      meta["clip_id"],

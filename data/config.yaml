@@ -24,28 +24,39 @@ datasets:
   #   train_per_epoch: 500   # int: 500 clips per epoch (absolute)
   #   valid_per_epoch: 50
 
-# B. Shared transform /Aaugmentation params
-#   mask_perturb / ref_aug:
-#   These are CROSS-DATASET shared knobs read by data/transform.py::TfmBundle
-#   and data/ref_sampler.py::RefSampler, instantiated once per (cfg, shared)
-#   pair inside build_datasets(). Putting them here avoids dragging duplicate
-#   blocks into every per-dataset yaml.
+# B. Shared transform / augmentation params.
+#   These are CROSS-DATASET knobs read by data/transform.py::TfmBundle and
+#   data/ref_sampler.py::RefSampler. Single-resolution training only -- if
+#   multi-resolution is ever needed, push these back into the per-dataset
+#   yaml. TfmBundle / RefSampler are instantiated ONCE inside build_datasets()
+#   and reused across all sub-datasets.
 
-# 1) Mask boundary perturbation (consistent across the T frames of a clip).
-# Simulates the imprecision of a user-drawn UI mask at inference time.
+# 1) Target spatial size for video & ref. Datasets coming in at a different
+#    native size are aspect-preserving fit-padded into this canvas at runtime.
+video_size:
+  height: 480
+  width:  832
+ref_size: 480
+
+# 2) Mask boundary perturbation (consistent across the T frames of a clip).
+#    Simulates the imprecision of a user-drawn UI mask at inference time.
+#    p_dilate and p_erode are MUTUALLY EXCLUSIVE: per call we draw one branch
+#    in {dilate, erode, no-op} from a single uniform draw. Required:
+#        p_dilate + p_erode <= 1.0
+#    p_elastic is independent and stacks on top of the chosen morpho branch.
 mask_perturb:
-  p_dilate: 0.5
-  p_erode: 0.5
+  p_dilate: 0.4
+  p_erode:  0.4          # remaining 0.2 mass -> no morphological op
   dilate_range: [3, 7]   # max ~7px expansion
   erode_range:  [3, 5]   # max ~5px shrink
   p_elastic: 0.3
   elastic_alpha: 8.0     # amplitude
   elastic_sigma: 12.0    # smoothness
 
-# 2) Reference image background augmentation, applied inside __getitem__.
-# Solid branch rejection-samples a grayscale value that contrasts the garment;
-# distract branch fills bg with low-frequency RGB noise. Together they prevent
-# the model from learning a fixed-background shortcut.
+# 3) Reference image background augmentation, applied inside RefSampler.pick().
+#    Solid branch rejection-samples a grayscale value that contrasts the
+#    garment; distract branch fills bg with low-frequency RGB noise. Together
+#    they prevent the model from learning a fixed-background shortcut.
 ref_aug:
   p_solid: 0.5
   p_distract: 0.5

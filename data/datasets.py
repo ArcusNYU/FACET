@@ -88,6 +88,11 @@ def build_datasets(
         val_quotas   : List[int], same for val
     """
     cfg = load_cfg(cfg_path)  # top-level cfg (data/config.yaml)
+
+    # Build them ONCE and share across every sub-dataset.
+    tfm = TfmBundle.from_cfg(shared=cfg)
+    refs = RefSampler.from_cfg(shared=cfg)
+
     train_dss: List[Dataset] = []
     val_dss: List[Dataset] = []
     train_quotas: List[int] = []
@@ -100,9 +105,6 @@ def build_datasets(
 
         _lazy_import(name)
         cls = _REGISTRY[name]
-
-        tfm = TfmBundle.from_cfg(sub_cfg, shared=cfg)
-        refs = RefSampler.from_cfg(shared=cfg)
 
         ds_train = cls(sub_cfg, tfm, refs, split="train")
         ds_val   = cls(sub_cfg, tfm, refs, split="val")

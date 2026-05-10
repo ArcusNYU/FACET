@@ -30,6 +30,7 @@ from PIL import Image
 
 class RefSampler:
     """
+    Pick one reference image from the pool and implement random augmentation on the padding region.
     Two probability branches:
         p < p_solid                  -> contrast-aware random grayscale in padding region
         p_solid <= p < 1             -> low-frequency distract texture in padding region

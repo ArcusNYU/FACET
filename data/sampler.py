@@ -86,10 +86,11 @@ class MultiSampler(Sampler[int]):
         if not chunks:
             return iter([])
 
-        stacked = torch.cat(chunks) # stack for all sub-datasets
-        perm = torch.randperm(len(stacked), generator=g)
-        stacked = stacked[perm] # len(stacked) = sum(quotas)
+        stacked = torch.cat(chunks) # concatenate for all sub-datasets  
+        perm = torch.randperm(len(stacked), generator=g) # len(stacked) = sum(quotas)
+        stacked = stacked[perm] 
 
+        # DDP multi-rank
         if self.num_replicas > 1:
             total = self._global_total()
             stacked = stacked[:total][self.rank::self.num_replicas]
