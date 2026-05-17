@@ -19,6 +19,9 @@ import json
 from pathlib import Path
 from typing import Optional
 
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0") # for A100
 import torch
 
 from loader import build_loaders

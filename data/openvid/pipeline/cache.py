@@ -10,9 +10,12 @@ Reads {out_root}/index.jsonl produced by main.py. For each ok clip:
   5. Save {tgt_latent, t5_emb} to {latent_cache_dir}/{part}/{ab}/{cd}/{cid}.pt
      atomically (.pt.tmp -> rename), so a killed run never leaves a corrupt file.
 
-Resume: clips whose .pt already exists are skipped.
-Disk dtype: defaults to bfloat16 to keep total cache small 
-            (~2.6 MB / clip for480x832x81 @ z_dim=48). Override with --save-dtype.
+Resume: at startup latent_root is “rglob”ed once to build a set of already-cached
+        clip_ids; matching items are dropped from todo. Stale `.pt.tmp` files
+        from killed runs are also swept. 
+        With `--shard i/N` each worker only handles items whose hash(cid) % N == i
+Disk dtype: defaults to bfloat16 to keep total cache small
+            (~2.6 MB / clip for 480x832x81 @ z_dim=48). Override with --save-dtype.
 
 Wan weights layout (cfg.prepare.weight_dir / WAN):
     models_t5_umt5-xxl-enc-bf16.pth          # T5 encoder ckpt
@@ -27,10 +30,17 @@ Wan weights layout (cfg.prepare.weight_dir / WAN):
 
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")  # A100
+
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning,
+                        message=r".*torch\.cuda\.amp\.autocast.*")
+warnings.filterwarnings("ignore", category=FutureWarning,
+                        message=r".*weights_only=False.*")
 
 import sys
 from pathlib import Path
@@ -41,7 +51,7 @@ import torch
 from decord import VideoReader, cpu
 from tqdm import tqdm
 
-_WAN_PATH = Path(__file__).resolve().parents[3] / "Wan"
+_WAN_PATH = Path(__file__).resolve().parents[3] / "WAN"
 if str(_WAN_PATH) not in sys.path:
     sys.path.insert(0, str(_WAN_PATH))
 
@@ -80,6 +90,28 @@ def clip_dir(out_root: Path, part: str, cid: str) -> Path:
 def latent_pt_path(latent_root: Path, part: str, cid: str) -> Path:
     """latent_root/{part}/{ab}/{cd}/{cid}.pt   (matches openvid.py _load_cache)."""
     return latent_root / part / cid[:2] / cid[2:4] / f"{cid}.pt"
+
+
+def scan_cached_cids(latent_root: Path) -> set[str]:
+    """One-shot directory walk: collect every {cid}.pt already on disk.
+    """
+    if not latent_root.exists():
+        return set()
+    return {p.stem for p in latent_root.rglob("*.pt")}
+
+
+def sweep_stale_tmp(latent_root: Path) -> int:
+    """Remove `.pt.tmp` left behind by a killed run."""
+    if not latent_root.exists():
+        return 0
+    n = 0
+    for p in latent_root.rglob("*.pt.tmp"):
+        try:
+            p.unlink()
+            n += 1
+        except OSError:
+            pass
+    return n
 
 
 # ============================================================
@@ -149,7 +181,16 @@ def main():
     p.add_argument("--save-dtype", default="bfloat16",
                    choices=["bfloat16", "float16", "float32"],
                    help="storage dtype for tgt_latent & t5_emb (default bf16, halves disk)")
+    p.add_argument("--shard", default="0/1",
+                   help="i/N: this worker handles items whose hash(cid)%%N == i. "
+                        "Use to spread 100k+ clips across multiple GPUs/processes.")
+    p.add_argument("--no-sweep-tmp", action="store_true",
+                   help="skip cleanup of stale .pt.tmp files at startup")
+    # 当前阶段不使用该指令 默认清除未完成临时文件
     args = p.parse_args()
+
+    shard_i, shard_n = (int(x) for x in args.shard.split("/"))
+    assert 0 <= shard_i < shard_n, f"bad --shard {args.shard}"
 
     cfg = load_cfg(args.config)
     out_root = Path(cfg.prepare.out_root)
@@ -168,9 +209,30 @@ def main():
     items = read_index(index_path)
     if args.limit > 0:
         items = items[: args.limit]
-    todo = [it for it in items
-            if not latent_pt_path(latent_root, it["part"], it["clip_id"]).exists()]
-    print(f"[cache] indexed={len(items)}  todo={len(todo)}  cached={len(items) - len(todo)}")
+
+    if not args.no_sweep_tmp:
+        n_tmp = sweep_stale_tmp(latent_root)
+        if n_tmp:
+            print(f"[cache] swept {n_tmp} stale .pt.tmp files")
+
+    # Build the "already cached" set in ONE directory walk (cheap on 100k items)
+    cached_cids = scan_cached_cids(latent_root)
+
+    todo: List[Dict[str, Any]] = []
+    n_skipped_shard = 0
+    for it in items:
+        cid = it["clip_id"]
+        if cid in cached_cids:
+            continue
+        # Stable cross-process hash (built-in hash() is seeded per-process).
+        if shard_n > 1 and (int(hashlib.md5(cid.encode()).hexdigest(), 16) % shard_n) != shard_i:
+            n_skipped_shard += 1
+            continue
+        todo.append(it)
+
+    n_cached = len(cached_cids & {it["clip_id"] for it in items})
+    print(f"[cache] indexed={len(items)}  cached={n_cached}  "
+          f"shard={args.shard} (other_shards={n_skipped_shard})  todo={len(todo)}")
     if not todo:
         return
 

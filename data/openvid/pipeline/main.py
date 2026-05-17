@@ -27,10 +27,15 @@ keeps rows with `single == True`. For each clip:
   7. Write minimal meta.json.
   8. Atomic append to index.jsonl (resume-friendly).
 
-Resume: clip_ids already in index.jsonl are skipped on restart.
+Resume: clip_ids already in index.jsonl are skipped on restart. index.jsonl is
+        guarded by fcntl.flock so multiple `--part` (or `--shard`) workers can
+        append concurrently without line-interleaving even on NFS.
 Failure classes (missing_src / short / empty_mask / no_ref / error) are
 counted on stdout but not recorded; they will be re-attempted on restart.
 Model loading cost is amortized over the whole run, so retrying is cheap.
+Within-part parallelism: `--shard i/N` splits a single part across N workers
+        by md5(clip_id) % N, mirroring cache.py. Useful when one part is the
+        bottleneck and the GPU still has free VRAM.
 """
 
 # TODO: 可能涉及fps重采样
@@ -40,6 +45,8 @@ Model loading cost is amortized over the whole run, so retrying is cheap.
 
 from __future__ import annotations
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
@@ -255,13 +262,27 @@ def read_done_clips(index_path: Path) -> set:
 
 
 def append_jsonl(path: Path, obj: dict) -> None:
-    """Append a jsonl line with fsync. Single-process, no locking needed."""
+    """Append a jsonl line with fsync, guarded by an advisory file lock.
+
+    pipe.sh runs `--part 1 &` and `--part 2 &` concurrently against the SAME
+    index.jsonl. POSIX O_APPEND is only atomic up to PIPE_BUF (4096B) on local
+    filesystems; on NFS/Lustre/GPFS the guarantee does NOT hold and two
+    concurrent appends can interleave, producing a broken json line that
+    read_done_clips silently skips -> sneaky double-processing on resume.
+
+    fcntl.flock(LOCK_EX) serializes the write+fsync window across processes
+    and is free when uncontended.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, ensure_ascii=False) + "\n"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(line) # write to python buffer
-        f.flush()     # to OS buffer
-        os.fsync(f.fileno()) # write to disk
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(line) # write to python buffer
+            f.flush()     # to OS buffer
+            os.fsync(f.fileno()) # write to disk
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 # ============================================================
@@ -491,7 +512,14 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--schp-batch", type=int, default=None,
                    help="override cfg.prepare.schp_batch if you hit OOM")
+    p.add_argument("--shard", default="0/1",
+                   help="i/N: within this part, handle only clips whose "
+                        "md5(cid)%%N == i. Lets you co-locate multiple workers "
+                        "on the same GPU/part when VRAM allows.")
     args = p.parse_args()
+
+    shard_i, shard_n = (int(x) for x in args.shard.split("/"))
+    assert 0 <= shard_i < shard_n, f"bad --shard {args.shard}"
 
     cfg_top = load_cfg(args.config)
     cfg = cfg_top.prepare
@@ -535,6 +563,13 @@ def main():
     df = pd.read_csv(csv_path, low_memory=False)
     df = df[df["single"].astype(str).str.lower() == "true"]
     df = df[~df["clip_id"].astype(str).isin(done)]
+    if shard_n > 1:
+        # Stable cross-process hash; mirrors cache.py:scan_cached_cids logic.
+        def _in_shard(cid: str) -> bool:
+            return (int(hashlib.md5(cid.encode()).hexdigest(), 16) % shard_n) == shard_i
+        before = len(df)
+        df = df[df["clip_id"].astype(str).map(_in_shard)]
+        print(f"[prepare] shard={args.shard}: kept {len(df)}/{before} clips for this worker")
     if args.limit > 0:
         df = df.head(args.limit)
 
