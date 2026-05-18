@@ -40,8 +40,8 @@ class RefSampler:
 
     def __init__(
         self,
-        p_solid: float = 0.5,
-        p_distract: float = 0.5,
+        p_solid: float = 1.0,
+        p_distract: float = 0.0,
         solid_min_dist: int = 60,      # min |candidate_gray - fg_gray| on [0,255] luminance 
         solid_max_tries: int = 20,     # rejection-sampling cap before falling back to extreme
     ):

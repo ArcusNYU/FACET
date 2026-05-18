@@ -1,11 +1,21 @@
 model:
+
+  device: null # "cuda" | "cpu" | "auto"
+
   name: "Wan2.2-TI2V-5B"
-  base_model_id: "Wan-AI/Wan2.2-TI2V-5B" #FIXME: 改为本地路径加载 而非huggingface下载
-  base_model_path: "./weights/WAN"
+  base:
+    load_from: "local" # "huggingface" | "local"
+    id: "Wan-AI/Wan2.2-TI2V-5B" #FIXME: 改为本地路径加载 而非huggingface下载 即仅使用base_model_path
+    dir: "./weights/WAN"
+
+    dit: "diffusion_pytorch_model*.safetensors"
+    t5: "models_t5_umt5-xxl-enc-bf16.pth"
+    vae: "Wan2.2_VAE.pth"
+    tokenizer: null
 
   dtype: "bf16"
   device: "cuda"
-  # freeze_base: true
+  # freeze_base: true  默认
   gradient_checkpointing: true
 
   wan:
@@ -27,12 +37,19 @@ model:
     # resize_mode: "center_crop_resize" 
     # encode_with_wan_vae: true
     # latent_frames: 1
-    detach_latent: true
+    detach_latent: true   # NOTE: 也是默认的 肯定不会把梯度传latent本身上面 
     timestep: 0.0
-    injection_mode: "branch_attention"   # branch_attention | concat_tokens
-    # update_reference_branch: true
+    injection_mode: "branch_attention"   # branch_attention NOTE: 仅表明OminiControl的架构 此cfg变量不会被使用 除了未来的消融实验
+    
+    position:
+      mode: "spatial_offset" # spatial_offset | temporal_offset  TODO: 需要针对这两种方式进行消融实验 原始OminiControl的实现是spatial_offset
+      temporal_offset: 0
+      h_offset: 0
+      w_offset: -15
+
+    # update_reference_branch: true   NOTE: 暂时默认为True 
     # independent_reference: false
-    kv_cache_reference: true
+    kv_cache_reference: true   #NOTE: 仅在inference使用 training中暂不使用
 
   lora:
     enabled: true
@@ -42,10 +59,10 @@ model:
     alpha: 32
     dropout: 0.0
     init: "kaiming_zero"
-    branch_routing:
-      target: "default"
-      reference: "default"
-      text: null
+    # branch_routing:
+    #   target: "default"
+    #   reference: "default"
+    #   text: null
 
   text: # 基本上是用于T5 caption embedding
     max_text_len: 512
@@ -57,11 +74,11 @@ model:
     cfg_scale: 5.0 
     reference_guidance_scale: 1.0
     seed: null
-    output_type: "pil"
+    output_type: "video_tensor" # frames: list of PIL frames | video_tensor: torch.Tensor [81, 3, 480, 832] [T, C, H, W]
 
   training:
-    prediction_type: "flow_velocity"
-    timestep_sampling: "logit_normal"
+    prediction_type: "velocity"  # 预测类型 "noise"(WAN默认) | "velocity"  
+    timestep_sampling: "logit_normal"  # 时间步采样使用正态分布    "uniform" | "logit_normal"
     loss_type: "mse"
     ref_dropout_prob: 0.05
     text_dropout_prob: 0.10

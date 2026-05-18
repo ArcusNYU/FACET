@@ -38,6 +38,7 @@ class BaseVideoDataset(Dataset):
         video = self.tfm.video(meta["video"])           # [T,3,H,W] in [-1,1]
         mask  = self.tfm.mask(meta["mask"])             # [T,1,H,W] in {0,1}, perturbed
         masked_video = video * (1.0 - mask)             # [T,3,H,W]
+        # FIXME: 对于mask区域施加高斯噪声而非直接置零
 
         ref_img = self.ref_sampler.pick(meta["ref_pool"], meta["mask"])
         ref_img = self.tfm.ref(ref_img)                 # [3,H,W] in [-1,1]

@@ -58,5 +58,5 @@ mask_perturb:
 #    garment; distract branch fills bg with low-frequency RGB noise. Together
 #    they prevent the model from learning a fixed-background shortcut.
 ref_aug:
-  p_solid: 0.5
-  p_distract: 0.5
+  p_solid: 1.0
+  p_distract: 0.0

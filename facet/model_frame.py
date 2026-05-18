@@ -1,7 +1,7 @@
 Class FACET 结构 
  ├── pipe / components
  │    ├── dit              # Wan diffusion transformer, frozen base + LoRA
- │    ├── vae              # Wan2.2_VAE.pth, frozen
+ │    ├── vae              # Wan_VAE.pth, frozen
  │    ├── text_encoder     # UMT5/T5, frozen
  │    └── scheduler        # 
  │
@@ -9,6 +9,11 @@ Class FACET 结构
  ├── reference encoder helpers  # for encoding reference branch 可以取名叫 ref_branch
  ├── forward()             # training one-step denoising
  └── generate() / pipeline.__call__()  # inference denoising loop
+
+形状变化流: 
+video input: [81, 832, 480]  -> VAE: 下采样 (4, 16, 16) -> latent input: [21, 52, 30]c=4
+path embedding / positional embedding:
+patch size (1, 2, 2) -> latent token [21, 26, 15] -> token总网格数: 21*26*15 = 8190
 
 class FACET(nn.Module):
     def __init__(...):
@@ -51,6 +56,12 @@ ref_latent [1, 30, 30]c=4
 ref_tokens [1, 15, 15]c=4
   ↓ attention with target noisy video tokens
 target output tokens
+#FIXME: 注意 由于WAN原始apply_rope不支持这种per-token arbitrary RoPE 所以需要手动实现 参照于OmniControl的实现
+# OminiControl的实现思路是 side-by-side spatial offset: 原始架构是把condition image移动到了generated image左侧
+# 在这里的实现方案是 Wan VAE spatial stride 16 * DiT patch spatial stride 2 = 32 px per DiT token
+# 所以如果把reference image放置到target video的左侧的话 需要 480 / 32 = 15 tokens
+# 那么reference image的 position delta 应该是 w_offset = (0, -15) 已在 facet/config.yaml中配置
+
 
 # 用于训练和推理的模块函数:
 def from_config()
@@ -71,13 +82,15 @@ def forward(
     return_dict: bool = True, # List[Tensor], each [C, F, H, W]
 ) -> dict | list[torch.Tensor]: 
 # 训练时使用的前向传递 该函数自用所以可保证输入合规性 不需要做input check 也不需要高兼容性 流程为: 
-输入target video latent(已经提前由WAN2.2VAE编码好的) List[Tensor], each [C, Fv, Hv, Wv]
+输入target video latent(已经提前由WAN VAE编码好的) List[Tensor], each [C, Fv, Hv, Wv]
 进行patchify(& RoPE) 从而得到 latent token
-输入reference image latanet(同样已经由WAN2.2VAE编码好) List[Tensor], each [C, 1, Hr, Wr]
+输入reference image latanet(同样已经由WAN VAE编码好) List[Tensor], each [C, 1, Hr, Wr]
 进行patchify(positional embedding的具体策略待定) 得到ref token
 输入caption embedding(已经提前由T5 text encoder编码好) shape: List[Tensor], each [L, text_dim]
-进行text embedding 得到 context token???
+进行text embedding 得到 context token
 return pred_velocity / pred_noise List[Tensor], each [C, F, H, W] 
+对于ref branch 需要保持训练和推理过程中 timestep=0 也就是 torch.zeros_like(t)
+在WAN内部 t会被计算在每个token生成一个timestep embedding
 
 @torch.no_grad()
 def generate(): 实际上的FACETpipeline call核心
@@ -121,7 +134,8 @@ trainable:
 
 
 
-# model.py
+# =============================================================================
+# model.py:
 
 from __future__ import annotations
 
@@ -129,6 +143,7 @@ import math
 import yaml
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import logging
 
 import torch
 import torch.nn as nn
@@ -138,11 +153,12 @@ from PIL import Image
 
 from config import FACETWanConfig, FACETTargetConfig, FACETReferenceConfig, FACETLoRAConfig, FACETInferenceConfig
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class FACETModelConfig:
-    name: str = "FACET-Wan2.2-TI2V-5B"
-    base_model_id: str = "Wan-AI/Wan2.2-TI2V-5B" #FIXME: 改为本地路径加载 而非huggingface下载
+    name: str = "FACET-Wan2.2-TI2V-5B"  #FIXME: v2v model
+    # base_model_id: str = "Wan-AI/Wan2.2-TI2V-5B" #FIXME: 改为本地路径加载 而非huggingface下载
     dtype: str = "bf16"
     device: str = "cuda"
     # freeze_base: bool = True
@@ -341,7 +357,7 @@ def validate_video_size(height: int, width: int, num_frames: int, hw_multiple: i
 
 class FACETWanModel(nn.Module):
     """
-    FACET model wrapper around Wan2.2-TI2V-5B.
+    FACET model wrapper.
 
     Training:
         forward() does one denoising prediction step.
@@ -383,7 +399,7 @@ class FACETWanModel(nn.Module):
 
     def _load_base_components(self) -> None:
         """
-        Load Wan2.2-TI2V-5B components.
+        Load Wan components.
 
         You have two implementation choices:
 
@@ -398,35 +414,38 @@ class FACETWanModel(nn.Module):
         """
         
         #TODO: 使用optionA
-        #FIXME: 使用本地路径加载 而非huggingface下载
+        #FIXME: 使用本地路径加载 先glob本地文件夹 而非huggingface下载
         # Pseudocode:
         #
         # from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-        #
+
+        # dit_paths, t5_paths, vae_paths = self._resolve_weight_paths()
+
         # self.pipe = WanVideoPipeline.from_pretrained(
         #     torch_dtype=self.dtype,
-        #     device=self.cfg.device,
+        #     device=self.init_device,
         #     model_configs=[
-        #         ModelConfig(
-        #             model_id=self.cfg.base_model_id,
-        #             origin_file_pattern="diffusion_pytorch_model*.safetensors",
-        #         ),
-        #         ModelConfig(
-        #             model_id=self.cfg.base_model_id,
-        #             origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-        #         ),
-        #         ModelConfig(
-        #             model_id=self.cfg.base_model_id,
-        #             origin_file_pattern="Wan2.2_VAE.pth",
-        #         ),
+        #         ModelConfig(path=dit_paths),
+        #         ModelConfig(path=t5_paths[0]),
+        #         ModelConfig(path=vae_paths[0]),
         #     ],
+        #     tokenizer_config=(
+        #         ModelConfig(path=self.cfg.base.tokenizer_dir)
+        #         if self.cfg.base.tokenizer_dir is not None
+        #         else None
+        #     ),
         # )
-        #
+
         # self.dit = self.pipe.dit
         # self.vae = self.pipe.vae
         # self.text_encoder = self.pipe.text_encoder
-        # self.tokenizer = self.pipe.tokenizer
+        # self.tokenizer = getattr(self.pipe, "tokenizer", None)
         # self.scheduler = self.pipe.scheduler
+        # 如果DiffSynth不支持path:
+        # ModelConfig(
+        #     model_id=str(base_dir),
+        #     origin_file_pattern=self.cfg.base.dit_pattern,
+        # )
 
         raise NotImplementedError("Implement Wan2.2 component loading here.")
 
@@ -498,6 +517,11 @@ class FACETWanModel(nn.Module):
 
         if prompt is None:
             raise ValueError("Either prompt or prompt_embeds must be provided.")
+        
+        #TODO: 兼容prompt/prompt_embeds两种输入方式
+        # 如果 prompt_embeds 不为空，优先用 prompt_embeds。
+        # 如果 prompt 和 prompt_embeds 都为空，报错。
+        # 如果 prompt 和 prompt_embeds 都给了，可以 warning，但不报错。
 
         # Pseudocode:
         #
@@ -521,6 +545,14 @@ class FACETWanModel(nn.Module):
         For FACET:
             reference image is resized to 480x480 by default.
         """
+        # TODO: reference_image的格式支持:
+        # PIL.Image
+        # List[PIL.Image]
+        # torch.Tensor [3,H,W]
+        # torch.Tensor [B,3,H,W]
+        # 目前仅支持1张reference_image输入
+        # 需要兼容已经是reference latent / processed reference image tensor / raw PIL 
+        # 对于raw PIL 需要的预处理函数可以在 data.transform找到对应的参考代码
         # Pseudocode:
         #
         # 1. normalize input to list of PIL or tensor batch
@@ -555,46 +587,104 @@ class FACETWanModel(nn.Module):
         #
         raise NotImplementedError("Implement Wan VAE decoding.")
 
-    def prepare_latents(
-        self,
-        batch_size: int,
-        height: int,
-        width: int,
-        num_frames: int,
-        generator: Optional[torch.Generator] = None,
-    ) -> List[torch.Tensor]:
+    # FIXME: 该函数不需要 因为是针对masked video生成的latent进行去噪 而非随机噪声
+    # def prepare_latents(
+    #     self,
+    #     batch_size: int,
+    #     height: int,
+    #     width: int,
+    #     num_frames: int,
+    #     generator: Optional[torch.Generator] = None,
+    # ) -> List[torch.Tensor]:
+    #     """
+    #     Initialize Gaussian latent for inference.
+    #     """
+    #     validate_video_size(
+    #         height=height,
+    #         width=width,
+    #         num_frames=num_frames,
+    #         hw_multiple=self.cfg.target.hw_multiple,
+    #     )
+
+    #     f_lat = latent_frames_from_num_frames(
+    #         num_frames,
+    #         temporal_stride=self.cfg.wan.vae_temporal_stride,
+    #     )
+    #     h_lat = height // self.cfg.wan.vae_spatial_stride
+    #     w_lat = width // self.cfg.wan.vae_spatial_stride
+
+    #     # Wan latent channels are typically 16 for these models.
+    #     # Better: read from self.dit.in_dim or self.vae config.
+    #     c = getattr(self.dit, "in_dim", 16)
+
+    #     latents = torch.randn(
+    #         batch_size,
+    #         c,
+    #         f_lat,
+    #         h_lat,
+    #         w_lat,
+    #         generator=generator,
+    #         device=self.cfg.device,
+    #         dtype=self.dtype,
+    #     )
+    #     return ensure_latent_list(latents)
+
+
+    # --------------------------------------------------------
+    # Rotary Position Embedding
+    # --------------------------------------------------------
+    @torch.amp.autocast("cuda", enabled=False)
+    def apply_3d_rope(
+        x: torch.Tensor,
+        pos_ids: torch.Tensor,
+        freqs: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        Initialize Gaussian latent for inference.
+        x:
+            [B, L, num_heads, head_dim]
+
+        pos_ids:
+            [B, L, 3], containing f,h,w position ids.
+
+        freqs:
+            Wan freqs, same as self.dit.freqs.
         """
-        validate_video_size(
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            hw_multiple=self.cfg.target.hw_multiple,
+        B, L, N, D = x.shape
+        c = D // 2
+
+        freqs_f, freqs_h, freqs_w = freqs.split(
+            [c - 2 * (c // 3), c // 3, c // 3],
+            dim=1,
         )
 
-        f_lat = latent_frames_from_num_frames(
-            num_frames,
-            temporal_stride=self.cfg.wan.vae_temporal_stride,
-        )
-        h_lat = height // self.cfg.wan.vae_spatial_stride
-        w_lat = width // self.cfg.wan.vae_spatial_stride
+        out = []
+        for b in range(B):
+            ids = pos_ids[b].long()
+            f_ids = ids[:, 0].clamp(min=0, max=freqs_f.shape[0] - 1)
+            h_ids = ids[:, 1].clamp(min=0, max=freqs_h.shape[0] - 1)
+            w_ids = ids[:, 2].clamp(min=0, max=freqs_w.shape[0] - 1)
 
-        # Wan latent channels are typically 16 for these models.
-        # Better: read from self.dit.in_dim or self.vae config.
-        c = getattr(self.dit, "in_dim", 16)
+            freqs_i = torch.cat(
+                [
+                    freqs_f[f_ids],
+                    freqs_h[h_ids],
+                    freqs_w[w_ids],
+                ],
+                dim=-1,
+            )  # [L, D/2]
 
-        latents = torch.randn(
-            batch_size,
-            c,
-            f_lat,
-            h_lat,
-            w_lat,
-            generator=generator,
-            device=self.cfg.device,
-            dtype=self.dtype,
-        )
-        return ensure_latent_list(latents)
+            x_i = torch.view_as_complex(
+                x[b].to(torch.float64).reshape(L, N, -1, 2)
+            )  # [L, N, D/2]
+
+            x_i = torch.view_as_real(
+                x_i * freqs_i[:, None, :]
+            ).flatten(2)
+
+            out.append(x_i)
+
+        return torch.stack(out, dim=0).float()
+
 
     # --------------------------------------------------------
     # Training forward
@@ -610,51 +700,32 @@ class FACETWanModel(nn.Module):
         category_ids: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[Dict[str, Any], List[torch.Tensor]]:
+        
         """
-        One-step denoising prediction for training.
+        Training forward.
 
-        Args:
-            noisy_latents:
-                List[Tensor] or Tensor.
-                Each target latent shape [C, F, H, W].
+        noisy_latents:
+            List length B.
+            Each [C, F, H, W].
 
-            timesteps:
-                Tensor [B].
+        timesteps:
+            [B], values in [0, 1] if flow matching.
 
-            prompt_embeds:
-                List[Tensor] or Tensor.
-                Each text embedding shape [L, D].
+        prompt_embeds:
+            List length B.
+            Each [L, text_dim], T5 hidden states.
 
-            reference_latents:
-                Optional reference latent list.
-                Each shape [C, 1, H_ref, W_ref].
+        reference_latents:
+            List length B.
+            Each [C, 1, H_ref, W_ref].
 
-            input_image_latents:
-                Optional TI2V/I2V condition latents if you want to preserve
-                original Wan TI2V behavior.
-
-            category_ids:
-                Optional clothing part category ids.
+        edit_masks:
+            Optional latent-space or token-space masks.
 
         Returns:
-            pred:
-                List[Tensor], same latent shape as noisy_latents.
+            pred velocity for target video branch only.
         """
-        x = ensure_latent_list(noisy_latents)
-        context = ensure_context_list(prompt_embeds)
-        y = ensure_latent_list(input_image_latents) if input_image_latents is not None else None
-
-        # if reference_latents is not None:
-        # FIXME: 必须要求有 reference_latents
-        ref = ensure_latent_list(reference_latents)
-        pred = self._forward_with_reference(
-            x=x,
-            t=timesteps,
-            context=context,
-            ref=ref,
-            y=y,
-            category_ids=category_ids,
-        )
+        assert reference_latents is not None, "FACET requires reference_latents."
 
         # FIXME: forward函数一次性写出来 不需要反复根据选择option进行分支套壳 
         # 选择_forward_with_reference_branch_attention
@@ -665,24 +736,51 @@ class FACETWanModel(nn.Module):
         #         context=context,
         #         y=y,
         #     )
+        保留patch embedding 分别构造time embedding
+        每个branch做branch-aware self-attention
 
-        if return_dict:
-            return {"pred": pred}
-        return pred
+        关于forward中的OminiControl-style reference token branch:
+        - target branch timestep = t
+        - reference branch timestep = 0
+        在空间自注意力机制Spatial Self-Attention中:
+            reference 计算 k_ref / q_ref / v_ref 
+            latent token 及实验 k / q / v
+            接合concat k_ref / v_ref 得到 k_all / v_all
+            将latent branch v attention 到 k_all / v_all 并将 q_ref attend 仅attend 至自身 k_ref - v_ref
+            (可能会涉及 group mask的使用) 
+            于是 ref token 形成一种类似于 layer-wise condition memory
+            在forward过程中 ref token本身也要发生变化 以适应WAN不同stage latent注意力计算的需要 例如不同的尺度细粒度纹理等...
 
-    # def _forward_base_dit(
-    #     self,
-    #     x: List[torch.Tensor],
-    #     t: torch.Tensor,
-    #     context: List[torch.Tensor],
-    #     y: Optional[List[torch.Tensor]] = None,
-    # ) -> List[torch.Tensor]:
-    #     """
-    #     Original Wan forward path.
-    #     """
-    #     seq_len = self._infer_seq_len_for_wan(x, y=y)
-    #     return self.dit(x=x, t=t, context=context, seq_len=seq_len, y=y)
+        在文本交叉注意力机制中
+            ref_branch暂时不参与 (需要做成一个forward函数中的optional选项)
+            让latent token生成的query attend 到 text token的key和value
 
+        target branch:
+            uses Wan patch_embedding
+            uses Wan q/k/v/o
+            uses Wan ffn
+            uses LoRA on those modules
+        reference branch:
+            uses same Wan patch_embedding
+            uses same Wan q/k/v/o
+            uses same Wan ffn
+            uses same LoRA on those modules
+        所以Lora注入和OminiControl架构下的branch attention是可以相互独立进行的 因为reference branch复用了原始&LoRA的参数
+
+        head只作用于target branch
+
+        所以流程可以为:
+        1) patchify latent branch & ref banch
+        2) position ids 
+        3) timestep embedding
+        4) text/caption/prompt condition projection
+        5) branch-aware WAN blocks
+        6) head (only latent branch)
+        7) unpachiy only target branch
+        8) return_xxx
+    
+
+    # 该函数即将废弃:
     def _forward_with_reference(
         self,
         x: List[torch.Tensor],
@@ -724,6 +822,7 @@ class FACETWanModel(nn.Module):
 
         raise ValueError(f"Unknown reference injection mode: {self.cfg.reference.injection_mode}")
 
+    # 该函数即将废弃:
     def _forward_with_reference_concat_tokens(
         self,
         x: List[torch.Tensor],
@@ -743,6 +842,7 @@ class FACETWanModel(nn.Module):
             "Recommended method is branch_attention."
         )
 
+    # 该函数即将废弃:
     def _forward_with_reference_branch_attention(
         self,
         x: List[torch.Tensor],

@@ -9,22 +9,22 @@ data_root: /mnt/highspeed/users/Arcus/openvid
 # BaseVideoDataset picks {split_dir}/{split}.json based on the split argument.
 split_dir: data/openvid/splits
 
-# video parameters (consistent with prepare.py)
+# video parameters (consistent with main.py)
 height: 480
 width: 832
 num_frames: 81
 fps: 24
 
-# ref parameters (consistent with prepare.py)
+# ref parameters (consistent with main.py)
 ref_size: 480
-ref_per_clip: 3       # candidate ref number (prepare.py max limit)
+ref_per_clip: 3       # candidate ref number (main.py max limit)
 ref_format: png       # RGBA png; alpha=0 on padding, alpha=255 on bbox fg
 
 # latent cache 
 latent_cache: True
 latent_cache_dir: /mnt/highspeed/users/Arcus/openvid/latents
 
-# for prepare.py
+# for main.py
 prepare:
   weight_dir: weights
   csv_glob: /mnt/highspeed/users/Arcus/OPENVID_DATA/OpenHumanVid_part_*.csv
@@ -50,7 +50,7 @@ prepare:
   ref_pad_ratio: 0.20            # bbox outer padding ratio; square pad then resize
   # 1) computer vision Metrics:
   # Calibrated at target resolution (cfg.height x cfg.width = 480 x 832).
-  # When SCHP runs on raw video, prepare.py scales these thresholds by
+  # When SCHP runs on raw video, main.py scales these thresholds by
   # the raw->target fit_pad factor so the "min bbox in target space" semantic
   # stays consistent across portrait / landscape / mixed sources.
   cv_min_size:
