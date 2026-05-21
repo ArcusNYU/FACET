@@ -1,44 +1,35 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 # ============================================================
-# 1. Config
+# Config
 # ============================================================
 
-@dataclass
-class FACETLoRAConfig:
-    enabled: bool = True
-    base_model: str = "dit"
-    target_modules: Tuple[str, ...] = ("q", "k", "v", "o", "ffn.0", "ffn.2")
-    rank: int = 32
-    alpha: int = 32
-    dropout: float = 0.0
 
-    # TODO: adapter ???
-    # LoRA routing for multi-branch reference injection.
-    # "default" means use the same LoRA adapter.
-    # None means no LoRA on that branch.
-    # target_adapter: Optional[str] = "default"
-    # reference_adapter: Optional[str] = "default"
-    # text_adapter: Optional[str] = None
+@dataclass
+class FACETBaseConfig:
+    """WAN2.1-VACE base checkpoint location."""
+    load_from: str = "local"                # "local" | "huggingface"
+    id: str = "Wan-AI/Wan2.1-VACE-1.3B"
+    dir: str = "./weights/WAN2.1"           # local root of WAN weights
+    dit: str = "diffusion_pytorch_model*.safetensors"
+    t5: str = "models_t5_umt5-xxl-enc-bf16.pth"
+    vae: str = "Wan2.1_VAE.pth"
+    tokenizer: Optional[str] = None         # if None, fall back to umT5-XXL tokenizer dir under base.dir
+    # FIXME: tokenizer_dir 是 /google/umt5-xxl
 
 
 @dataclass
-class FACETReferenceConfig:
-    # enabled: bool = True
-    image_size: int = 480
-    # resize_mode: str = "center_crop_resize"
-    # encode_with_wan_vae: bool = True
-    # latent_frames: int = 1
-    detach_latent: bool = True   #TODO: ???
-
-    # OminiControl-style setting
-    timestep: float = 0.0
-    injection_mode: str = "branch_attention"  # branch_attention | concat_tokens
-    # update_reference_branch: bool = True
-    # independent_reference: bool = False
-    # kv_cache_reference: bool = True   #FIXME: 暂时不需要进行缓存 因为不涉及ref条件的复用
+class FACETWanConfig:
+    model_type: str = "vace"                          # "ti2v" | "vace"
+    patch_size: Tuple[int, int, int] = (1, 2, 2)
+    vae_temporal_stride: int = 4                      # F_lat = (F-1)//4 + 1
+    vae_spatial_stride: int = 8                       # WAN2.1: 8 | WAN2.2: 16
+    token_temporal_stride: int = 4                    # patch_size[0] * vae_temporal_stride
+    token_spatial_stride: int = 16                    # patch_size[1] * vae_spatial_stride
 
 
 @dataclass
@@ -50,12 +41,29 @@ class FACETTargetConfig:
 
 
 @dataclass
-class FACETWanConfig:
-    # model_type: str = "ti2v"
-    patch_size: Tuple[int, int, int] = (1, 2, 2)
-    vae_temporal_stride: int = 4
-    vae_spatial_stride: int = 16
-    # require_num_frames_4n_plus_1: bool = True
+class FACETReferenceConfig:
+    image_size: int = 480
+    f_offset: int = 21                      # place ref token f index at 21 (right of latent grid f=[0..20])
+    detach_latent: bool = True
+    timestep: float = 0.0                   # clean signal for ref branch
+    injection_mode: str = "branch_attention"
+    kv_cache_reference: bool = True         # inference-time only; training does not cache
+
+
+@dataclass
+class FACETLoRAConfig:
+    target_modules: Tuple[str, ...] = ("q", "k", "v", "o", "ffn.0", "ffn.2")
+    base_blocks: bool = True                # inject LoRA on dit.blocks.*
+    vace_blocks: bool = True                # inject LoRA on dit.vace_blocks.*  (incl. before_proj/after_proj)
+    rank: int = 32
+    alpha: int = 32
+    dropout: float = 0.0
+    init: str = "kaiming_zero"              # only kaiming_zero supported in v1
+
+
+@dataclass
+class FACETTextConfig:
+    max_text_len: int = 512
 
 
 @dataclass
@@ -63,4 +71,14 @@ class FACETInferenceConfig:
     num_inference_steps: int = 50
     cfg_scale: float = 5.0
     reference_guidance_scale: float = 1.0
-    output_type: str = "pil"  #TODO: ???
+    seed: Optional[int] = None
+    output_type: str = "video"              # "frames" | "video"
+
+
+@dataclass
+class FACETTrainingConfig:
+    prediction_type: str = "velocity"       # "noise" | "velocity"
+    timestep_sampling: str = "logit_normal" # "uniform" | "logit_normal"
+    loss_type: str = "mse"
+    ref_dropout_prob: float = 0.05
+    text_dropout_prob: float = 0.10

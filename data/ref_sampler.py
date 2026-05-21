@@ -28,6 +28,7 @@ import numpy as np
 from PIL import Image
 
 
+# FIXME: 把物体的背景颜色更改为不太接近物体的颜色任意之一 而不是现在的最远灰度 同样避免产生归纳偏置
 class RefSampler:
     """
     Pick one reference image from the pool and implement random augmentation on the padding region.

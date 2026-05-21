@@ -23,7 +23,7 @@ Wan weights layout (cfg.prepare.weight_dir / WAN):
     Wan2.2_VAE.pth                           # video VAE ckpt
 """
 
-# FIXME: None
+# FIXME: 转为WAN2.1-VACE的版本
 # TODO: 单进程串行版本; 大数据集时可用 CUDA_VISIBLE_DEVICES + --shard 切片并发
 # TODO: 若后续允许 negative-prompt CFG dropout, 在此一并 cache null T5 embedding
 

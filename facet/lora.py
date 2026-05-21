@@ -1,6 +1,15 @@
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+
+
 # ============================================================
-# 2. LoRA
+# LoRA
 # ============================================================
+
 
 class LoRALinear(nn.Module):
     """
@@ -36,7 +45,6 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_up.weight)
 
-        # Freeze base.
         for p in self.base.parameters():
             p.requires_grad_(False)
 

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from typing import Tuple
+from torch import nn
 
 
 # ============================================================
@@ -86,3 +88,30 @@ def write_png(arr: np.ndarray, out_path: Path) -> None:
     from PIL import Image
     out_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(arr).save(out_path)
+
+
+# ============================================================
+#                       Model utilities
+# ============================================================
+
+def resolve_dtype(dtype: str) -> torch.dtype:
+    if dtype in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    if dtype in ("fp16", "float16"):
+        return torch.float16
+    if dtype in ("fp32", "float32"):
+        return torch.float32
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _get_parent_module(root: nn.Module, module_name: str) -> Tuple[nn.Module, str]:
+    """
+    Given 'blocks.0.self_attn.q', return:
+      parent = root.blocks[0].self_attn
+      child_name = 'q'
+    """
+    parts = module_name.split(".")
+    parent = root
+    for p in parts[:-1]:
+        parent = getattr(parent, p)
+    return parent, parts[-1]
