@@ -1,30 +1,20 @@
 """
-Project-level shared utilities.
+Project-wide utilities for the FACET workspace.
 
 Shared by:
-  - loader_visual.py         (visualization)
+  - facet/model.py                 (model)
+  - loader_visual.py               (visualization)
   - data/openvid/pipeline/main.py  (dataset preprocessing)
-  - train.py / eval.py       
+  - train.py / eval.py             (training & evaluation)
 """
 
 from __future__ import annotations
-import subprocess
+
 from pathlib import Path
+from typing import List, Tuple, Union
 
-import numpy as np
 import torch
-from typing import Tuple
-from torch import nn
-
-
-# ============================================================
-#                  Tensor -> uint8 converters
-# ============================================================
-def video_to_uint8(v: torch.Tensor) -> np.ndarray:
-    """[T,3,H,W] float in [-1,1] -> [T,H,W,3] uint8 RGB."""
-    v = v.detach().cpu().clamp(-1.0, 1.0)
-    v = v.add(1.0).mul(127.5).clamp(0, 255).byte()
-    return v.permute(0, 2, 3, 1).contiguous().numpy()
+import torch.nn as nn
 
 
 def image_to_uint8(img: torch.Tensor) -> np.ndarray:
@@ -32,7 +22,6 @@ def image_to_uint8(img: torch.Tensor) -> np.ndarray:
     img = img.detach().cpu().clamp(-1.0, 1.0)
     img = img.add(1.0).mul(127.5).clamp(0, 255).byte()
     return img.permute(1, 2, 0).contiguous().numpy()
-
 
 def mask_to_uint8(m: torch.Tensor) -> np.ndarray:
     """[T,1,H,W] float in {0,1} -> [T,H,W,3] uint8 grayscale (fg=255)."""
@@ -50,7 +39,6 @@ def write_mp4(
     allow_fallback: bool = False,
 ) -> None:
     """Pipe [T,H,W,3] uint8 RGB frames to ffmpeg (libx264 yuv420p crf18).
-
     allow_fallback=False (default): raises RuntimeError when ffmpeg is absent
       -- the right behaviour for preprocessing pipelines.
     allow_fallback=True: falls back to a per-frame PNG dump under
@@ -90,28 +78,133 @@ def write_png(arr: np.ndarray, out_path: Path) -> None:
     Image.fromarray(arr).save(out_path)
 
 
-# ============================================================
-#                       Model utilities
-# ============================================================
+# ------------------------------------------------------------
+# Project root
+# ------------------------------------------------------------
 
-def resolve_dtype(dtype: str) -> torch.dtype:
-    if dtype in ("bf16", "bfloat16"):
-        return torch.bfloat16
-    if dtype in ("fp16", "float16"):
-        return torch.float16
-    if dtype in ("fp32", "float32"):
-        return torch.float32
-    raise ValueError(f"Unsupported dtype: {dtype}")
+PROJECT_ROOT: Path = Path(__file__).resolve().parent
+# obtain a fixed project root path: /nvmedata/workspace2/users/Arcus/FACET
 
-
-def _get_parent_module(root: nn.Module, module_name: str) -> Tuple[nn.Module, str]:
+def _resolve_project_root(p: Union[str, Path]) -> Path:
     """
-    Given 'blocks.0.self_attn.q', return:
-      parent = root.blocks[0].self_attn
-      child_name = 'q'
+    Obtain absolute path under the FACET project root.
+    推断p在服务器中的绝对路径 (通过组合项目绝对路径+相对于项目根目录的相对路径)
     """
-    parts = module_name.split(".")
-    parent = root
+    p = Path(p)
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    return p
+
+
+# ------------------------------------------------------------
+# dtype helpers
+# ------------------------------------------------------------
+
+_DTYPE_TABLE = {
+    "fp32": torch.float32, "float32": torch.float32, "f32": torch.float32,
+    "fp16": torch.float16, "float16": torch.float16, "f16": torch.float16, "half": torch.float16,
+    "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+}
+
+
+def _resolve_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
+    """Map a string like 'bf16' to torch.bfloat16. Passes torch.dtype through."""
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    key = str(dtype).lower()
+    if key not in _DTYPE_TABLE:
+        raise ValueError(
+            f"Unknown dtype string: {dtype!r}. "
+            f"Expected one of {sorted(_DTYPE_TABLE)}."
+        )
+    return _DTYPE_TABLE[key]
+
+
+# ------------------------------------------------------------
+# Module-tree helpers
+# ------------------------------------------------------------
+
+
+def _get_parent_module(root: nn.Module, dotted: str) -> Tuple[nn.Module, str]:
+    """
+    Resolve a dotted module path to (parent_module, child_attr_name).
+
+    Supports numeric segments for ModuleList / Sequential.
+
+    Example:
+        parent, child = _get_parent_module(dit, "blocks.0.self_attn.q")
+        # parent: dit.blocks[0].self_attn
+        # child:  "q"
+    """
+    parts = dotted.split(".")
+    parent: nn.Module = root
     for p in parts[:-1]:
-        parent = getattr(parent, p)
+        if p.isdigit():
+            parent = parent[int(p)]  # type: ignore[index]
+        else:
+            parent = getattr(parent, p)
     return parent, parts[-1]
+
+
+# ------------------------------------------------------------
+# Path helpers
+# ------------------------------------------------------------
+
+
+def _has_glob_wildcard(pattern: str) -> bool:
+    """
+    Check if the pattern contains glob wildcards ('*', '?', '[').
+    """
+    return any(c in pattern for c in "*?[")
+
+
+def _resolve_local_path(dir_or_file: Union[str, Path], pattern: str) -> str:
+    """
+    Resolve `pattern` under `dir_or_file` to a single absolute path.
+
+    - If `pattern` contains glob wildcards ('*', '?', '['), the function globs
+      and [asserts exactly ONE match].
+    - Otherwise it joins `dir_or_file/pattern` directly. 
+      Works for files AND directories (!used by the tokenizer path resolution).
+    """
+    base = _resolve_project_root(dir_or_file)
+    if not base.exists():
+        raise FileNotFoundError(f"Base directory not found: {base}")
+
+    if _has_glob_wildcard(pattern):
+        matches = sorted(base.glob(pattern))
+        if len(matches) == 0:
+            raise FileNotFoundError(
+                f"No file matched pattern {pattern!r} under {base}."
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"Pattern {pattern!r} under {base} matched {len(matches)} files. "
+                f"Use _resolve_local_paths for multi-shard checkpoints."
+            )
+        return str(matches[0])
+
+    full = base / pattern
+    if not full.exists():
+        raise FileNotFoundError(f"Path not found: {full}")
+    return str(full)
+
+
+def _resolve_local_paths(dir_or_file: Union[str, Path], pattern: str) -> List[str]:
+    """Same as `_resolve_local_path` but returns a sorted list of all matches."""
+    base = _resolve_project_root(dir_or_file)
+    if not base.exists():
+        raise FileNotFoundError(f"Base directory not found: {base}")
+
+    if _has_glob_wildcard(pattern):
+        matches = sorted(base.glob(pattern))
+        if len(matches) == 0:
+            raise FileNotFoundError(
+                f"No file matched pattern {pattern!r} under {base}."
+            )
+        return [str(m) for m in matches]
+
+    full = base / pattern
+    if not full.exists():
+        raise FileNotFoundError(f"Path not found: {full}")
+    return [str(full)]

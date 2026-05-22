@@ -49,4 +49,11 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.lora_up(self.lora_down(self.dropout(x))) * self.scale
+        base_out = self.base(x)
+        lora_out = self.lora_up(self.lora_down(self.dropout(x))) * self.scale
+        # Safety cast: under accelerate's autocast policy lora_* params may live
+        # in fp32 while the base linear stays in bf16. Without this match the
+        # outer + would upcast everything and silently break dtype invariants.
+        if lora_out.dtype != base_out.dtype:
+            lora_out = lora_out.to(base_out.dtype)
+        return base_out + lora_out

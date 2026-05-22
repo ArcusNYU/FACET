@@ -53,8 +53,9 @@ class FACETReferenceConfig:
 @dataclass
 class FACETLoRAConfig:
     target_modules: Tuple[str, ...] = ("q", "k", "v", "o", "ffn.0", "ffn.2")
-    on_base_blocks: bool = True                # inject LoRA on dit.blocks.*
-    on_vace_blocks: bool = True                # inject LoRA on dit.vace_blocks.*  (incl. before_proj/after_proj)
+    on_base_blocks: bool = True             # inject LoRA on dit.blocks.*
+    on_vace_blocks: bool = True             # inject LoRA on dit.vace_blocks.*  (incl. before_proj/after_proj)
+    on_cross_attn:  bool = False            # if False, q/k/v/o in cross_attn are skipped
     rank: int = 32
     alpha: int = 32
     dropout: float = 0.0
