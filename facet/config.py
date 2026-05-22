@@ -18,8 +18,8 @@ class FACETBaseConfig:
     dit: str = "diffusion_pytorch_model*.safetensors"
     t5: str = "models_t5_umt5-xxl-enc-bf16.pth"
     vae: str = "Wan2.1_VAE.pth"
-    tokenizer: Optional[str] = None         # if None, fall back to umT5-XXL tokenizer dir under base.dir
-    # FIXME: tokenizer_dir 是 /google/umt5-xxl
+    # tokenizer: Optional[str] = None         # if None, fall back to umT5-XXL tokenizer dir under base.dir # FIXME: tokenizer_dir 是 /google/umt5-xxl
+    tokenizer: str = "google/umt5-xxl"
 
 
 @dataclass
@@ -53,8 +53,8 @@ class FACETReferenceConfig:
 @dataclass
 class FACETLoRAConfig:
     target_modules: Tuple[str, ...] = ("q", "k", "v", "o", "ffn.0", "ffn.2")
-    base_blocks: bool = True                # inject LoRA on dit.blocks.*
-    vace_blocks: bool = True                # inject LoRA on dit.vace_blocks.*  (incl. before_proj/after_proj)
+    on_base_blocks: bool = True                # inject LoRA on dit.blocks.*
+    on_vace_blocks: bool = True                # inject LoRA on dit.vace_blocks.*  (incl. before_proj/after_proj)
     rank: int = 32
     alpha: int = 32
     dropout: float = 0.0

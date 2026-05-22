@@ -13,7 +13,7 @@ model:
     t5: "models_t5_umt5-xxl-enc-bf16.pth"
     vae: "Wan2.1_VAE.pth"
     # 14B模型的 text encoder & VAE 权重并非.pth 而是权重文件夹
-    tokenizer: null
+    tokenizer: "google/umt5-xxl"
 
   dtype: "bf16"
   device: "cuda"  # "cuda" | "cpu" | "auto"
@@ -51,8 +51,8 @@ model:
     # FIXME: 下面部分需要进行修改 因为 base blocks & vace blocks 需要注入LoRA的权重不同
     # base_model: "dit"
     target_modules: ["q", "k", "v", "o", "ffn.0", "ffn.2"]
-    base_blocks: True  # 对于WAN DiT blocks注入LoRA参数
-    vace_blocks: True  # 对于VaceWanBlock注入LoRA参数
+    on_base_blocks: True  # 对于WAN DiT blocks注入LoRA参数
+    on_vace_blocks: True  # 对于VaceWanBlock注入LoRA参数
     rank: 32     # 沿用 DiffSynth 的设置
     alpha: 32
     dropout: 0.0

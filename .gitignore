@@ -1,11 +1,12 @@
 # model libraries
 CLIP-IQA/
-DiffSynth/
+# DiffSynth/
 OminiControl/
 VACE/
 weights/
 example/
 
-
+WAN2.1/
+WAN2.2/
 
 schp_results/

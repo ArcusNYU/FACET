@@ -1,20 +1,12 @@
 """
 FACET / WAN2.1-VACE-1.3B + OminiControl LoRA fine-tuning model.
 
-This file contains everything except the per-step `forward()` and the inference
-`generate()` loop (those land in Step 2). What is implemented here:
-
-    A. FACETConfig        : top-level config, mirrors facet/config.yaml -> dataclasses
-    B. LoRA injection     : suffix-based matcher + LoRALinear replacement
-    C. Utilities          : tensor <-> list conversion, video size validator
-    D. FACETWanModel      : ctor + base component loader + freeze + LoRA + (no_grad) encoders
-
-Reference layout (from facet/model_frame.py):
+Reference layout:
 
   base (target) branch (x):   [B, 16, F_lat=21, 60, 104]  -- WAN2.1 VAE z_dim=16
-  vace branch        (c):   [B, 96, F_lat=21, 60, 104]  -- (inactive,reactive) latent + 64ch mask
-  reference branch   (r):   [B, 16,         1, 30, 30]  -- single image VAE latent
-  text branch        (t):   [B, 512, 4096] T5 -> 1536 dim
+  vace branch          (c):   [B, 96, F_lat=21, 60, 104]  -- (inactive,reactive) latent + 64ch mask
+  reference branch     (r):   [B, 16,         1, 30, 30]  -- single image VAE latent
+  text branch          (t):   [B, 512, 4096] T5 -> 1536 dim
 
 Hidden dims for WAN2.1-VACE-1.3B: dim=1536, num_heads=12, ffn_dim=8960, num_layers=30,
 vace_layers = [0, 2, ..., 28] (15 layers).
@@ -33,14 +25,10 @@ import yaml
 from PIL import Image
 
 from .config import (
-    FACETBaseConfig,
-    FACETInferenceConfig,
-    FACETLoRAConfig,
-    FACETReferenceConfig,
-    FACETTargetConfig,
-    FACETTextConfig,
-    FACETTrainingConfig,
-    FACETWanConfig,
+    FACETBaseConfig,     FACETInferenceConfig,
+    FACETLoRAConfig,     FACETReferenceConfig,
+    FACETTargetConfig,   FACETTextConfig,
+    FACETTrainingConfig, FACETWanConfig,
 )
 from .lora import LoRALinear
 from .utils import (
@@ -48,7 +36,7 @@ from .utils import (
     _resolve_dtype,
     _resolve_local_path,
     _resolve_local_paths,
-)
+) # FIXME: from ..utils import xxx
 
 
 logger = logging.getLogger(__name__)
@@ -135,9 +123,9 @@ class FACETConfig:
 # ============================================================
 
 
-def _module_name_matches_suffix(name: str, target_modules: Sequence[str]) -> bool:
+def _suffix_match(name: str, target_modules: Sequence[str]) -> bool:
     """
-    True if `name` ends with any of `target_modules`.
+    模块名尾标匹配: True if `name` ends with any of `target_modules`.
 
     Handles both single-segment ("q") and multi-segment ("ffn.0") suffixes.
 
@@ -166,19 +154,19 @@ def lora_targets(
     Rules:
       - The module must be inside dit.blocks.* (`in_base_block`) or
         dit.vace_blocks.* (`in_vace_block`).
-      - `lora_cfg.base_blocks` / `lora_cfg.vace_blocks` toggles whole regions.
+      - `lora_cfg.on_base_blocks` / `lora_cfg.on_vace_blocks` toggles whole regions.
       - Suffix must be in `target_modules`, OR for vace blocks we additionally
         always include {before_proj, after_proj} since these are VACE-only
         projections without a counterpart in base WAN blocks.
     """
-    if in_base_block and not lora_cfg.base_blocks:
+    if in_base_block and not lora_cfg.on_base_blocks:
         return False
-    if in_vace_block and not lora_cfg.vace_blocks:
+    if in_vace_block and not lora_cfg.on_vace_blocks:
         return False
     if not (in_base_block or in_vace_block):
         return False
 
-    if _module_name_matches_suffix(name, target_modules):
+    if _suffix_match(name, target_modules):
         return True
 
     if in_vace_block and (
@@ -194,12 +182,12 @@ def inject_lora(
     lora_cfg: FACETLoRAConfig,
 ) -> List[str]:
     """
-    Walk `root`, replace every matching nn.Linear with LoRALinear in-place.
+    Replace target modules with LoRALinear in-place by setting LoRA attributes.
 
     Returns the list of replaced module paths (for logging / debugging).
 
-    NOTE: `root` must be the dit (transformer) module. We deliberately do NOT
-    iterate over vae / text_encoder.
+    NOTE: `root` must be the DiT (transformer) module.
+    Deliberately do NOT iterate over vae / text_encoder.
     """
     replaced: List[str] = []
 
@@ -239,7 +227,7 @@ def inject_lora(
 # ============================================================
 # C. Utilities
 # ============================================================
-
+# TODO: 之后把utitlies部分移到末尾 提升model.py阅读性
 
 def latent_frames_from_num_frames(num_frames: int, temporal_stride: int = 4) -> int:
     """F_lat = (F - 1) // temporal_stride + 1, with WAN's 4n+1 constraint."""
@@ -327,10 +315,10 @@ class FACETWanModel(nn.Module):
     FACET model wrapper.
 
     Training:
-        forward() does one denoising prediction step. (implemented in Step 2)
+        forward() does one denoising prediction step.
 
     Inference:
-        generate() does full denoising loop. (implemented in Step 2)
+        generate() does full denoising loop.
 
     This class uses composition over inheritance: it owns a DiffSynth
     WanVideoPipeline and delegates dit / vae / text_encoder to it.
@@ -353,6 +341,7 @@ class FACETWanModel(nn.Module):
 
         self._load_base_components()
         self._freeze_base()
+
         self._lora_replaced: List[str] = []
         self._init_lora()
 
@@ -384,11 +373,14 @@ class FACETWanModel(nn.Module):
               dit: diffusion_pytorch_model*.safetensors
               t5:  models_t5_umt5-xxl-enc-bf16.pth
               vae: Wan2.1_VAE.pth
+              tokenizer: google/umt5-xxl
 
         is resolved to absolute local paths via glob.
         """
-        # Late import: DiffSynth pulls in flash_attn etc, so we only import
-        # when actually constructing a model.
+        # NOTE: Late import: DiffSynth pulls in flash_attn etc, 
+        # so only import when actually constructing a model.
+        # NOTE: 通过DiffSynth的WanVideoPipeline加载模型权重 使得最开始所有组件都在self.device=gpu上
+        # 而后进行acc放置的时候 权重依然是在gpu上
         from diffsynth.pipelines.wan_video import (
             WanVideoPipeline,
             ModelConfig as DSModelConfig,
@@ -401,31 +393,19 @@ class FACETWanModel(nn.Module):
             dit_paths = _resolve_local_paths(bcfg.dir, bcfg.dit)   # may be sharded
             t5_path = _resolve_local_path(bcfg.dir, bcfg.t5)
             vae_path = _resolve_local_path(bcfg.dir, bcfg.vae)
+            tokenizer_path = _resolve_local_path(bcfg.dir, bcfg.tokenizer)
 
             model_configs = [
                 DSModelConfig(path=dit_paths if len(dit_paths) > 1 else dit_paths[0]),
                 DSModelConfig(path=t5_path),
                 DSModelConfig(path=vae_path),
             ]
-            # tokenizer: either a yaml override, or fall back to local subdir.
-            if bcfg.tokenizer:
-                tok_path = bcfg.tokenizer
-            else:
-                # DiffSynth's default is "google/umt5-xxl" tokenizer dir.
-                # Look for it under base.dir/google/umt5-xxl
-                tok_dir = os.path.join(bcfg.dir, "google", "umt5-xxl")
-                if not os.path.isdir(tok_dir):
-                    raise FileNotFoundError(
-                        f"Tokenizer dir not found: {tok_dir}. "
-                        "Set model.base.tokenizer in yaml to override."
-                    )
-                tok_path = tok_dir
-            tokenizer_config = DSModelConfig(path=tok_path)
+            tokenizer_config = DSModelConfig(path=tokenizer_path)
         elif bcfg.load_from == "huggingface":
             # Reserved for ablation. Today we only allow local because the
             # weights are pre-staged on disk.
             raise NotImplementedError(
-                "huggingface loading is intentionally disabled in FACET v1. "
+                "huggingface loading is intentionally disabled in FACET. "
                 "Pre-download weights and use load_from: local."
             )
         else:
@@ -458,8 +438,8 @@ class FACETWanModel(nn.Module):
         if self.vace is None:
             raise RuntimeError(
                 "WanVideoPipeline did not load the VACE branch. "
-                "Make sure you are using the VACE checkpoint "
-                "(Wan2.1-VACE-1.3B), not the plain T2V."
+                "Make sure using the VACE checkpoint "
+                "(Wan2.1-VACE-1.3B/14B), not the plain T2V."
             )
 
     # --------------------------------------------------------
@@ -468,11 +448,11 @@ class FACETWanModel(nn.Module):
 
     def _freeze_base(self) -> None:
         """
-        Freeze everything before LoRA injection.
+        Freeze pipeline base components before LoRA injection.
+        将基础参数冻结 并将模块设置为eval模式
+        LoRA-bearing modules will re-enable grad on their own lora_down/lora_up parameters during forward; 
+        Additionally re-set 'requires_grad' after _init_lora() to be explicit.
 
-        LoRA-bearing modules will re-enable grad on their own lora_down/lora_up
-        parameters during forward; we additionally re-set requires_grad after
-        _init_lora() to be explicit.
         """
         for p in self.parameters():
             p.requires_grad_(False)
@@ -487,19 +467,16 @@ class FACETWanModel(nn.Module):
         """
         Inject LoRA into dit.blocks.* (base) and dit.vace_blocks.* (vace).
 
-        We rely on the convention that VACE blocks are stored as
-            self.pipe.vace.vace_blocks
-        in DiffSynth's VaceWanModel. To allow `inject_lora` to find both
-        regions with simple prefix tests, we walk vace under its own root.
+        NOTE: VACE blocks are stored as self.pipe.vace.vace_blocks in DiffSynth's VaceWanModel.
         """
         replaced: List[str] = []
 
-        if self.dit is not None and self.cfg.lora.base_blocks:
+        if self.dit is not None and self.cfg.lora.on_base_blocks:
             replaced += [
                 "dit." + n for n in inject_lora(self.dit, self.cfg.lora)
             ]
 
-        if self.vace is not None and self.cfg.lora.vace_blocks:
+        if self.vace is not None and self.cfg.lora.on_vace_blocks:
             replaced += [
                 "vace." + n for n in inject_lora(self.vace, self.cfg.lora)
             ]
@@ -508,7 +485,7 @@ class FACETWanModel(nn.Module):
             raise RuntimeError(
                 "No LoRA modules were injected. "
                 f"Check lora.target_modules={list(self.cfg.lora.target_modules)} "
-                "against your Wan / VACE module names."
+                "against Wan / VACE module names."
             )
 
         # Re-enable grad ONLY on lora_down / lora_up parameters.
@@ -518,6 +495,7 @@ class FACETWanModel(nn.Module):
         self._lora_replaced = replaced
 
         logger.info("[FACET] Injected LoRA into %d modules.", len(replaced))
+        # TODO: # 
         for name in replaced[:20]:
             logger.info("  - %s", name)
         if len(replaced) > 20:
@@ -549,8 +527,8 @@ class FACETWanModel(nn.Module):
 
     def load_lora(self, path: str, strict: bool = False) -> None:
         """
-        Load LoRA weights. _init_lora() must have run first so that the matching
-        LoRALinear modules already exist in the model.
+        Load LoRA weights. 
+        # NOTE: using after _init_lora().
         """
         from safetensors.torch import load_file
 
@@ -581,8 +559,7 @@ class FACETWanModel(nn.Module):
 
         Priority:
           - if `prompt_embeds` is given, normalize and return as a list directly
-            (this is the common training path: we precompute and cache T5 hidden
-             states in the data pipeline).
+            (common training path: precompute and cache T5 hidden states in the data pipeline).
           - else encode `prompt` via WAN text encoder + tokenizer.
 
         Output shape: List length B, each [L_i, 4096], L_i <= cfg.text.max_text_len.
@@ -603,8 +580,7 @@ class FACETWanModel(nn.Module):
         if self.text_encoder is None or self.tokenizer is None:
             raise RuntimeError("text_encoder/tokenizer not loaded.")
 
-        # WanVideoPipeline keeps the text_encoder on its own device. We use
-        # the same call signature DiffSynth uses internally.
+        # WanVideoPipeline keeps the text_encoder on its own device.
         device = next(self.text_encoder.parameters()).device
 
         ids, mask = self.tokenizer(
@@ -614,10 +590,10 @@ class FACETWanModel(nn.Module):
         )
         ids = ids.to(device)
         mask = mask.to(device)
-        seq_lens = mask.gt(0).sum(dim=1).long()
+        seq_lens = mask.gt(0).sum(dim=1).long() # real sequence length
         context = self.text_encoder(ids, mask)  # [B, L_max, 4096]
         # strip padding per sample to match WAN forward's expected list format.
-        return [u[:int(l)] for u, l in zip(context, seq_lens)]
+        return [u[:int(l)] for u, l in zip(context, seq_lens)] # strip padding using ":int(l)"
 
     @torch.no_grad()
     def encode_reference_image(
@@ -637,16 +613,24 @@ class FACETWanModel(nn.Module):
 
         Returned list element shape: [16, 1, H/8, W/8].
 
-        We DO NOT resize here when the input is already a tensor at
-        cfg.reference.image_size; we trust the data pipeline to have done it
-        (see data/transform.py:RefTfm). For raw PIL we delegate to DiffSynth's
-        pipe.preprocess_video on a single-frame list, which handles
+        'Resize' & 'Normalize' are not performed here since data pipeline has already done it. (data/transform.py:RefTfm). 
+        For raw PIL, delegate to DiffSynth's pipe.preprocess_video on a single-frame list, which handles
         center-crop / resize / normalize to [-1, 1].
 
-        NOTE: We do not consume RGBA alpha here. The dataset has already done
-        background augmentation before storing the tensor on disk. If you pass
-        a PIL.Image with mode RGBA, the alpha channel is dropped here.
+        NOTE: RGBA alphas are not consumed here.
+        The dataset has already done background augmentation before storing the tensor on disk. 
+        If a PIL.Image with mode RGBA is passed, the alpha channel is dropped here.
         """
+
+        # NOTE: 如果传入的pil/tensor是多个 那么该函数会默认是batch维度 并不具备是否是单张reference image的判断
+        # 在后续的模型forward的过程中 会检测 batch size 是否与 reference image总数恰好对齐
+        # 在此项目的对外展示demo中 如果用户走gradio demo 那么 reference image也会先经过SCHP得到mask 再转化为tensor传入
+        # 所以此函数默认了 如果传入的类型是tensor 那么就已经是走transform进行了 resize & normalize
+        # 如果用户绕开整个pre-process 直接传入PIL Image 那么就默认使用粗糙的_encode_ref_pil进行处理
+
+        # FIXME: encode_reference_image & _encode_ref_pil 中凡是使用 self.vae.encode 的地方 
+        # 传入的tensor必须是 float32 否则会出现值溢出异常  VAE本身在迁移到acc时 也需要为 fp32
+
         if self.vae is None:
             raise RuntimeError("VAE not loaded.")
 
@@ -709,8 +693,8 @@ class FACETWanModel(nn.Module):
     ) -> List[torch.Tensor]:
         """
         Path used when caller passed PIL images. Routes through pipe.preprocess_video
-        on a single-frame "video" so that we reuse DiffSynth's normalization
-        (resize + (x-0.5)/0.5 + permute) instead of re-implementing it here.
+        on a single-frame "video" so that DiffSynth's normalization
+        (resize + (x-0.5)/0.5 + permute) is reused instead of re-implementing it here.
         """
         # Each PIL becomes a single-frame "video" of length 1.
         resized = [im.convert("RGB").resize((ref_size, ref_size)) for im in pil_list]
@@ -734,7 +718,7 @@ class FACETWanModel(nn.Module):
     def decode_latents(
         self,
         latents: Union[List[torch.Tensor], torch.Tensor],
-        output_type: str = "video",
+        output_type: str = "video",  #FIXME: 改内容并没有用到 需要迁移到pipeline forward中
     ) -> torch.Tensor:
         """
         Decode target video latents [B, 16, F_lat, H/8, W/8] -> pixel-space tensor.
@@ -742,6 +726,7 @@ class FACETWanModel(nn.Module):
         Returns a stacked tensor [B, 3, F, H, W] in [-1, 1].
         Postprocess (uint8, PIL frame list, mp4 encode...) is the pipeline's job.
         """
+        # FIXME: 在使用vae进行decode之前 latents必须是fp32 
         latents = ensure_latent_list(latents)
 
         # DiffSynth's WanVideoVAE.decode wants a stacked tensor.
@@ -823,7 +808,7 @@ class FACETWanModel(nn.Module):
             freqs of shape [f*h*w, 1, head_dim/2] ready to multiply with q/k.
         """
         if self.dit is None:
-            raise RuntimeError("dit not loaded.")
+            raise RuntimeError("DiT not loaded.")
         # DiffSynth WanModel stores precomputed 1D freqs as a tuple of three
         # complex tensors (f_freqs, h_freqs, w_freqs) on self.dit.freqs.
         f_freqs, h_freqs, w_freqs = self.dit.freqs
@@ -858,39 +843,37 @@ class FACETWanModel(nn.Module):
         timestep: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Convert [B]-shaped diffusion timestep into the (B, 6, dim) modulation
-        tensor that every WAN attention block consumes.
+        Convert [B]-shaped diffusion timestep into the (B, 6, dim) modulation.
 
-        Used by the custom block forward in Step 2 so the ref branch can be
-        modulated with t=0 while the base branch is modulated with the current
-        diffusion timestep.
+        The base branch is modulated with the current diffusion timestep,
+        while the reference branch is modulated with t=0.
         """
         # Late-bound import to avoid pulling DiffSynth at module load time.
         from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
 
         if self.dit is None:
-            raise RuntimeError("dit not loaded.")
+            raise RuntimeError("DiT not loaded.")
 
         dit = self.dit
         device = next(dit.parameters()).device
         timestep = timestep.to(device=device)
 
         # Cast to the dtype the rest of the dit expects.
-        t_emb = sinusoidal_embedding_1d(dit.freq_dim, timestep).to(self.dtype)
+        t_emb = sinusoidal_embedding_1d(dit.freq_dim, timestep).to(self.dtype) #freq_dim = 1024
         t = dit.time_embedding(t_emb)
         t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))  # [B, 6, dim]
         return t_mod
 
 
 # ============================================================
-# E. Public pipeline (kept light here; full inference lands in Step 2)
+# E. Public pipeline
 # ============================================================
 
 
 class FACETPipeline:
     """
     Thin user-facing wrapper. Real inference loop lives in
-    FACETWanModel.generate(); we add input validation + RNG plumbing here.
+    FACETWanModel.generate(); input validation + RNG plumbing are added here.
     """
 
     def __init__(self, model: FACETWanModel):
@@ -899,10 +882,8 @@ class FACETPipeline:
 
     @torch.no_grad()
     def __call__(self, *args, **kwargs):
-        # generate() will be implemented in Step 2; for now this routes through
-        # so importing the module is safe before the loop is finished.
         if not hasattr(self.model, "generate"):
             raise NotImplementedError(
-                "FACETWanModel.generate() is not implemented yet (Step 2)."
+                "FACETWanModel.generate() is not implemented yet."
             )
         return self.model.generate(*args, **kwargs)

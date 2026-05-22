@@ -38,7 +38,7 @@ class BaseVideoDataset(Dataset):
         video = self.tfm.video(meta["video"])           # [T,3,H,W] in [-1,1]
         mask  = self.tfm.mask(meta["mask"])             # [T,1,H,W] in {0,1}, perturbed
         masked_video = video * (1.0 - mask)             # [T,3,H,W]
-        
+        # FIXME: 因为模型结构变化 dataloader提供的内容需要有所变化 对话 - Loader Chain v2
         ref_img = self.ref_sampler.pick(meta["ref_pool"], meta["mask"])
         ref_img = self.tfm.ref(ref_img)                 # [3,H,W] in [-1,1]
         #NOTE: difference of ref_sampler and ref_tfm:
