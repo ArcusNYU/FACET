@@ -223,90 +223,9 @@ def inject_lora(
 
 
 # ============================================================
-# C. Utilities
+# C. Block-level branch attention forward
 # ============================================================
-# TODO: 之后把utitlies部分移到末尾 提升model.py阅读性
-
-def latent_frames_from_num_frames(num_frames: int, temporal_stride: int = 4) -> int:
-    """F_lat = (F - 1) // temporal_stride + 1, with WAN's 4n+1 constraint."""
-    assert (num_frames - 1) % temporal_stride == 0, (
-        f"num_frames should be {temporal_stride}n+1 for WAN-style video VAE, "
-        f"got {num_frames}"
-    )
-    return (num_frames - 1) // temporal_stride + 1
-
-
-def ensure_latent_list(
-    x: Union[torch.Tensor, List[torch.Tensor]],
-) -> List[torch.Tensor]:
-    """
-    WAN expects List[Tensor] in several interface.
-
-    Accept:
-      [B, C, F, H, W] -> List of B tensors [C, F, H, W]
-      [C, F, H, W]    -> List of 1 tensor
-      List[Tensor]    -> unchanged
-    """
-    if isinstance(x, list):
-        return x
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"Expected Tensor or List[Tensor], got {type(x)}")
-    if x.ndim == 5:
-        return [x[i] for i in range(x.shape[0])]
-    if x.ndim == 4:
-        return [x]
-    raise ValueError(
-        f"Expected latent tensor with ndim 4 or 5, got shape {tuple(x.shape)}"
-    )
-
-
-def ensure_context_list(
-    x: Union[torch.Tensor, List[torch.Tensor]],
-) -> List[torch.Tensor]:
-    """
-    T5/WAN cross-attn context list normalizer.
-
-    Accept:
-      [B, L, D]    -> List of B tensors [L, D]
-      [L, D]       -> List of 1 tensor
-      List[Tensor] -> unchanged
-    """
-    if isinstance(x, list):
-        return x
-    if not isinstance(x, torch.Tensor):
-        raise TypeError(f"Expected Tensor or List[Tensor], got {type(x)}")
-    if x.ndim == 3:
-        return [x[i] for i in range(x.shape[0])]
-    if x.ndim == 2:
-        return [x]
-    raise ValueError(
-        f"Expected context tensor with ndim 2 or 3, got shape {tuple(x.shape)}"
-    )
-
-
-def validate_video_size(
-    height: int,
-    width: int,
-    num_frames: int,
-    hw_multiple: int = 32,
-    temporal_stride: int = 4,
-) -> None:
-    if height % hw_multiple != 0 or width % hw_multiple != 0:
-        raise ValueError(
-            f"height and width must be divisible by {hw_multiple}. "
-            f"Got height={height}, width={width}."
-        )
-    if (num_frames - 1) % temporal_stride != 0:
-        raise ValueError(
-            f"num_frames must be {temporal_stride}n+1 for WAN-style video VAE. "
-            f"Got {num_frames}."
-        )
-
-
-# ============================================================
-# D. Block-level branch attention forward
-# ============================================================
-# TODO: check or moved to block.py / module.py
+# TODO: 后期考虑移动到 module.py 因为模型结构可能会做消融实验
 
 def facet_block_forward(
     block: nn.Module,
@@ -1024,8 +943,12 @@ class FACETWanModel(nn.Module):
         vace_scale: float = 1.0,
         return_dict: bool = True,
     ) -> Union[Dict[str, Any], List[torch.Tensor]]:
+        # FIXME: 既然现在forward是自定义的 那么完全不用再要求输入是list 而是直接传入tensor
+        # 要不然dataloader把tensor改成list  这里又从list改成tensor 又要改回来 太麻烦了
+        # 某些地方的ensure_latent_list & ensure_context_list 可以考虑取消了
+        # 当然 text & vace_context 还是需要list 
         """
-        One denoising step (training & generation share this).
+        One denoising step.
 
         Args:
             noisy_latents:     List of [16, F_lat, h, w]   (or stacked tensor)
@@ -1041,11 +964,13 @@ class FACETWanModel(nn.Module):
             Interpretation (noise vs velocity) follows cfg.training.prediction_type;
             for FlowMatch + 'velocity' the model predicts noise - sample.
         """
+        # NOTE: noisy_latents & reference_latents  用stacked tensor就可以了 不需要要求list 也不需要'ensure list'
+        # prompt_embeds & vace_context 还是需要list
         # ---- 0. Normalize inputs ----
         noisy_latents = ensure_latent_list(noisy_latents)
         prompt_embeds = ensure_context_list(prompt_embeds)
         reference_latents = ensure_latent_list(reference_latents)
-        if vace_context is not None:
+        if vace_context is not None:  # FIXME: vace_context肯定需要 不需要判断是否是None
             vace_context = ensure_latent_list(vace_context)
 
         B = len(noisy_latents)
@@ -1069,10 +994,11 @@ class FACETWanModel(nn.Module):
         # Cast latents to model dtype (training script may pass fp32).
         noisy_latents = [l.to(device=self.device, dtype=self.dtype) for l in noisy_latents]
         reference_latents = [l.to(device=self.device, dtype=self.dtype) for l in reference_latents]
-        if vace_context is not None:
+        if vace_context is not None:   # FIXME: 同样地 不需要判断 直接cast
             vace_context = [c.to(device=self.device, dtype=self.dtype) for c in vace_context]
 
         # ---- 1. Patchify base branch ----
+        # FIXME: 转成tensor而非list 并把过程中tensor形状变化标出来 
         # patch_embedding: Conv3d (kernel=stride=(1,2,2)) -> [1, dim, F_lat, h/2, w/2]
         x_list = [self.dit.patch_embedding(u.unsqueeze(0)) for u in noisy_latents]
         # Assume same grid across batch (true for fixed H,W,F training).
@@ -1082,6 +1008,7 @@ class FACETWanModel(nn.Module):
         )  # [B, L_base, dim]
 
         # ---- 2. Patchify reference branch (uses same dit.patch_embedding) ----
+        # FIXME: 转成tensor而非list
         r_list = [self.dit.patch_embedding(u.unsqueeze(0)) for u in reference_latents]
         f_ref, h_ref, w_ref = r_list[0].shape[2:]
         x_ref = torch.cat(
@@ -1430,3 +1357,84 @@ class FACETPipeline:
         for clip in v:
             out.append([Image.fromarray(frame) for frame in clip])
         return out
+
+
+# ============================================================
+# C. Utilities
+# ============================================================
+# TODO: 之后把utitlies部分移到末尾 提升model.py阅读性
+
+def latent_frames_from_num_frames(num_frames: int, temporal_stride: int = 4) -> int:
+    """F_lat = (F - 1) // temporal_stride + 1, with WAN's 4n+1 constraint."""
+    assert (num_frames - 1) % temporal_stride == 0, (
+        f"num_frames should be {temporal_stride}n+1 for WAN-style video VAE, "
+        f"got {num_frames}"
+    )
+    return (num_frames - 1) // temporal_stride + 1
+
+
+def ensure_latent_list(
+    x: Union[torch.Tensor, List[torch.Tensor]],
+) -> List[torch.Tensor]:
+    """
+    WAN expects List[Tensor] in several interface.
+
+    Accept:
+      [B, C, F, H, W] -> List of B tensors [C, F, H, W]
+      [C, F, H, W]    -> List of 1 tensor
+      List[Tensor]    -> unchanged
+    """
+    if isinstance(x, list):
+        return x
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"Expected Tensor or List[Tensor], got {type(x)}")
+    if x.ndim == 5:
+        return [x[i] for i in range(x.shape[0])]
+    if x.ndim == 4:
+        return [x]
+    raise ValueError(
+        f"Expected latent tensor with ndim 4 or 5, got shape {tuple(x.shape)}"
+    )
+
+
+def ensure_context_list(
+    x: Union[torch.Tensor, List[torch.Tensor]],
+) -> List[torch.Tensor]:
+    """
+    T5/WAN cross-attn context list normalizer.
+
+    Accept:
+      [B, L, D]    -> List of B tensors [L, D]
+      [L, D]       -> List of 1 tensor
+      List[Tensor] -> unchanged
+    """
+    if isinstance(x, list):
+        return x
+    if not isinstance(x, torch.Tensor):
+        raise TypeError(f"Expected Tensor or List[Tensor], got {type(x)}")
+    if x.ndim == 3:
+        return [x[i] for i in range(x.shape[0])]
+    if x.ndim == 2:
+        return [x]
+    raise ValueError(
+        f"Expected context tensor with ndim 2 or 3, got shape {tuple(x.shape)}"
+    )
+
+
+def validate_video_size(
+    height: int,
+    width: int,
+    num_frames: int,
+    hw_multiple: int = 32,
+    temporal_stride: int = 4,
+) -> None:
+    if height % hw_multiple != 0 or width % hw_multiple != 0:
+        raise ValueError(
+            f"height and width must be divisible by {hw_multiple}. "
+            f"Got height={height}, width={width}."
+        )
+    if (num_frames - 1) % temporal_stride != 0:
+        raise ValueError(
+            f"num_frames must be {temporal_stride}n+1 for WAN-style video VAE. "
+            f"Got {num_frames}."
+        )
