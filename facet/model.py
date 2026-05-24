@@ -30,7 +30,7 @@ from .config import (
     FACETTargetConfig,   FACETTextConfig,
     FACETTrainingConfig, FACETWanConfig,
 )
-from .lora import LoRALinear
+from .lora import inject_lora
 
 from utils import (
     _get_parent_module,
@@ -120,112 +120,10 @@ class FACETConfig:
 
 
 # ============================================================
-# B. LoRA targeting and injection
+# B. Block-level branch attention forward
 # ============================================================
+# TODO: 后期考虑移动到 module.py 因为模型结构可能会做消融实验 现阶段暂不考虑
 
-
-def _suffix_match(name: str, target_modules: Sequence[str]) -> Optional[str]:
-    """Return the matched suffix or None. Suffixes can be 'q' or 'ffn.0'."""
-    for tm in target_modules:
-        if name == tm or name.endswith("." + tm):
-            return tm
-    return None
-
-
-def lora_targets(
-    name: str,
-    target_modules: Sequence[str],
-    in_base_block: bool,
-    in_vace_block: bool,
-    lora_cfg: FACETLoRAConfig,
-) -> bool:
-    """
-    Decide whether the nn.Linear at module path `name` should be wrapped.
-
-    Rules:
-      - Must be under dit.blocks.* or dit.vace_blocks.*.
-      - `lora_cfg.on_base_blocks` / `lora_cfg.on_vace_blocks` toggles whole regions.
-      - For q/k/v/o, cross_attn is excluded unless on_cross_attn=True (default
-        False to keep the current task focused on visual conditioning).
-      - For vace blocks, before_proj / after_proj are automatically included.
-    """
-    if in_base_block and not lora_cfg.on_base_blocks:
-        return False
-    if in_vace_block and not lora_cfg.on_vace_blocks:
-        return False
-    if not (in_base_block or in_vace_block):
-        return False
-
-    matched = _suffix_match(name, target_modules)
-
-    if matched is None:
-        if in_vace_block and (
-            name.endswith(".before_proj") or name.endswith(".after_proj")
-        ):
-            return True
-        return False
-
-    # q/k/v/o: skip cross_attn unless explicitly allowed.
-    if matched in ("q", "k", "v", "o"):
-        if ".cross_attn." in name and not lora_cfg.on_cross_attn:
-            return False
-        # Belt-and-suspenders: ensure self_attn membership unless cross_attn opt-in.
-        if ".self_attn." not in name and ".cross_attn." not in name:
-            return False
-
-    return True
-
-
-def inject_lora(
-    root: nn.Module,
-    lora_cfg: FACETLoRAConfig,
-) -> List[str]:
-    """
-    Replace target nn.Linear modules with LoRALinear in-place.
-
-    Returns the list of replaced module paths (for logging / debugging).
-
-    NOTE: `root` must be the DiT (transformer) module.
-    Deliberately do NOT iterate over vae / text_encoder.
-    """
-    replaced: List[str] = []
-
-    for name, module in list(root.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-
-        in_base_block = name.startswith("blocks.")
-        in_vace_block = name.startswith("vace_blocks.")
-
-        if not lora_targets(
-            name=name,
-            target_modules=lora_cfg.target_modules,
-            in_base_block=in_base_block,
-            in_vace_block=in_vace_block,
-            lora_cfg=lora_cfg,
-        ):
-            continue
-
-        parent, child_name = _get_parent_module(root, name)
-        setattr(
-            parent,
-            child_name,
-            LoRALinear(
-                base=module,
-                rank=lora_cfg.rank,
-                alpha=lora_cfg.alpha,
-                dropout=lora_cfg.dropout,
-            ),
-        )
-        replaced.append(name)
-
-    return replaced
-
-
-# ============================================================
-# C. Block-level branch attention forward
-# ============================================================
-# TODO: 后期考虑移动到 module.py 因为模型结构可能会做消融实验
 
 def facet_block_forward(
     block: nn.Module,
@@ -329,7 +227,7 @@ def facet_block_forward(
 
 
 # ============================================================
-# D. FACET model wrapper
+# C. FACET Wan Model wrapper
 # ============================================================
 
 
@@ -569,6 +467,10 @@ class FACETWanModel(nn.Module):
         Output: List length B, each [L_i, 4096], L_i <= cfg.text.max_text_len.
         """
         if prompt_embeds is not None:
+            if prompt is not None:
+                logger.info(
+                    "[FACET] Both prompt and prompt_embeds given; using prompt_embeds."
+                )
             return ensure_context_list(prompt_embeds)
 
         if prompt is None:
@@ -597,7 +499,7 @@ class FACETWanModel(nn.Module):
     def encode_reference_image(
         self,
         reference_images: Union[Image.Image, List[Image.Image], torch.Tensor],
-    ) -> List[torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Encode reference image(s) through WAN VAE to single-frame latents.
 
@@ -606,9 +508,10 @@ class FACETWanModel(nn.Module):
           Tensor [3, H, W]            -> batch 1
           Tensor [B, 3, H, W]         -> batch B
           Tensor [B, 3, 1, H, W]      -> already video-shaped, batch B
-          Tensor [(B,) 16, 1, h, w]   -> already latent (pre-cached); returned as-is
+          Tensor [16, 1, h, w]        -> already latent (pre-cached), batch 1
+          Tensor [B, 16, 1, h, w]     -> already latent (pre-cached), batch B
 
-        Returned element shape: [16, 1, H/8, W/8].
+        Returns: stacked tensor [B, 16, 1, H/8, W/8].
 
         'Resize' & 'Normalize' are not performed here since data pipeline has already done it. (data/transform.py:RefTfm). 
         For raw PIL, delegate to DiffSynth's pipe.preprocess_video on a single-frame list, which handles
@@ -621,7 +524,6 @@ class FACETWanModel(nn.Module):
         """
 
         # NOTE: 如果传入的pil/tensor是多个 那么该函数会默认是batch维度 并不具备是否是单张reference image的判断
-        # 在后续的模型forward的过程中 会检测 batch size 是否与 reference image总数恰好对齐
         # 在此项目的对外展示demo中 如果用户走gradio demo 那么 reference image也会先经过SCHP得到mask 再转化为tensor传入
         # 所以此函数默认了 如果传入的类型是tensor 那么就已经是走transform进行了 resize & normalize
         # 如果用户绕开整个pre-process 直接传入PIL Image 那么就默认使用粗糙的_encode_ref_pil进行处理
@@ -646,11 +548,12 @@ class FACETWanModel(nn.Module):
 
         x = reference_images
 
-        # Pre-cached latent (z_dim=16, F=1). Return as-is in list form.
-        if x.ndim == 5 and x.shape[1] == 16 and x.shape[2] == 1:
-            return ensure_latent_list(x)
+        # Pre-cached latent (z_dim=16, F=1). Normalize to [B, 16, 1, h, w].
         if x.ndim == 4 and x.shape[0] == 16 and x.shape[1] == 1:
-            return ensure_latent_list(x)
+            x = x.unsqueeze(0)
+        if x.ndim == 5 and x.shape[1] == 16 and x.shape[2] == 1:
+            out = x.to(device=self.device, dtype=self.dtype)
+            return out.detach() if self.cfg.reference.detach_latent else out
 
         # Raw pixel tensor. Normalize shape to [B, 3, 1, H, W].
         if x.ndim == 3:                           # [3, H, W]
@@ -669,38 +572,34 @@ class FACETWanModel(nn.Module):
 
         ref_latents = self.vae.encode(x, device=self.device).to(
             dtype=self.dtype, device=self.device
-        )
+        )  # [B, 16, 1, H/8, W/8]
 
-        latents = ensure_latent_list(ref_latents)
         if self.cfg.reference.detach_latent:
-            latents = [l.detach() for l in latents]
-        return latents
+            ref_latents = ref_latents.detach()
+        return ref_latents
 
     def _encode_ref_pil(
         self,
         pil_list: List[Image.Image],
         ref_size: int,
-    ) -> List[torch.Tensor]:
+    ) -> torch.Tensor:
         """
         PIL fast path: route through pipe.preprocess_video (which handles
         resize + (x-0.5)/0.5 + permute) for one-frame "videos".
+
+        Returns: [B, 16, 1, H/8, W/8].
         """
         # Each PIL becomes a single-frame "video" of length 1.
         resized = [im.convert("RGB").resize((ref_size, ref_size)) for im in pil_list]
-        # pipe.preprocess_video accepts a list of PIL frames; we wrap each PIL
-        # individually as its own one-frame clip.
-        out_latents: List[torch.Tensor] = []
-        for im in resized:
-            v = self.pipe.preprocess_video([im])  # [1, 3, 1, H, W]
-            v = v.to(device=self.device, dtype=torch.float32)
-            z = self.vae.encode(v, device=self.device).to(
-                dtype=self.dtype, device=self.device
-            )
-            z = z[0]
-            if self.cfg.reference.detach_latent:
-                z = z.detach()
-            out_latents.append(z)
-        return out_latents
+        # Stack into one [B, 3, 1, H, W] batch and VAE-encode in one shot.
+        clips = [self.pipe.preprocess_video([im]) for im in resized]  # each [1, 3, 1, H, W]
+        v = torch.cat(clips, dim=0).to(device=self.device, dtype=torch.float32)
+        z = self.vae.encode(v, device=self.device).to(
+            dtype=self.dtype, device=self.device
+        )  # [B, 16, 1, H/8, W/8]
+        if self.cfg.reference.detach_latent:
+            z = z.detach()
+        return z
 
     @torch.no_grad()
     def encode_vace_context(
@@ -787,47 +686,6 @@ class FACETWanModel(nn.Module):
         video = self.vae.decode(stacked, device=self.device)
         return video
 
-    # --------------------------------------------------------
-    # Latent initialization
-    # --------------------------------------------------------
-
-    def prepare_latents(
-        self,
-        batch_size: int,
-        height: int,
-        width: int,
-        num_frames: int,
-        generator: Optional[torch.Generator] = None,
-    ) -> List[torch.Tensor]:
-        """
-        Sample initial Gaussian latents for the target (base) branch.
-
-        Shape per sample: [z_dim=16, F_lat, H/8, W/8].
-        """
-        validate_video_size(
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            hw_multiple=self.cfg.target.hw_multiple,
-            temporal_stride=self.cfg.wan.vae_temporal_stride,
-        )
-
-        f_lat = latent_frames_from_num_frames(
-            num_frames,
-            temporal_stride=self.cfg.wan.vae_temporal_stride,
-        )
-        h_lat = height // self.cfg.wan.vae_spatial_stride
-        w_lat = width // self.cfg.wan.vae_spatial_stride
-
-        c = getattr(self.dit, "in_dim", 16)
-
-        latents = torch.randn(
-            batch_size, c, f_lat, h_lat, w_lat,
-            generator=generator,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        return ensure_latent_list(latents)
 
     # --------------------------------------------------------
     # RoPE / time helpers
@@ -932,101 +790,78 @@ class FACETWanModel(nn.Module):
     # --------------------------------------------------------
     # Training forward
     # --------------------------------------------------------
+    # NOTE: 可以考虑提高vace_scale的程度 这样模型的本质就变成了在masked_src_video之上
+    # 添加了少量噪声 然后进行了去噪 如果值异常 则考虑放缩系数施加于x 使得x的主路值变小
+    # FIXME: 目前尚未解决的问题是vace block中所使用的reactivate区域实际上没有意义
+    # 或者说功能与masks产生了重复 
+    # TODO: 后期考虑CFG: classfier-free guidance 的实现
 
     def forward(
         self,
-        noisy_latents: Union[List[torch.Tensor], torch.Tensor],
+        noisy_latents: torch.Tensor,
         timesteps: torch.Tensor,
-        prompt_embeds: Union[List[torch.Tensor], torch.Tensor],
-        reference_latents: Union[List[torch.Tensor], torch.Tensor],
-        vace_context: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
+        prompt_embeds: List[torch.Tensor],
+        reference_latents: torch.Tensor,
+        vace_context: List[torch.Tensor],
         vace_scale: float = 1.0,
         return_dict: bool = True,
-    ) -> Union[Dict[str, Any], List[torch.Tensor]]:
-        # FIXME: 既然现在forward是自定义的 那么完全不用再要求输入是list 而是直接传入tensor
-        # 要不然dataloader把tensor改成list  这里又从list改成tensor 又要改回来 太麻烦了
-        # 某些地方的ensure_latent_list & ensure_context_list 可以考虑取消了
-        # 当然 text & vace_context 还是需要list 
+    ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+        # NOTE: 注意timesteps要求的dtype=fp32
         """
         One denoising step.
 
         Args:
-            noisy_latents:     List of [16, F_lat, h, w]   (or stacked tensor)
-            timesteps:         [B]
-            prompt_embeds:     List of [L_i, 4096]         (or stacked tensor)
-            reference_latents: List of [16, 1, h_ref, w_ref]  (REQUIRED for FACET)
-            vace_context:      List of [96, F_lat, h, w]      (REQUIRED for VACE)
-            vace_scale:        hint mixing scale (DiffSynth's vace_scale)
-            return_dict:       if True, return {"pred": ...}; else return list
+            noisy_latents:     [B, 16, F_lat, h, w]
+            timesteps:         [B]                              fp32
+            prompt_embeds:     List length B, each [L_i, 4096]  (variable length T5 hidden states)
+            reference_latents: [B, 16, 1, h_ref, w_ref]
+            vace_context:      List length B, each [96, F_lat, h, w]
+                               (list because VACE patchifies per sample; see DiffSynth's VaceWanModel)
+            vace_scale:        VACE hint mixing scalar
+            return_dict:       if True, return {"pred": ...}; else return tensor
 
         Returns:
-            pred: List of [16, F_lat, h, w] predictions for the BASE branch.
+            pred: [B, 16, F_lat, h, w] tensor.
             Interpretation (noise vs velocity) follows cfg.training.prediction_type;
             for FlowMatch + 'velocity' the model predicts noise - sample.
         """
-        # NOTE: noisy_latents & reference_latents  用stacked tensor就可以了 不需要要求list 也不需要'ensure list'
-        # prompt_embeds & vace_context 还是需要list
-        # ---- 0. Normalize inputs ----
-        noisy_latents = ensure_latent_list(noisy_latents)
-        prompt_embeds = ensure_context_list(prompt_embeds)
-        reference_latents = ensure_latent_list(reference_latents)
-        if vace_context is not None:  # FIXME: vace_context肯定需要 不需要判断是否是None
-            vace_context = ensure_latent_list(vace_context)
+        noisy_latents = noisy_latents.to(device=self.device, dtype=self.dtype)
+        reference_latents = reference_latents.to(device=self.device, dtype=self.dtype)
+        vace_context = [c.to(device=self.device, dtype=self.dtype) for c in vace_context]
 
-        B = len(noisy_latents)
-        if len(reference_latents) != B:
-            raise ValueError(
-                f"reference batch size {len(reference_latents)} != noisy_latents {B}."
-            )
-        if len(prompt_embeds) != B:
-            raise ValueError(
-                f"prompt batch size {len(prompt_embeds)} != noisy_latents {B}."
-            )
-        if vace_context is not None and len(vace_context) != B:
-            raise ValueError(
-                f"vace_context batch size {len(vace_context)} != noisy_latents {B}."
-            )
-        if timesteps.shape != (B,):
-            raise ValueError(
-                f"timesteps shape {tuple(timesteps.shape)} does not match batch {B}."
-            )
-
-        # Cast latents to model dtype (training script may pass fp32).
-        noisy_latents = [l.to(device=self.device, dtype=self.dtype) for l in noisy_latents]
-        reference_latents = [l.to(device=self.device, dtype=self.dtype) for l in reference_latents]
-        if vace_context is not None:   # FIXME: 同样地 不需要判断 直接cast
-            vace_context = [c.to(device=self.device, dtype=self.dtype) for c in vace_context]
+        B = noisy_latents.shape[0]
 
         # ---- 1. Patchify base branch ----
-        # FIXME: 转成tensor而非list 并把过程中tensor形状变化标出来 
-        # patch_embedding: Conv3d (kernel=stride=(1,2,2)) -> [1, dim, F_lat, h/2, w/2]
-        x_list = [self.dit.patch_embedding(u.unsqueeze(0)) for u in noisy_latents]
-        # Assume same grid across batch (true for fixed H,W,F training).
-        f_base, h_base, w_base = x_list[0].shape[2:]
-        x_base = torch.cat(
-            [u.flatten(2).transpose(1, 2) for u in x_list], dim=0,
-        )  # [B, L_base, dim]
+        # Conv3d natively batches: [B, 16, F_lat, H_lat, W_lat]
+        #   -- patch_embedding (k=stride=(1,2,2)) -->
+        # [B, dim, F_lat, H_lat/2, W_lat/2]   (e.g. [B, 1536, 21, 30, 52])
+        x_base = self.dit.patch_embedding(noisy_latents)
+        f_base, h_base, w_base = x_base.shape[2:]
+        # Flatten 3D grid into token sequence: [B, L_base, dim], L_base = f*h*w=21*30*52=31920
+        x_base = x_base.flatten(2).transpose(1, 2)
 
-        # ---- 2. Patchify reference branch (uses same dit.patch_embedding) ----
-        # FIXME: 转成tensor而非list
-        r_list = [self.dit.patch_embedding(u.unsqueeze(0)) for u in reference_latents]
-        f_ref, h_ref, w_ref = r_list[0].shape[2:]
-        x_ref = torch.cat(
-            [u.flatten(2).transpose(1, 2) for u in r_list], dim=0,
-        )  # [B, L_ref, dim]
+        # ---- 2. Patchify reference branch (shares dit.patch_embedding weights) ----
+        # [B, 16, 1, H_ref, W_ref]  ->  [B, dim, 1, H_ref/2, W_ref/2]
+        x_ref = self.dit.patch_embedding(reference_latents)
+        f_ref, h_ref, w_ref = x_ref.shape[2:]
+        x_ref = x_ref.flatten(2).transpose(1, 2)
+        # x_ref: [B, L_ref, dim]   (e.g. for 480x480 ref -> L_ref = 1*30*30 = 900)
 
         # ---- 3. Time features ----
+        # (t, t_mod): t [B, dim] feeds dit.head; t_mod [B, 6, dim] feeds every block.
         t_base, t_mod_base = self.compute_time_features(timesteps)
-        # Ref branch always sees a fixed clean-image timestep.
-        t_ref_val = torch.full_like(
-            timesteps, fill_value=float(self.cfg.reference.timestep)
+        # Ref branch sees a fixed clean-image timestep (default 0).
+        t_ref = torch.full_like(
+            timesteps, fill_value=float(self.cfg.reference.timestep),
         )
-        _, t_mod_ref = self.compute_time_features(t_ref_val)
+        _, t_mod_ref = self.compute_time_features(t_ref)
 
-        # ---- 4. Text context (dit.text_embedding) ----
+        # ---- 4. Text context (pad to text_len & dit.text_embedding -> [B, 512, dim]) ----
         context = self._prepare_text_context(prompt_embeds)
 
-        # ---- 5. RoPE freqs per branch (same precomputed table) ----
+        # ---- 5. RoPE freqs per branch (same precomputed dit.freqs table) ----
+        # Both branches use the SAME 3D RoPE table. The only difference is which
+        # f-rows are sliced, so they live in a single shared rotary coordinate space.
         freqs_base = self.build_freqs(
             f_base, h_base, w_base,
             f_offset=0, device=x_base.device,
@@ -1034,22 +869,41 @@ class FACETWanModel(nn.Module):
         freqs_ref = self.build_freqs(
             f_ref, h_ref, w_ref,
             f_offset=self.cfg.reference.f_offset, device=x_base.device,
-        )
+        ) # x_base.device = x_ref.device = device
 
-        # ---- 6. VACE hints (vace sees only base; ref does NOT enter VACE) ----
-        # NOTE: the VACE branch is gated independently of the ref branch.
-        # Per design: vace_context is a List of [96, F_lat, h, w] tensors;
-        # x_base / context / t_mod_base / freqs_base are stacked tensors.
+        # ---- 6. VACE hints ----
         gc_enabled = bool(self.cfg.gradient_checkpointing) and self.training
-        vace_hints = None
-        if vace_context is not None:
-            vace_hints = self.vace(
-                x_base, vace_context, context, t_mod_base, freqs_base,
-                use_gradient_checkpointing=gc_enabled,
-                use_gradient_checkpointing_offload=False,
-            )
+        # self.training is the built-in nn.Module bool flag set by .train()/.eval().
+        # gc only makes sense during training; eval mode keeps all activations for inference.
+        vace_hints = self.vace(
+            x_base, vace_context, context, t_mod_base, freqs_base,
+            use_gradient_checkpointing=gc_enabled,
+            use_gradient_checkpointing_offload=False,
+        )
+        # vace_hints: list/tuple of 15 tensors, each [B, L_base, dim], one per VACE injection point.
+        #
+        # use_gradient_checkpointing_offload=False:
+        #   This is DiffSynth's extra flag on top of GC. When True, the saved input
+        #   activations are additionally moved to CPU during forward and copied back
+        #   during backward. Saves more GPU memory at the cost of H2D/D2H traffic.
+        #   1.3B fits comfortably, so leave it False.
+        #
+        # How VACE GC works internally:
+        #   DiffSynth wraps each vace_block call with torch.utils.checkpoint. Forward
+        #   saves only the INPUT tensors (c, x, context, t_mod, freqs); intermediate
+        #   activations (attn logits, FFN intermediates of width 8960, norm stats) are
+        #   discarded. During backward, the block forward is re-run on the saved inputs
+        #   to recompute those activations and then run grad through them. Tradeoff:
+        #   ~2x compute on the GC'd portion in exchange for big activation memory savings.
 
-        # ---- 7. Iterate base DiT blocks (custom branch attention) ----
+        # ---- 7. Iterate base DiT blocks (custom OminiControl-style branch attention) ----
+        # torch.utils.checkpoint.checkpoint(fn, ...) IS the same gradient-checkpointing
+        # primitive that VACE wraps internally;
+        #
+        # use_reentrant=False:
+        #   New non-reentrant implementation. Preferred for DDP/FSDP, accelerator hooks,
+        #   and any code with side effects. The legacy reentrant=True path is deprecated
+        #   and triggers warnings on torch>=2.x.
         for block_id, block in enumerate(self.dit.blocks):
             if gc_enabled:
                 x_base, x_ref = torch.utils.checkpoint.checkpoint(
@@ -1066,21 +920,19 @@ class FACETWanModel(nn.Module):
                     freqs_base, freqs_ref,
                 )
 
-            # VACE hint injection (after the block, before next).
-            if vace_hints is not None and block_id in self.vace.vace_layers_mapping:
+            if block_id in self.vace.vace_layers_mapping:
                 hint = vace_hints[self.vace.vace_layers_mapping[block_id]]
                 x_base = x_base + hint * vace_scale
 
         # ---- 8. Head (base branch only) + unpatchify ----
-        x_base = self.dit.head(x_base, t_base)  # [B, L_base, out_dim * prod(patch_size)]
+        # head: [B, L_base, dim] -> [B, L_base, out_dim * prod(patch_size)]
+        x_base = self.dit.head(x_base, t_base)
+        # unpatchify back to video latent: [B, 16, F_lat, H_lat, W_lat]
         out = self.dit.unpatchify(x_base, (f_base, h_base, w_base))
-        # out: [B, 16, F_lat, H, W]
-
-        pred = ensure_latent_list(out)
 
         if return_dict:
-            return {"pred": pred}
-        return pred
+            return {"pred": out}
+        return out
 
     # --------------------------------------------------------
     # Inference
@@ -1090,43 +942,50 @@ class FACETWanModel(nn.Module):
     def generate(
         self,
         prompt: Optional[Union[str, List[str]]] = None,
-        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
-        src_video: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        src_mask: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
+        reference_latents: Optional[torch.Tensor] = None,
+        src_video: Optional[torch.Tensor] = None,
+        src_mask: Optional[torch.Tensor] = None,
+        vace_context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = "",
         negative_prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_frames: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
-        cfg_scale: Optional[float] = None,
+        cfg_scale: float = 1.0,
         vace_scale: float = 1.0,
-        latents: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        vace_context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        latents: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         sigma_shift: float = 5.0,
         denoising_strength: float = 1.0,
     ) -> torch.Tensor:
         """
-        Full inference loop. Returns the decoded video tensor [B, 3, F, H, W] in [-1, 1].
+        Full inference loop. Returns decoded video tensor [B, 3, F, H, W] in [-1, 1].
 
-        FACET requires reference_image + (src_video, src_mask) OR a pre-computed
-        vace_context tensor list.
+        Required (one from each pair):
+            - prompt OR prompt_embeds
+            - reference_image OR reference_latents
+            - vace_context OR (src_video AND src_mask)
 
-        FACETPipeline wraps this with input validation / RNG plumbing /
-        output_type post-processing.
+        Batch-size resolution (in order of priority):
+            1. If src_video is given:   B = src_video.shape[0]
+            2. Else if vace_context:    B = (B of vace_context)
+            3. Else:                    B = (B inferred from prompt / reference)
 
-        NOTE: KV-cache for the reference branch (cfg.reference.kv_cache_reference)
+        Inputs that arrive with B=1 are broadcast to the resolved B. Inputs that
+        already arrive with B that matches are used as-is. Any mismatch raises.
+
+        TODO: KV-cache for the reference branch (cfg.reference.kv_cache_reference)
         is NOT implemented yet; ref tokens are re-computed every step. The
         forward interface will not change when caching is added later.
         """
-        # ---- 0. Resolve defaults ----
+        # ---- 0. Resolve scalar defaults ----
         height = height or self.cfg.target.height
         width = width or self.cfg.target.width
         num_frames = num_frames or self.cfg.target.num_frames
         num_inference_steps = num_inference_steps or self.cfg.inference.num_inference_steps
-        cfg_scale = cfg_scale if cfg_scale is not None else self.cfg.inference.cfg_scale
 
         validate_video_size(
             height=height, width=width, num_frames=num_frames,
@@ -1134,46 +993,122 @@ class FACETWanModel(nn.Module):
             temporal_stride=self.cfg.wan.vae_temporal_stride,
         )
 
-        # ---- 1. Prompt embeddings (cond + uncond if doing CFG) ----
-        cond_context = self.encode_prompt(prompt=prompt, prompt_embeds=prompt_embeds)
-        do_cfg = cfg_scale is not None and cfg_scale > 1.0
-        if do_cfg:
-            uncond_context = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-            )
+        # ---- 1. VACE context ----
+        if vace_context is None and src_video is None:
+            raise ValueError("Either vace_context, or (src_video AND src_mask) must be provided.")
+
+        if vace_context is not None:
+            # Accept stacked tensor [B, 96, F_lat, h, w] or list of [96, ...].
+            vace_ctx_list = ensure_latent_list(vace_context)
+            batch_size = len(vace_ctx_list)
+            if src_video is not None:
+                logger.info(
+                    "[FACET] Both vace_context and src_video given; "
+                    "using vace_context and ignoring src_video/src_mask."
+                )
         else:
-            uncond_context = None
+            # src_video path. src_mask is mandatory because the region to edit can not be guessed.
+            if src_mask is None:
+                raise ValueError("src_mask is required when src_video is provided.")
 
-        batch_size = len(cond_context)
+            # Make sure both are stacked tensors with explicit batch dim.
+            if src_video.ndim == 4:
+                src_video = src_video.unsqueeze(0)
+            if src_mask.ndim == 4:
+                src_mask = src_mask.unsqueeze(0)
 
-        def _broadcast_to_batch(lst, name):
+            batch_size = src_video.shape[0]
+            if src_mask.shape[0] != batch_size:
+                raise ValueError(
+                    f"src_mask batch size {src_mask.shape[0]} != "
+                    f"src_video batch size {batch_size}."
+                )
+            # Auto-broadcast a single-frame mask along the time axis.
+            mv_f = src_video.shape[2]
+            mm_f = src_mask.shape[2]
+            if mm_f == 1 and mv_f > 1:
+                logger.info(
+                    "[FACET] src_mask has F=1; broadcasting to src_video F=%d.", mv_f,
+                )
+                src_mask = src_mask.expand(-1, -1, mv_f, -1, -1)
+            elif mm_f != mv_f:
+                raise ValueError(
+                    f"src_mask F={mm_f} doesn't match src_video F={mv_f} (and is not 1)."
+                )
+            # H/W check vs cfg.target.
+            if src_video.shape[-2:] != (height, width):
+                raise ValueError(
+                    f"src_video shape {tuple(src_video.shape[-2:])} doesn't match "
+                    f"target (H, W) = ({height}, {width})."
+                )
+            if src_mask.shape[-2:] != (height, width):
+                raise ValueError(
+                    f"src_mask shape {tuple(src_mask.shape[-2:])} doesn't match "
+                    f"target (H, W) = ({height}, {width})."
+                )
+
+            vace_ctx_list = self.encode_vace_context(src_video, src_mask)
+
+        def _broadcast_list(lst, name):
             if len(lst) == batch_size:
                 return lst
             if len(lst) == 1:
+                logger.info(
+                    "[FACET] Broadcasting %s from B=1 to B=%d.", name, batch_size,
+                )
                 return lst * batch_size
             raise ValueError(
                 f"{name} batch size {len(lst)} cannot be broadcast to {batch_size}."
             )
 
-        # ---- 2. Reference latents (required) ----
-        if reference_image is None:
-            raise ValueError("reference_image is required for FACET inference.")
-        ref_latents = self.encode_reference_image(reference_image)
-        ref_latents = _broadcast_to_batch(ref_latents, "reference")
-
-        # ---- 3. VACE context (build from src_video + src_mask if not given) ----
-        if vace_context is not None:
-            vace_ctx_list = ensure_latent_list(vace_context)
-            vace_ctx_list = _broadcast_to_batch(vace_ctx_list, "vace_context")
-        else:
-            if src_video is None or src_mask is None:
-                raise ValueError(
-                    "FACET inference requires either vace_context, or "
-                    "(src_video AND src_mask) to build it."
+        def _broadcast_tensor(t, name):
+            if t.shape[0] == batch_size:
+                return t
+            if t.shape[0] == 1:
+                logger.info(
+                    "[FACET] Broadcasting %s from B=1 to B=%d.", name, batch_size,
                 )
-            vace_ctx_list = self.encode_vace_context(src_video, src_mask)
-            vace_ctx_list = _broadcast_to_batch(vace_ctx_list, "vace_context")
+                rep = [batch_size] + [1] * (t.ndim - 1)
+                return t.repeat(*rep)
+            raise ValueError(
+                f"{name} batch size {t.shape[0]} cannot be broadcast to {batch_size}."
+            )
+
+        # ---- 2. Prompt embeddings (cond + uncond if doing CFG) ----
+        cond_context = self.encode_prompt(prompt=prompt, prompt_embeds=prompt_embeds)
+        cond_context = _broadcast_list(cond_context, "prompt")
+
+        do_cfg = cfg_scale > 1.0
+        if do_cfg:
+            if negative_prompt is None and negative_prompt_embeds is None:
+                # Standard CFG convention: missing negative -> empty string.
+                negative_prompt = ""
+            uncond_context = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+            )
+            uncond_context = _broadcast_list(uncond_context, "negative_prompt")
+        else:
+            uncond_context = None
+
+        # ---- 3. Reference latents ----
+        if reference_latents is None and reference_image is None:
+            raise ValueError(
+                "Either reference_image or reference_latents must be provided."
+            )
+        if reference_latents is not None:
+            if reference_image is not None:
+                logger.info(
+                    "[FACET] Both reference_image and reference_latents given; "
+                    "using reference_latents."
+                )
+            # Expect [B, 16, 1, h, w] or [16, 1, h, w].
+            ref_latents = reference_latents
+            if ref_latents.ndim == 4:
+                ref_latents = ref_latents.unsqueeze(0)
+        else:
+            ref_latents = self.encode_reference_image(reference_image)
+        ref_latents = _broadcast_tensor(ref_latents, "reference_latents")
 
         # ---- 4. Initial noisy latents ----
         if latents is None:
@@ -1183,17 +1118,25 @@ class FACETWanModel(nn.Module):
                 generator=generator,
             )
         else:
-            cur_latents = ensure_latent_list(latents)
+            cur_latents = latents.unsqueeze(0) if latents.ndim == 4 else latents
+            cur_latents = _broadcast_tensor(cur_latents, "latents")
+            cur_latents = cur_latents.to(device=self.device, dtype=self.dtype)
 
-        # ---- 5. Scheduler timesteps ----
+        # ---- 5. VACE batch broadcast (after batch_size is finalized) ----
+        vace_ctx_list = _broadcast_list(vace_ctx_list, "vace_context")
+
+        # ---- 6. Scheduler timesteps ----
         timesteps = self._prepare_inference_timesteps(
             num_inference_steps=num_inference_steps,
             sigma_shift=sigma_shift,
             denoising_strength=denoising_strength,
         )
 
-        # ---- 6. Denoising loop ----
+        # ---- 7. Denoising loop ----
         for t in timesteps:
+            # fp32 for timesteps: sinusoidal_embedding_1d casts to fp64 internally,
+            # and the time_embedding MLP is dtype-sensitive. Keeping the input fp32
+            # avoids the bf16 quantization artifact (e.g. 999 -> 998 or 1000).
             t_batch = torch.full(
                 (batch_size,), float(t),
                 device=self.device, dtype=torch.float32,
@@ -1213,10 +1156,7 @@ class FACETWanModel(nn.Module):
                     vace_context=vace_ctx_list, vace_scale=vace_scale,
                     return_dict=True,
                 )["pred"]
-                pred = [
-                    u + cfg_scale * (c - u)
-                    for c, u in zip(pred_cond, pred_uncond)
-                ]
+                pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
             else:
                 pred = pred_cond
 
@@ -1224,8 +1164,46 @@ class FACETWanModel(nn.Module):
                 pred=pred, timestep=t, latents=cur_latents,
             )
 
-        # ---- 7. Decode final latents ----
+        # ---- 8. Decode final latents ----
         return self.decode_latents(cur_latents)
+
+
+    def prepare_latents(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """
+        Sample initial Gaussian latents for the target (base) branch.
+
+        Returns: [B, z_dim=16, F_lat, H/8, W/8].
+        """
+        validate_video_size(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            hw_multiple=self.cfg.target.hw_multiple,
+            temporal_stride=self.cfg.wan.vae_temporal_stride,
+        )
+
+        f_lat = latent_frames_from_num_frames(
+            num_frames,
+            temporal_stride=self.cfg.wan.vae_temporal_stride,
+        )
+        h_lat = height // self.cfg.wan.vae_spatial_stride
+        w_lat = width // self.cfg.wan.vae_spatial_stride
+
+        c = getattr(self.dit, "in_dim", 16)
+
+        return torch.randn(
+            batch_size, c, f_lat, h_lat, w_lat,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     def _prepare_inference_timesteps(
         self,
@@ -1235,6 +1213,17 @@ class FACETWanModel(nn.Module):
     ) -> torch.Tensor:
         """
         Build the FlowMatch (Wan template) inference schedule.
+
+        sigma_shift:
+            FlowMatch sigma rescaling: sigmas <- shift*s / (1 + (shift-1)*s).
+            shift > 1 squeezes more steps into the high-noise region (early
+            timesteps), i.e. coarser early / finer late. 
+            Wan's recommended default is 5.
+
+        denoising_strength:
+            Scales the starting sigma. 1.0 = start from pure noise (sigma~1).
+            <1.0 starts partway through the schedule (for img2img-style local
+            denoising). FACET always uses 1.0.
 
         Returns CPU tensor of timesteps in [0, 1000].
         """
@@ -1248,16 +1237,20 @@ class FACETWanModel(nn.Module):
 
     def _scheduler_step(
         self,
-        pred: List[torch.Tensor],
+        pred: torch.Tensor,
         timestep: torch.Tensor,
-        latents: List[torch.Tensor],
-    ) -> List[torch.Tensor]:
-        """One scheduler step per batch element (DiffSynth's step is per-sample)."""
-        return [self.scheduler.step(p, timestep, l) for p, l in zip(pred, latents)]
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        One full-batch scheduler step.
+        DiffSynth's FlowMatchScheduler.step does element-wise math
+        (prev = sample + model_output * (sigma_next - sigma)).
+        """
+        return self.scheduler.step(pred, timestep, latents)
 
 
 # ============================================================
-# E. Public pipeline
+# D. Public pipeline
 # ============================================================
 
 
@@ -1277,37 +1270,28 @@ class FACETPipeline:
     def __call__(
         self,
         prompt: Optional[Union[str, List[str]]] = None,
-        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
-        src_video: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        src_mask: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
+        reference_latents: Optional[torch.Tensor] = None,
+        src_video: Optional[torch.Tensor] = None,
+        src_mask: Optional[torch.Tensor] = None,
+        vace_context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = "",
         negative_prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_frames: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
-        cfg_scale: Optional[float] = None,
+        cfg_scale: float = 1.0,
         vace_scale: float = 1.0,
         seed: Optional[int] = None,
-        latents: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        vace_context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        latents: Optional[torch.Tensor] = None,
         output_type: Optional[str] = None,
         sigma_shift: float = 5.0,
         denoising_strength: float = 1.0,
     ):
-        if prompt is None and prompt_embeds is None:
-            raise ValueError("Either prompt or prompt_embeds must be provided.")
-
-        if reference_image is None:
-            raise ValueError("reference_image is required for FACET inference.")
-
-        if vace_context is None and (src_video is None or src_mask is None):
-            raise ValueError(
-                "Either vace_context, or (src_video AND src_mask) must be provided."
-            )
-
-        # Seed -> generator
+        # All required-input validation lives in `generate`.
+        # Pipeline only adds: RNG plumbing + output post-processing.
         if seed is not None:
             generator = torch.Generator(device=self.model.device)
             generator.manual_seed(int(seed))
@@ -1316,10 +1300,12 @@ class FACETPipeline:
 
         video = self.model.generate(
             prompt=prompt,
+            prompt_embeds=prompt_embeds,
             reference_image=reference_image,
+            reference_latents=reference_latents,
             src_video=src_video,
             src_mask=src_mask,
-            prompt_embeds=prompt_embeds,
+            vace_context=vace_context,
             negative_prompt=negative_prompt,
             negative_prompt_embeds=negative_prompt_embeds,
             height=height, width=width, num_frames=num_frames,
@@ -1327,12 +1313,10 @@ class FACETPipeline:
             cfg_scale=cfg_scale,
             vace_scale=vace_scale,
             latents=latents,
-            vace_context=vace_context,
             generator=generator,
             sigma_shift=sigma_shift,
             denoising_strength=denoising_strength,
-        )
-        # video: [B, 3, F, H, W] in [-1, 1]
+        ) # video: [B, 3, F, H, W] in [-1, 1]
 
         output_type = output_type or self.model.cfg.inference.output_type
         if output_type == "video":
@@ -1360,9 +1344,9 @@ class FACETPipeline:
 
 
 # ============================================================
-# C. Utilities
+# E. Utilities
 # ============================================================
-# TODO: 之后把utitlies部分移到末尾 提升model.py阅读性
+
 
 def latent_frames_from_num_frames(num_frames: int, temporal_stride: int = 4) -> int:
     """F_lat = (F - 1) // temporal_stride + 1, with WAN's 4n+1 constraint."""
