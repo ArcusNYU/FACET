@@ -1,6 +1,6 @@
 # model libraries
 CLIP-IQA/
-# DiffSynth/
+DiffSynth/
 OminiControl/
 VACE/
 weights/
