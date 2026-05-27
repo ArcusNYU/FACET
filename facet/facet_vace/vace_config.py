@@ -11,13 +11,13 @@ from typing import Optional, Tuple
 
 @dataclass
 class FACETBaseConfig:
-    """WAN2.2-TI2V-5B base checkpoint location."""
+    """WAN2.1-VACE base checkpoint location."""
     load_from: str = "local"                # "local" | "huggingface"
-    id: str = "Wan-AI/Wan2.2-TI2V-5B"
-    dir: str = "./weights/WAN2.2"           # local root of WAN weights
+    id: str = "Wan-AI/Wan2.1-VACE-1.3B"
+    dir: str = "./weights/WAN2.1"           # local root of WAN weights
     dit: str = "diffusion_pytorch_model*.safetensors"
     t5: str = "models_t5_umt5-xxl-enc-bf16.pth"
-    vae: str = "Wan2.2_VAE.pth"
+    vae: str = "Wan2.1_VAE.pth"
     tokenizer: str = "google/umt5-xxl"
 
 
@@ -26,9 +26,9 @@ class FACETWanConfig:
     model_type: str = "vace"                          # "ti2v" | "vace"
     patch_size: Tuple[int, int, int] = (1, 2, 2)
     vae_temporal_stride: int = 4                      # F_lat = (F-1)//4 + 1
-    vae_spatial_stride: int = 16                       # WAN2.2: 16
+    vae_spatial_stride: int = 8                       # WAN2.1: 8 | WAN2.2: 16
     token_temporal_stride: int = 4                    # patch_size[0] * vae_temporal_stride
-    token_spatial_stride: int = 32                    # patch_size[1] * vae_spatial_stride
+    token_spatial_stride: int = 16                    # patch_size[1] * vae_spatial_stride
 
 
 @dataclass
@@ -37,12 +37,6 @@ class FACETTargetConfig:
     width: int = 832
     num_frames: int = 81
     hw_multiple: int = 32
-
-
-@dataclass
-class FACETSourceConfig:
-    f_offset: int = ?
-    # TODO: 待根据config.yaml进行完善
 
 
 @dataclass
@@ -59,6 +53,7 @@ class FACETReferenceConfig:
 class FACETLoRAConfig:
     target_modules: Tuple[str, ...] = ("q", "k", "v", "o", "ffn.0", "ffn.2")
     on_base_blocks: bool = True             # inject LoRA on dit.blocks.*
+    on_vace_blocks: bool = True             # inject LoRA on dit.vace_blocks.*  (incl. before_proj/after_proj)
     on_cross_attn:  bool = False            # if False, q/k/v/o in cross_attn are skipped
     rank: int = 32
     alpha: int = 32

@@ -23,7 +23,7 @@ class LoRALinear(nn.Module):
 
     The base linear layer is frozen.
     """
-
+    # TODO: 32 -> 128
     def __init__(
         self,
         base: nn.Linear,

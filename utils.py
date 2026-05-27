@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Tuple, Union
+import numpy as np
+import subprocess
 
 import torch
 import torch.nn as nn
@@ -27,6 +29,12 @@ def mask_to_uint8(m: torch.Tensor) -> np.ndarray:
     """[T,1,H,W] float in {0,1} -> [T,H,W,3] uint8 grayscale (fg=255)."""
     m = m.detach().cpu().squeeze(1).clamp(0, 1).mul(255).byte()
     return m.unsqueeze(-1).expand(-1, -1, -1, 3).contiguous().numpy()
+
+def video_to_uint8(v: torch.Tensor) -> np.ndarray:
+    """[T,3,H,W] float in [-1,1] -> [T,H,W,3] uint8 RGB."""
+    v = v.detach().cpu().clamp(-1.0, 1.0)
+    v = v.add(1.0).mul(127.5).clamp(0, 255).byte()
+    return v.permute(0, 2, 3, 1).contiguous().numpy()
 
 
 # ============================================================

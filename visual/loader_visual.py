@@ -10,13 +10,19 @@ build_loaders / collate_batch  -> loader.py
 tensor helpers / write_mp4     -> utils.py
 
 Run:
-    python loader_visual.py [--cfg data/config.yaml] [--n 20] [--out ./visual_exampler]
+    cd /Facet
+    python visual/loader_visual.py [--cfg data/config.yaml] [--n 20] [--out ./visual_exampler]
 """
 
 from __future__ import annotations
+import sys
+from pathlib import Path
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import argparse
 import json
-from pathlib import Path
 from typing import Optional
 
 import os
@@ -77,6 +83,7 @@ def main():
         # path     = batch["path"][0]
         # caption  = batch["caption"][0]
         # mask     = batch["mask"][0]         # [T,1,H,W] in {0,1}
+        # FIXME: loader更改后这里的内容获取也要添加mask的可视化&形状检查
 
 
         print(f"[{seen+1:02d}/{args.n}] clip_id      = {cid}")

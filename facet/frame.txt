@@ -16,7 +16,7 @@ Class FACETWanModel 结构
  ├── from_config 
  ├── load_base_components
  │    ├── dit              # Wan diffusion transformer, frozen base + LoRA
- │    ├── vae              # Wan2.1_VAE.pth, frozen
+ │    ├── vae              # Wan2.2_VAE.pth, frozen
  │    ├── text_encoder     # UMT5/T5, frozen
  │    └── scheduler        # FlowMatchScheduler
  # 权重管理
@@ -44,42 +44,29 @@ Class FACETWanModel 结构
 
 ====================================
 背景信息:
-在WAN2.1-VACE-1.3B的基础上结合OmniControl的架构 实现一个FACET模型 用于单人视频的衣物饰品等编辑
+在WAN2.2-TI2V-5B的基础上结合OmniControl的架构 实现一个FACET模型 用于单人视频的头发编辑(inpainting)
 模型需要的输入大致为 [从概念阐述上讲] :
-1. src video [源视频也叫做 masked video]   2. src mask [源视频的掩码mask序列]
-3. ref image [单张参考图像]                4. prompt / caption [标题或者文本提示]
+1. src video [源视频也叫做 masked video]   2. ref image [单张参考图像]   3. prompt / caption [标题或者文本提示]
 训练时 dataloader会提供1个未被掩码的原视频 target video 作为训练目标
 
 各个输入的形状变化流程:
 a. latent: 
-由perpare_latents()函数得到 在对标加和src video的情况下 形状应当为 [z_dim=16, 21, 60, 104] (z_dim, F, H, W)
-即标准的 WAN VAE latent: [z_dim, F_lat, H/8, W/8] 
+由perpare_latents()函数得到 在对标加和src video的情况下 形状应当为 [z_dim=16, 21, 30, 52] (z_dim, F, H, W)
+即标准的 WAN2.2 VAE latent: [z_dim, F_lat, H/16, W/16] 
 在后续被称为 base branch (x) 
 
-b. src video # 参照于 WAN2.1/wan/vace.py 中的 vace_encode_frames() 函数
-src video: [3, 81, 480, 832] 在pipeline中首先使用WAN2.1_VAE进行编码 
-WAN2.1_VAE的下采样率是8 而WAN2.2_VAE的下采样率是16
-所以 -> VAE: 下采样 (4, 8, 8) -> src latent: [z_dim=16, 21, 60, 104]
-由于对于inactive & reactive的拼接 所以 src latent: [z_dim=32, 21, 60, 104] 作为z0
-
-c. src mask  # 参照于 WAN2.1/wan/vace.py 中的 vace_encode_masks() 函数
-src mask: [1, 81, 480, 832] 
-src mask 不能被VAE处理 所以参考VAE处理src video处理后的形状 即(4, 8, 8)的降采样率
-计算src mask在pixel-unshuffle之后的形状 应该为[dim, 21, 60, 104]
-随后使用8x8的pixel-unshffle src mask形状由[1, 81, 480, 832]变为 [1, 81, 60, 104, 8]
-使用permute(2, 4, 0, 1, 3)以及reshape src mask形状变为 [64, 81, 60, 104] 
-再对时间维度使用最邻近插值 使得src mask形状变为 [64, 21, 60, 104] 作为m0
-
-d. vace_context
-m0 与 z0 拼接为 vace_context 形状为 [z_dim=96, 21, 60, 104] 
-在后续被称为 VACE branch (c) condition
-
-e. reference image
-由于单张的ref image需要以OminiControl的形式参与pipeline 所以首先使用同样的WAN2.1_VAE进行编码
-形状由[1, 3, 480, 480] -> [z_dim=16, 1, 60, 60] 
+b. reference image
+由于单张的ref image需要以OminiControl的形式参与pipeline 所以首先使用同样的WAN2.2_VAE进行编码
+形状由[1, 3, 480, 480] -> [z_dim=16, 1, 30, 30] 作为 ref latent
 在后续被称为 ref branch (r)
 
-f. prompt/caption
+c. src video # 参照于 OminiControl架构:
+src video: [3, 81, 480, 832] 同样需要以OminiControl的形式参与pipeline
+首先使用WAN2.2_VAE进行编码  WAN2.1_VAE的下采样率是8 而WAN2.2_VAE的下采样率是16
+所以 -> VAE: 下采样 (4, 16, 16) -> src latent: [z_dim=16, 21, 30, 52]
+在后续被称为 src branch (s)
+
+d. prompt/caption
 使用T5 text encoder进行编码 List[str] [B,] -> tokenizer -> [B, text_len=512]
 -> 使用umT5-XXL encoder -> context [B, 512, text_dim=4096]
 -> 按seq_lens切掉padding 返回list [[L_i, 4096], ...] Li是prompt的真实token数量
@@ -88,16 +75,28 @@ f. prompt/caption
 最后输出context 为 [B, 512, 1536] 不进行RoPE/AdaN modulation 进入 text cross-attention 模块中进行进一步操作
 作为 text branch (t) 
 
-g. base branch (x)
+e. base branch (x)
 在进入DiT之后 首先使用patchify 得到 patch embedding 采用self.patch_embedding: conv3d k=(1,2,2) s=(1,2,2) 降采样率为(1, 2, 2)
-形状变化: [B=1, 16, 21, 60, 104] -> [B=1, dim, 21, 30, 52]
-随后采用flatten -> [B=1, L=21*30*52=32760, dim=1536] 成为base branch token 
+形状变化: [B, 16, 21, 30, 52] -> [B, dim, 21, 15, 26]
+随后采用flatten -> [B, L=21*15*26=8190, dim=1536] 成为base branch token 
 
-h. vace branch(c) 
-采用类似的patchify + flatten 流程 使用self.vace_patch_embedding: conv3d k=(1,2,2) s=(1,2,2) 降采样率为(1, 2, 2)
-[B=1, 96, 21, 60, 104] -> [B=1, dim, 21, 30, 52] -> [B=1, L=21*30*52=32760, dim] 成为vace branch token
-此时 base branch 与 vace branch对齐 vace branch 以 residual hints的形式注入base branch中
-注入方式有具体的规则和方式 参考 WAN2.1/wan/modules/vace_model.py 默认是偶数层
+f. ref branch (r) # 由于使用OminiControl架构:
+ref latent 在由WAN2.2_VAE得到之后同样经过 patch embedding 
+形状变化: [B=1, 16, 30, 30] -> [B, 16, 15, 15]
+随后进行flatten -> [B, L=15*15=225, 1536] 成为ref branch token 与 base branch共享 freqs 以及 DiT 主干
+
+g. src branch (s) # 由于使用OminiControl架构:
+src latent 在由WAN2.2_VAE得到之后同样经过 patch embedding 
+形状变化: [B, 16, 21, 30, 52] -> [B, 16, 21, 15, 26] 所以形状上是与base branch token一致
+随后进行flatten -> [B, L=21*15*26=8190, 1536] 成为src branch token 同样与 base branch共享 freqs 以及 DiT 主干
+
++g. 在后期可考虑消融实验把src mask 即针对原视频的mask序列 也作为extra branch以OminiControl的形式参与pipeline
+现阶段暂时不考虑
+
+h. mask (m)
+由于后续需要计算 token coverage 所以针对 src_video的mask序列 - src mask 需要进行降采样
+使得其与 src video token, ref video token的形状一致
+在OminiControl中 会详细介绍如何相关计算及变形
 
 i. timestep embedding
 每个样本需要对应一个时刻 假设时间步t [B,] 在经过sin_embedding之后得到 [B, freq_dim=256]
@@ -120,11 +119,9 @@ y = base(x) + scale * B(A(dropout(x))) scale:残差放缩系数
 
 --lora_target_modules 
 LoRA需要注入的模块
-在WAN2.1-VACE-1.3B中 存在30个base block vace-block每隔1层注入1次 所以应当有15个VACE注入点
-对于VaceWanBlock: 考虑self-attn q, k, v, o, ffn.0, ffn.2, vace_block.*.after_proj, vace_block.0.before_proj
-对于WanBlock: 考虑所有wanblock的 self-attn q, k, v, o, ffn.0, ffn.2; 
-两者的cross-attn 也可以在后期考虑加入 但是目前的任务不以文字控制训练为主
-目前A100 80GB 显存 + 1.3B的模型 显存比较充裕
+在WAN2.2-TI2V-5B中 需要对于所有 attention block都注入LoRA权重
+考虑其中所有self-attn q, k, v, o, ffn.0, ffn.2
+目前的cross-attn暂时不考虑加入(config.yaml中已经设置on_cross_attention为False) 因为目前的任务不以文字控制训练为主
 
 --不适宜注入LoRA的模块/层:
 patch embedding; text embedding; timestep embedding; timestep projection;
@@ -133,37 +130,49 @@ freqs / RoPE; head.head; norm layers; modulation;
 
 ====================================
 RoPE设置
-rope的freqs在pipeline初始化的时候提前被构造完成  # 参照于 WAN2.1/wan/modules/model.py 
+rope的freqs在pipeline初始化的时候提前被构造完成  # 参照于 WAN2.2/wan/modules/model.py 
 rope只在spatial self-attention中使用 并且在注意力头head内部只对q & k 进行计算 具体位置是每个self-attn里的q/k进行linear之后使用
 WAN中的做法是在head_dim=128的情况下 需要给128/2=64个复数对 需要把64分给3个轴 
-做法即是 64//3=21 余1 所以x轴21个 剩y轴21个 剩下1个给z轴 z轴22个  # 参照于 WAN2.1/wan/modules/model.py Lines 478 ~ Lines 485
+做法即是 64//3=21 余1 所以x轴21个 剩y轴21个 剩下1个给z轴 z轴22个  # 参照于 WAN2.2/wan/modules/model.py
 所以对于一个token grid坐标 它的 q / k 会被三组旋转共同编码
+于是在WAN中 noisy latent token - base branch(x) 其中token上的每一个grid会根据自己的坐标从提前建好的freqs表格中找到自己的RoPR freq值
+base branch的坐标范围为:
+f: 0~20, h: 0~14, w: 0~25
 
-base branch 与 vace branch 调用的是同一个 self.freqs张量表 但是使用各自的grid_sizes
-两者可通过同一个self attention机制计算 因为如上述信息流中计算的 两个branch在patch embedding输出的token grid一致 
-在 forward_vace 里可以把 kwargs (含 grid_sizes、freqs、seq_lens) 直接转给 vace_blocks # 参照于 WAN2.1/wan/modules/vace_model.py
-对于ref branch的设置需要参考OminiControl中的实现:
-本身OminiControl是用于2d图像生成 根据总的下采样倍率(VAE+patchify)算出了每个token的单位长度是 16px 
+对于其他 branch的设置需要参考OminiControl中的实现:
+本身OminiControl是用于2d图像生成 根据总的下采样倍率(VAE+patchify)算出了每个token的单位长度是 32px 
 所以添加了position delta 一个负值将 reference image放置在了生成图的空间左侧
 原论文提到: [spatially-aligned task 让 condition 和 target 共享位置non-aligned task; 
 比如 subject-driven generation则给 condition tokens 加固定 offset 避免和 target token 空间重叠 并且这种 shifting 会带来更快收敛和更好效果]
+还提到了[condition image 先经过 VAE 进入和 noisy image tokens 相同的 latent space 然后和 noisy image tokens 拼接进 DiT 的 multi-modal attention
+还区分了 spatially-aligned tasks 与 subject-driven / non-aligned tasks 的 position assignment: 前者共享位置 后者加固定 offset]
 
-但是在WAN rope中 position embedding的计算 依赖于使用坐标索引freqs 例如-1意味着可能是索引倒数第1个 
-解决方法是在计算rope的时候 临时将reference image的f设置为0  latent token全部向右移动1个token 这样所有坐标都是正的了 
-或者把referece image的f值临时设置为21(注意这是一个索引值 论数量的话这应该是第22个) 即放置在latent token的右侧
-目前更倾向于后者 因为这样不会改变原始latent token的空间位置 符合我在WAN2.1-VACE这种已经经过训练分布适应的模型上进行fine-tuning
+1. 对于src branch:
+由于src video实际上与noisy latent(去噪目标)是完全对齐的关系 所以它们两者的RoPE坐标是共享(完全对齐)的
+src branch的坐标范围为:
+f: 0~20, h: 0~14, w: 0~25
+
+2. 对于 ref branch:
+在WAN rope中 position embedding的计算 依赖于使用坐标索引freqs 例如-1意味着可能是索引倒数第1个 
+解决方法是在计算rope的时候 把referece image的f值临时设置为21(注意这是一个索引值 论数量的话这应该是第22个) 即放置在latent token的右侧
+这样不会改变原始latent token的空间位置 符合我在WAN2.2-TI2V-5B这种已经经过训练分布适应的模型上进行fine-tuning
 并且放置在右侧也不违背OminiControl的工程目的 - ref branch & base branch 在grid空间上没有重叠
 
-同时原始apply rope需要传入grid sizes 目前的 reference branch 在 vae & patchify后形状是 [z_dim=16, 1, 30, 30]
-无法连同 latent token 构成一个连续的grid size空间 所以 apply rope函数需要重写 即利用3d position id 来计算
-或者说不需要position id 把apply rope改成允许支持offset也可以 然后在 facet/config.yaml中的position项中配置 offset 
+同时原始apply rope需要传入grid sizes 目前的 reference branch 在 vae & patchify后形状是 [z_dim=16, 1, 15, 15]
+无法连同 latent token 构成一个连续的grid size空间 所以 apply rope函数需要重写 改成允许传入offset
+然后在 facet/config.yaml中针对ref branch 配置 offset 
+ref branch的坐标范围为:
+f: 21, h: 0~14, w: 0~14
 
-RoPE的计算流程 # 参照于 WAN2.1/wan/modules/model.py Lines 31 ~ Lines 70:
-如上所说 latent token会被flatten成[1, 32760, 1536] 所以期待RoPE也是相同的形状
-首先构造 freqs 位置复数坐标表格 长度为 [1024, 21]或者[1024, 22] 实际上目前的latent只会使用f=0~20, h=0~29, w=0~51
-例如 freqs[0][:f].shape = [21, 22]; f_freqs.shape=[21 30, 52, 22] ; h_freqs = w_freqs = [21, 30, 52, 21]
-随后对f h w的freqs进行拼接 从而得到3d表格 shape = [21, 30, 52, 64] -> reshape [32760, 1, 64]
+--------------------------------
+
+RoPE的计算流程 # 参照于 WAN2.2/wan/modules/model.py:
+如上所说 latent token会被flatten成[1, 8190, 1536] 所以期待RoPE也是相同的形状
+首先构造 freqs 位置复数坐标表格 长度为 [1024, 21]或者[1024, 22] 实际上目前的latent只会使用f=0~20, h=0~14, w=0~25
+例如 freqs[0][:f].shape = [21, 22]; f_freqs.shape=[21, 15, 26, freq_channels=22] ; h_freqs = w_freqs = [21, 15, 26, freq_channels=21]
+随后对f h w的freqs进行拼接 从而得到3d表格 shape = [21, 15, 26, 64] -> reshape [8190, 1, 64]
 此时就能与latent token进行相乘 其中的1会在相乘的时候进行广播
+如果3个branch在RoPE grid的排布并不连续 必要时则需要改写成基于explicit coordiante的RoPE实现
 
 
 ====================================
@@ -199,10 +208,8 @@ shift_msa scale_msa gate_msa shift_mlp scale_mlp gate_mlp
 在空间自注意力机制中 e使用 shift_msa & scale_msa & gate_msa 来调制空间自注意力机制layernorm
 在文本交叉注意力机制中 e使用 shift_mlp & scale_mlp & gate_mlp 来调制交叉注意力机制后的FFN 文本交叉注意力本身完全不被AdaLN调制
 
-base branch & vace branch 走的都是WanAttentionBlock 所以使用同一个e0
-对于base branch 和 vace branch 根据当前时间步使用timestep embedding e(t)
-
-对于ref branch 暂时先遵循OminiControl的实现 使用timestep embedding e(0) 即在训练和推理时设置时间步为0 
+base branch 使用同一个e0 即根据当前时间步使用timestep embedding e(t)
+对于ref branch & src brach 暂时先遵循OminiControl的实现 使用timestep embedding e(0) 即在训练和推理时设置时间步为0 
 使得模型间接知道该内容是完全干净的 不需要进行去噪的内容 只进行特征提取  同时 condition k/v 在推理时可以跨step cache 
 所以这里涉及对WAN的block中的修改 使不同branch在AdaLN / modulation里使用不同的timestep embedding
 
@@ -217,3 +224,90 @@ frozen:
 
 trainable:
   - LoRA 
+
+
+====================================
+OminiControl-style Attention Block 设置
+文本交叉注意力机制Text Cross-Attention保持不变 src branch & ref branch 不参与该注意力模块计算
+
+在空间自注意力机制中:
+base branch token, ref branch token, src branch token 都会计算出KQV
+OmniControl架构下的attention机制可以有多种计算模式
+1. 'full iteration' 模式 
+即 将 k_base, k_ref, k_src concat 成 k_all 同理  v_base, v_ref, v_src concat 成 v_all
+q_base, q_ref, q_src 在attention block中都 attend k_all & v_all
+attention mask:
+          K_base   K_src   K_ref
+Q_base      1       1       1
+Q_src       1       1       1
+Q_ref       1       1       1
+2. 'asymmetric control' 模式 
+即 base branch attend k_all & v_all 
+而 ref branch & src branch 只 attend 自己产生的 k & v 
+
+--------------------------------
+在FACET-WAN2.2 暂时执行的设置如下:
+暂时先采用 asymmetric-control 模式 即对应的attend模式为:
+          K_base   K_src   K_ref
+Q_base      1       1(ma)   1(ma)
+Q_src       1       0       0
+Q_ref       1       0       0
+ma: mask-aware cross attention
+在这种模式下 base branch是信息融合中心 src branch & ref branch 是条件编码器 但 src / ref 之间不直接交换信息
+OminiControl的原论文也强调了[condition tokens 和 image tokens 使用统一的序列处理 灵活的token interaction方式]
+[可以有group mask来关闭不同condition branch之间的cross attention]
+
+base query attend k_all & v_all 在 attend k_base & v_base 时 就是标准的 Spatial Self-Attention
+在attend k_src & v_src 或者 k_ref & v_ref 时 就需要使用 attention mask
+需要计算token coverage 作为attention mask (soft prior mask) 由字母m来表示
+mask的原始形状是 [B, f=81, h=480, w=832] 这跟 raw video的形状相同 由于后续要对 token grid对应 
+所以需要降采样到 latent token的 形状 即[B, 21, 15, 26]
+具体做法是使用 torch.nn.functional.adaptive_avg_pool3d 将当前mask和目标token_grid形状传入 (dilation作为optional可选项)
+由于使用 average pooling 所以 mask token中的coverage值存在平滑过渡
+另外 3dpoolconv之后进行的flatten必须跟latent执行patch embedding的展平顺序一致 否则会使得attention mask计算不正确
+
+在query_base attend 到 k_src & v_src 时:
+Attn(q) = softmax( Q_base * K_src^T / sqrt(d_k)  + gamma * log[epislon + (1 - m)] ) * V_src
+epsilon: 一个很小的正数 用于避免log(0) 变量名称为 safe_epsilon
+gamma: 一个缩放因子可学习参数 变量名称就叫 gamma 但是解释为 scaling factor
+在这种情况下 当m->1的时候 意味着此区域为mask区域 来自src video的该区域全是padding为127灰度的无效信息
+所以 log[x] -> - inf 但是在代码工程中需要clip到下限为 -1e4 避免数值爆炸(bf16模式下更加稳定)
+而当m->0的时候 意味着此区域为非mask区域 来自src video的该区域全是有效信息 gamma * log[epsilon + (1 - m)] -> 0
+所以attention mask此时不会对于 attention score 产生偏置作用 即不产生影响
+
+在query_base attend 到 k_ref & v_ref 时:
+Attn(q) = softmax[ Q_base * K_ref^T / sqrt(d_k)  + gamma * log(epislon + m) ] * V_ref
+在这种情况下 当m->1的时候 意味着此区域为mask区域 非常需要来自 ref image的信息来进行噪声预测
+反之在 m->0 的情况下 意味着此区域为非mask区域 不需要来自 ref image的信息来进行噪声预测 attention score会收受到抑制
+
+需要注意的是 query_base 实际上attend到的是 k_all & v_all 即所有branch的concatenated k & v 
+softmax的结果是在这个层面进行的 也就是全局softmax 这样condition branch的log-bias才能改变 
+
+对于 query_src 仅将其 attend 到自身src token得到的 key_src & v_src 即标准的self-attention
+query_src 不 attend 到 k_ref & v_ref 因为 两者都是base branch的条件 相互attend没有意义 而且会出现混淆
+与attention mask本身的设计逻辑是直接互斥的
+query_src 不 attend 到 k_base & v_base 因为 src branch会变成timestep-dependent
+base token是noisy latent token 在早期timestep噪声很大 可能反向污染 src branch
+同时如果这样也无法支持 KV cache 使得快速推理失效
+
+对于 query_ref 也是类似的 不会去attend k_src & v_src 同时也不会 attend k_base & v_base
+同样因为 ref 特征可能会被 noisy latent token 污染 
+所以 它只 attend 到自身ref token得到的 key_ref & v_ref 即标准的self-attention
+
+另外按照OminiControl的工程逻辑 在推理时的 for 循环去噪步中 
+每次forward都需要重新将原始干净的condition branch接回 
+一次forward结束之后 都需要把 src branch & ref branch drop掉 
+所以这两个branch在OminiControl中类似于一种 register token 融合信息 但是不用于最终预测
+
+上述某些配置需要在 config.yaml & config.py 中添加并体现
+gamma如果作为可学习的超参数 每个attention block都单独配置一个 好处在于每一层可以自我学习产生不同的routing强度
+不需要分 src_gamma或者ref_gamma 因为会产生超参数膨胀  需要将gamma初始化为1  且必须保持非负  
+现阶段可以暂时先设置成超参数 而非可学习的参数 等后期如果效果不好再做此考虑 当前的首要目标是模型收敛
+
+
+#NOTE: 后期需要观察视频生成中头发的边界状况 如果纹理在边界泄露 那么尝试 dilate mask 
+# 反之如果边界过硬 头发像是贴上去的 则不加入dilation 并且降低gamma的值 或者让k_base全局可见 
+# 如果存在边界抖动 那么降低 mask pertubation的强度 
+
+
+
