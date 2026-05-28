@@ -71,24 +71,24 @@ d. prompt/caption
 -> 使用umT5-XXL encoder -> context [B, 512, text_dim=4096]
 -> 按seq_lens切掉padding 返回list [[L_i, 4096], ...] Li是prompt的真实token数量
 -> 重新堆回 [B, 512, 4096] -> text embedding 
-在text embedding中 经过两层linear 分别为(4096->1536)(1536->1536)
-最后输出context 为 [B, 512, 1536] 不进行RoPE/AdaN modulation 进入 text cross-attention 模块中进行进一步操作
+在text embedding中 经过两层linear 分别为(4096->3072)(3072->3072)
+最后输出context 为 [B, 512, 3072] 不进行RoPE/AdaN modulation 进入 text cross-attention 模块中进行进一步操作
 作为 text branch (t) 
 
 e. base branch (x)
 在进入DiT之后 首先使用patchify 得到 patch embedding 采用self.patch_embedding: conv3d k=(1,2,2) s=(1,2,2) 降采样率为(1, 2, 2)
 形状变化: [B, 16, 21, 30, 52] -> [B, dim, 21, 15, 26]
-随后采用flatten -> [B, L=21*15*26=8190, dim=1536] 成为base branch token 
+随后采用flatten -> [B, L=21*15*26=8190, dim=3072] 成为base branch token 
 
 f. ref branch (r) # 由于使用OminiControl架构:
 ref latent 在由WAN2.2_VAE得到之后同样经过 patch embedding 
 形状变化: [B=1, 16, 30, 30] -> [B, 16, 15, 15]
-随后进行flatten -> [B, L=15*15=225, 1536] 成为ref branch token 与 base branch共享 freqs 以及 DiT 主干
+随后进行flatten -> [B, L=15*15=225, 3072] 成为ref branch token 与 base branch共享 freqs 以及 DiT 主干
 
 g. src branch (s) # 由于使用OminiControl架构:
 src latent 在由WAN2.2_VAE得到之后同样经过 patch embedding 
 形状变化: [B, 16, 21, 30, 52] -> [B, 16, 21, 15, 26] 所以形状上是与base branch token一致
-随后进行flatten -> [B, L=21*15*26=8190, 1536] 成为src branch token 同样与 base branch共享 freqs 以及 DiT 主干
+随后进行flatten -> [B, L=21*15*26=8190, 3072] 成为src branch token 同样与 base branch共享 freqs 以及 DiT 主干
 
 +g. 在后期可考虑消融实验把src mask 即针对原视频的mask序列 也作为extra branch以OminiControl的形式参与pipeline
 现阶段暂时不考虑
@@ -100,8 +100,8 @@ h. mask (m)
 
 i. timestep embedding
 每个样本需要对应一个时刻 假设时间步t [B,] 在经过sin_embedding之后得到 [B, freq_dim=256]
-随后经过time_embedding: 包括两个linear层(freq_dim->time_dim=1536)(time_dim->time_dim) 得到e [B, time_dim=1536]
-再经过time_projection 得到 e0 [B, 6, 1536] 分别对应 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+随后经过time_embedding: 包括两个linear层(freq_dim->time_dim=3072)(time_dim->time_dim) 得到e [B, time_dim=3072]
+再经过time_projection 得到 e0 [B, 6, 3072] 分别对应 shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 shift_msa / scale_msa: attention前LN的偏移和缩放 LN(x)(1 + scale_msa) + shift_msa
 gate_msa: attention的门控 用于控制attention的强度
 shift_mlp / scale_mlp: FFN前LN的偏移和缩放 LN(x)(1 + scale_mlp) + shift_mlp
@@ -167,7 +167,7 @@ f: 21, h: 0~14, w: 0~14
 --------------------------------
 
 RoPE的计算流程 # 参照于 WAN2.2/wan/modules/model.py:
-如上所说 latent token会被flatten成[1, 8190, 1536] 所以期待RoPE也是相同的形状
+如上所说 latent token会被flatten成[1, 8190, 3072] 所以期待RoPE也是相同的形状
 首先构造 freqs 位置复数坐标表格 长度为 [1024, 21]或者[1024, 22] 实际上目前的latent只会使用f=0~20, h=0~14, w=0~25
 例如 freqs[0][:f].shape = [21, 22]; f_freqs.shape=[21, 15, 26, freq_channels=22] ; h_freqs = w_freqs = [21, 15, 26, freq_channels=21]
 随后对f h w的freqs进行拼接 从而得到3d表格 shape = [21, 15, 26, 64] -> reshape [8190, 1, 64]
@@ -184,12 +184,12 @@ timestep embedding 设置
             │
         MLP (全局共享)
             │
-       e: [B, 6, 1536]  
+       e: [B, 6, 3072]  
             │
             ▼
   ┌──────────────────────────┐
-  │  + self.modulation       │ ← [1, 6, 1536] 静态 每个 block 可自我学习的参数
-  │     [1, 6, 1536]         │
+  │  + self.modulation       │ ← [1, 6, 3072] 静态 每个 block 可自我学习的参数
+  │     [1, 6, 3072]         │
   └──────────────────────────┘
             │  (fp32, 防数值误差)
             ▼
@@ -204,7 +204,7 @@ shift_msa scale_msa gate_msa shift_mlp scale_mlp gate_mlp
    x ── LN ──×(1+scale_msa) ──+shift_msa ── Attn ── *gate_msa ──+──▶
                                                               │
    ──── LN ──×(1+scale_mlp) ──+shift_mlp ── FFN ── *gate_mlp ──+──▶
-# 参照于 WAN2.1/wan/modules/model.py Lines296 ~ Lines316:
+# 参照于 WAN2.2/wan/modules/model.py Lines296 ~ Lines316:
 在空间自注意力机制中 e使用 shift_msa & scale_msa & gate_msa 来调制空间自注意力机制layernorm
 在文本交叉注意力机制中 e使用 shift_mlp & scale_mlp & gate_mlp 来调制交叉注意力机制后的FFN 文本交叉注意力本身完全不被AdaLN调制
 

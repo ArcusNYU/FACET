@@ -2,12 +2,12 @@
 
 model:
   name: "FACET-WAN2.2"
-  base: # 现阶段明确使用1.3B模型
-    load_from: "local" # "huggingface" | "local" 
+  base: # 现阶段明确使用5B TI2V模型
+    load_from: "local" # "huggingface" | "local"
     id: "Wan-AI/Wan2.2-TI2V-5B" # "Wan-AI/Wan2.2-TI2V-5B" | "Wan-AI/Wan2.2-T2V-A14B"
     # "Wan2.2-T2V-A14B"将来用于架构切换后的验证 以及大容量模型的scale-up验证
     dir: "./weights/WAN2.2"
-    dit: "diffusion_pytorch_model*.safetensors" #5B模型有3个分片 | A14B模型有12个总MoE分片  
+    dit: "diffusion_pytorch_model*.safetensors"  # 5B模型有3个分片 | A14B模型有12个总MoE分片
     t5: "models_t5_umt5-xxl-enc-bf16.pth"
     vae: "Wan2.2_VAE.pth"
     tokenizer: "google/umt5-xxl"
@@ -17,14 +17,12 @@ model:
   gradient_checkpointing: true
 
   wan:
-    model_type: "vace" # "ti2v" | "vace"
+    model_type: "ti2v" 
     patch_size: [1, 2, 2]
     vae_temporal_stride: 4
-    vae_spatial_stride: 16  # WAN2.2_VAE: 16
-    token_temporal_stride: 4  # 1 * 4 = 4
-    token_spatial_stride: 32  # 2 * 16 = 32
-    # vace_temporal_stride: 4
-    # vace_spatial_stride: 16
+    vae_spatial_stride: 16  # WAN2.2_VAE: 16 | WAN2.1_VAE: 8
+    token_temporal_stride: 4   # 1 * 4 = 4
+    token_spatial_stride: 32   # 2 * 16 = 32
 
   target:
     height: 480
@@ -33,48 +31,52 @@ model:
     hw_multiple: 32
 
   source:
-    # source 的 height / width / num_frames 需要与 target 相同 
-    f_offset: 22  # 计算RoPE时临时将masked source video token放置在latent token的右侧 即第23个token的位置 FIXME: 设置从第30个位置开始??? 可以观察RoPE e指数的周期性映射重叠
-    timestep: 0.0 
-    injection_mode: "branch_attention"
-    # update_reference_branch: true   NOTE: 暂时默认为True 代表src token在forward过程中自身也要产生变化
-    kv_cache: true 
+    # source 的 height / width / num_frames 需要与 target 相同
+    f_offset: 0           # 0 = 与 base 共享 RoPE 坐标(spatially-aligned, 见 frame.txt)
+                          
+    timestep: 0.0
+    injection_mode: "branch_attention"    # 仅文档用途
+    kv_cache: true                        # 仅 inference 使用
+
+    # OminiControl-style mask-aware bias (Q_base attend K_src / K_ref 时叠加)
+    attention_mode: "asymmetric"          # "asymmetric" | "full_iteration"
+    gamma: 1.0                            # log-bias 缩放因子(超参  后期可改成 per-layer 可学习参数)
+    safe_epsilon: 1.0e-3                  # 防 log(0) 数值下溢
+    mask_dilation: 0                      # mask 在 pool 之前的像素级 dilation 边界泄露时调高
+    mask_pool: "avg"                      # "avg" | "nearest"
+    detach_latent: true
 
   reference:
     image_size: 480
-    # latent_frames: 1
-    f_offset: 21  # 计算RoPE时临时将reference image放置在latent token的右侧 即第22个token的位置
-    detach_latent: true   # NOTE: 也是默认的 肯定不会把梯度传latent本身上面 
-    timestep: 0.0   # 设置ref branch的加噪步为0 告知模型此为干净图像 而非噪声
-    injection_mode: "branch_attention"   # branch_attention NOTE: 仅表明OminiControl的架构 此cfg变量不会被使用 除了未来的消融实验
+    f_offset: 21              # 计算RoPE时临时将reference image放置在latent token的右侧 即第22个token的位置
+    detach_latent: true       # NOTE: 也是默认的 肯定不会把梯度传latent本身上面
+    timestep: 0.0             # 设置ref branch的加噪步为0 告知模型此为干净图像 而非噪声
+    injection_mode: "branch_attention"   # NOTE: 仅表明OminiControl的架构 此cfg变量不会被使用 除了未来的消融实验
     # update_reference_branch: true   NOTE: 暂时默认为True 代表ref token在forward过程中自身也要产生变化
-    kv_cache: true   #NOTE: 仅在inference使用 training中暂不使用
+    kv_cache: true            # 仅 inference 使用 training中暂不使用
 
   lora:
-    # enabled: true
-    # base_model: "dit"
     target_modules: ["q", "k", "v", "o", "ffn.0", "ffn.2"]
-    on_base_blocks: True  # 对于WAN DiT blocks注入LoRA参数
-    # on_vace_blocks: True  # WAN2.2-TI2V-5B 没有 VACE blocks
-    rank: 32     # 沿用 DiffSynth 的设置
+    on_base_blocks: True      # 对于WAN DiT blocks注入LoRA参数
+    on_cross_attn: False      # 当前任务不以文字控制训练为主
+    rank: 32                  # 沿用 DiffSynth 的设置
     alpha: 32
     dropout: 0.0
     init: "kaiming_zero"
-    # branch_routing: 现阶段暂时不使用
 
   text: # text / caption embedding
     max_text_len: 512
 
   inference:
     num_inference_steps: 50
-    cfg_scale: 5.0 
+    cfg_scale: 5.0
     reference_guidance_scale: 1.0
     seed: null
-    output_type: "video" # frames: list of PIL frames | video: torch.Tensor [81, 3, 480, 832] [T, C, H, W]
+    output_type: "video"      # frames: list of PIL frames | video: torch.Tensor [81, 3, 480, 832] [T, C, H, W]
 
   training:
-    prediction_type: "velocity"  # 预测类型 "noise"(WAN默认) | "velocity"  
-    timestep_sampling: "logit_normal"  # 时间步采样使用正态分布    "uniform" | "logit_normal"
+    prediction_type: "velocity"        # 预测类型 "noise"(WAN默认) | "velocity"  
+    timestep_sampling: "logit_normal"  # 时间步采样使用正态分布 "uniform" | "logit_normal"
     loss_type: "mse"
     ref_dropout_prob: 0.05
     text_dropout_prob: 0.10

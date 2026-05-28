@@ -80,22 +80,33 @@ def lora_targets(
     name: str,
     target_modules: Sequence[str],
     in_base_block: bool,
+    in_vace_block: bool,
     lora_cfg: FACETLoRAConfig,
 ) -> bool:
     """
     Decide whether the nn.Linear at module path `name` should be wrapped.
 
     Rules:
-      - Must be under dit.blocks.*.
-      - `lora_cfg.on_base_blocks` toggles whole regions.
-      - For q/k/v/o, cross_attn is excluded unless on_cross_attn=True.
+      - Must be under dit.blocks.* or dit.vace_blocks.*.
+      - `lora_cfg.on_base_blocks` / `lora_cfg.on_vace_blocks` toggles whole regions.
+      - For q/k/v/o, cross_attn is excluded unless on_cross_attn=True (default
+        False to keep the current task focused on visual conditioning).
+      - For vace blocks, before_proj / after_proj are automatically included.
     """
     if in_base_block and not lora_cfg.on_base_blocks:
+        return False
+    if in_vace_block and not lora_cfg.on_vace_blocks:
+        return False
+    if not (in_base_block or in_vace_block):
         return False
 
     matched = _suffix_match(name, target_modules)
 
     if matched is None:
+        if in_vace_block and (
+            name.endswith(".before_proj") or name.endswith(".after_proj")
+        ):
+            return True
         return False
 
     # q/k/v/o: skip cross_attn unless explicitly allowed.
@@ -128,11 +139,13 @@ def inject_lora(
             continue
 
         in_base_block = name.startswith("blocks.")
+        in_vace_block = name.startswith("vace_blocks.")
 
         if not lora_targets(
             name=name,
             target_modules=lora_cfg.target_modules,
             in_base_block=in_base_block,
+            in_vace_block=in_vace_block,
             lora_cfg=lora_cfg,
         ):
             continue
