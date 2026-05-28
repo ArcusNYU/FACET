@@ -294,6 +294,20 @@ base token是noisy latent token 在早期timestep噪声很大 可能反向污染
 同样因为 ref 特征可能会被 noisy latent token 污染 
 所以 它只 attend 到自身ref token得到的 key_ref & v_ref 即标准的self-attention
 
+令:
+Q_b: [B, H, L_b, d]
+K_b: [B, H, L_b, d]
+K_s: [B, H, L_s, d]
+K_r: [B, H, L_r, d]
+m:   [B, L_b]
+如果 L_b = L_s 并且 flatten 顺序一致 可以直接复用同一个m
+m_q = m[:, None, :, None]  # [B, 1, L_base, 1]
+base_bias = 0
+src_bias = gamma * torch.log((1.0 - m_q).clamp_min(eps))
+# [B, 1, L_base, 1] -> broadcast 到 [B, H, L_base, L_src]
+ref_bias = gamma * torch.log(m_q.clamp_min(eps))
+# [B, 1, L_base, 1] -> broadcast 到 [B, H, L_base, L_ref]
+
 另外按照OminiControl的工程逻辑 在推理时的 for 循环去噪步中 
 每次forward都需要重新将原始干净的condition branch接回 
 一次forward结束之后 都需要把 src branch & ref branch drop掉 
