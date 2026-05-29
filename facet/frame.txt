@@ -1,4 +1,4 @@
-Model.py需要包含以下内容:
+Model.py包含以下内容:
 
 import_ 部分导入config.py 以及 FACET/utils.py 中的函数 _resolve_dtype() & _get_parent_module() 涉及同时完善 utils.py
 
@@ -46,8 +46,9 @@ Class FACETWanModel 结构
 背景信息:
 在WAN2.2-TI2V-5B的基础上结合OmniControl的架构 实现一个FACET模型 用于单人视频的头发编辑(inpainting)
 模型需要的输入大致为 [从概念阐述上讲] :
-1. src video [源视频也叫做 masked video]   2. ref image [单张参考图像]   3. prompt / caption [标题或者文本提示]
-训练时 dataloader会提供1个未被掩码的原视频 target video 作为训练目标
+1. src video [源视频也叫做 masked video]   2. ref image [单张参考图像]   
+3. src mask  [针对源视频的mask掩码序列]     4. prompt / caption [标题或者文本提示]
+训练时 dataloader会提供1个未被掩码的原视频潜空间特征 target latent 作为训练目标
 
 各个输入的形状变化流程:
 a. latent: 
@@ -93,7 +94,7 @@ src latent 在由WAN2.2_VAE得到之后同样经过 patch embedding
 +g. 在后期可考虑消融实验把src mask 即针对原视频的mask序列 也作为extra branch以OminiControl的形式参与pipeline
 现阶段暂时不考虑
 
-h. mask (m)
+h. src mask (m)
 由于后续需要计算 token coverage 所以针对 src_video的mask序列 - src mask 需要进行降采样
 使得其与 src video token, ref video token的形状一致
 在OminiControl中 会详细介绍如何相关计算及变形
@@ -153,25 +154,33 @@ src branch的坐标范围为:
 f: 0~20, h: 0~14, w: 0~25
 
 2. 对于 ref branch:
-在WAN rope中 position embedding的计算 依赖于使用坐标索引freqs 例如-1意味着可能是索引倒数第1个 
-解决方法是在计算rope的时候 把referece image的f值临时设置为21(注意这是一个索引值 论数量的话这应该是第22个) 即放置在latent token的右侧
-这样不会改变原始latent token的空间位置 符合我在WAN2.2-TI2V-5B这种已经经过训练分布适应的模型上进行fine-tuning
-并且放置在右侧也不违背OminiControl的工程目的 - ref branch & base branch 在grid空间上没有重叠
+原本OminiControl的做法是将reference image放置在target image的左边 所以采用了负数坐标
+但是在WAN rope中 position embedding的计算 依赖于使用坐标索引freqs 例如-1意味着可能是索引倒数第1个 
+所以解决办法是计算RoPE的时候 采用一个w_offset(依据于config.yaml&config.py) 模拟将reference token的空间位置是放置在base token的右侧
+由于base token的坐标范围是 f: 0~20, h: 0~14, w: 0~25 所以 reference token在紧邻其右侧放置后 w的范围为 26~41
+注意OminiControl原文提到了 对于condition branch 只要不产生空间的重叠 就是符合设计原则的  h不需要设置offset
+比较特殊的是对于时间轴f的处理 base token占据的f轴位置是0~20 原本打算将ref token的f_offset设置为21 
+但是这样处理会有两个问题 一个是模型在训练后会将其语义理解为第22个帧或者说未来帧 二是不同帧离ref token的时间距离不一致
+所以解决办法比较特殊 是当 query_base attend 到 key_ref 的时候 此时需要计算针对q&k的RoPE
+将两者的f值设置为相同 使得 delta_f = 0 这样RoPE计算就不会有时间上的差异 
+这相当于把base token右侧的ref token沿着f轴复制 使得每一个f上的base token都在右侧有相同的ref token 
+但是实际上不需要进行复制 只需要在计算RoPE的时候进行该特殊操作就行了 
+
+在ref branch进行自注意力的时候 由于 ref token的f恒定为自己本身或者就设置为0 所以不需要考虑时间轴的问题
 
 同时原始apply rope需要传入grid sizes 目前的 reference branch 在 vae & patchify后形状是 [z_dim=16, 1, 15, 15]
-无法连同 latent token 构成一个连续的grid size空间 所以 apply rope函数需要重写 改成允许传入offset
+如果无法连同 base token 构成一个连续的grid size空间 所以 apply rope函数需要重写 改成允许传入offset
+并且在必要的时候支持coordinate形式的RoPE实现
 然后在 facet/config.yaml中针对ref branch 配置 offset 
-ref branch的坐标范围为:
-f: 21, h: 0~14, w: 0~14
 
 --------------------------------
 
 RoPE的计算流程 # 参照于 WAN2.2/wan/modules/model.py:
-如上所说 latent token会被flatten成[1, 8190, 3072] 所以期待RoPE也是相同的形状
+如上所说 base token会被flatten成[1, 8190, 3072] 所以期待RoPE也是相同的形状
 首先构造 freqs 位置复数坐标表格 长度为 [1024, 21]或者[1024, 22] 实际上目前的latent只会使用f=0~20, h=0~14, w=0~25
 例如 freqs[0][:f].shape = [21, 22]; f_freqs.shape=[21, 15, 26, freq_channels=22] ; h_freqs = w_freqs = [21, 15, 26, freq_channels=21]
 随后对f h w的freqs进行拼接 从而得到3d表格 shape = [21, 15, 26, 64] -> reshape [8190, 1, 64]
-此时就能与latent token进行相乘 其中的1会在相乘的时候进行广播
+此时就能与base token进行相乘 其中的1会在相乘的时候进行广播
 如果3个branch在RoPE grid的排布并不连续 必要时则需要改写成基于explicit coordiante的RoPE实现
 
 

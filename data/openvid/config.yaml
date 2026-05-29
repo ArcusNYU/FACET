@@ -31,12 +31,12 @@ prepare:
   raw_video_root: /mnt/highspeed/users/Arcus/OPENVID_DATA  
   out_root: /mnt/highspeed/users/Arcus/openvid             # = data_root
   index_file: index.jsonl
-  category: upper_clothes        # TODO: multi-category in later iterations
+  category: hair       # TODO: multi-category in later iterations
   
   # ==== a. Parsing ====
   schp_model: SCHP/schp.pth
   schp_batch: 32                 # frames per SCHP forward; A100 80GB can take 81 if memory permits
-  lip_label_ids: [5, 7]          # Upper-clothes(5), Coat(7); merged into single mask
+  lip_label_ids: [2]          # Upper-clothes(5), Coat(7); merged into single mask
   temporal_smooth_k: 3           # mask temporal median filter window
 
   # ==== b. Caption ====

@@ -48,11 +48,11 @@ model:
 
   reference:
     image_size: 480
-    f_offset: 21              # 计算RoPE时临时将reference image放置在latent token的右侧 即第22个token的位置
-    detach_latent: true       # NOTE: 也是默认的 肯定不会把梯度传latent本身上面
+    h_offset: 0               # ref h 与 base 同范围 
+    w_offset: 26              # null = 自动 = target.width / token_spatial_stride (480x832@stride32 -> 26)
+    detach_latent: true       # NOTE: 肯定不会把梯度传latent本身上面
     timestep: 0.0             # 设置ref branch的加噪步为0 告知模型此为干净图像 而非噪声
     injection_mode: "branch_attention"   # NOTE: 仅表明OminiControl的架构 此cfg变量不会被使用 除了未来的消融实验
-    # update_reference_branch: true   NOTE: 暂时默认为True 代表ref token在forward过程中自身也要产生变化
     kv_cache: true            # 仅 inference 使用 training中暂不使用
 
   lora:

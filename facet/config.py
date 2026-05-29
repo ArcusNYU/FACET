@@ -1,7 +1,83 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
+import yaml
+
+
+# ============================================================
+# Top-level model config
+# ============================================================
+
+
+@dataclass
+class FACETConfig:
+    """
+    Aggregates every sub-config under `model:` in facet/config.yaml.
+
+    Construct via `FACETConfig.from_yaml(path)`.
+    """
+
+    name: str = "FACET-WAN2.2"
+    dtype: str = "bf16"
+    device: str = "cuda"
+    gradient_checkpointing: bool = True
+
+    base: FACETBaseConfig = field(default_factory=FACETBaseConfig)
+    wan: FACETWanConfig = field(default_factory=FACETWanConfig)
+    target: FACETTargetConfig = field(default_factory=FACETTargetConfig)
+    source: FACETSourceConfig = field(default_factory=FACETSourceConfig)
+    reference: FACETReferenceConfig = field(default_factory=FACETReferenceConfig)
+    lora: FACETLoRAConfig = field(default_factory=FACETLoRAConfig)
+    text: FACETTextConfig = field(default_factory=FACETTextConfig)
+    inference: FACETInferenceConfig = field(default_factory=FACETInferenceConfig)
+    training: FACETTrainingConfig = field(default_factory=FACETTrainingConfig)
+
+    _SUB_CONFIGS = {
+        "base": ("base", FACETBaseConfig),
+        "wan": ("wan", FACETWanConfig),
+        "target": ("target", FACETTargetConfig),
+        "source": ("source", FACETSourceConfig),
+        "reference": ("reference", FACETReferenceConfig),
+        "lora": ("lora", FACETLoRAConfig),
+        "text": ("text", FACETTextConfig),
+        "inference": ("inference", FACETInferenceConfig),
+        "training": ("training", FACETTrainingConfig),
+    }
+    _FLAT_FIELDS = {"name", "dtype", "device", "gradient_checkpointing"}
+
+    @staticmethod
+    def from_yaml(path: str) -> "FACETConfig":
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+
+        model_block = raw.get("model", {}) or {}
+        cfg = FACETConfig()
+
+        for k, v in model_block.items():
+            if k in FACETConfig._FLAT_FIELDS:
+                setattr(cfg, k, v)
+                continue
+
+            if k in FACETConfig._SUB_CONFIGS:
+                attr_name, _ = FACETConfig._SUB_CONFIGS[k]
+                sub = getattr(cfg, attr_name)
+                for sk, sv in (v or {}).items():
+                    if not hasattr(sub, sk):
+                        logger.warning(
+                            "Unknown key model.%s.%s in yaml, ignored.", k, sk
+                        )  #FIXME: logger.warning改成print
+                        continue
+                    if sk == "patch_size" and isinstance(sv, list):
+                        sv = tuple(sv)
+                    if sk == "target_modules" and isinstance(sv, list):
+                        sv = tuple(sv)
+                    setattr(sub, sk, sv)
+                continue
+
+            logger.warning("Unknown top-level key model.%s in yaml, ignored.", k) #FIXME: 同样改成print
+
+        return cfg
 
 
 # ============================================================
@@ -96,8 +172,36 @@ class FACETSourceConfig:
 
 @dataclass
 class FACETReferenceConfig:
+    """
+    Configures the OminiControl-style 'ref branch' (reference image).
+
+    RoPE placement (per frame.txt - design changed in WAN2.2 era):
+      - h_offset / w_offset:
+            ref tokens are placed to the RIGHT of base in the w-axis to avoid
+            spatial overlap. For target 480x832 with token_spatial_stride=32:
+              base.w range: 0..25  ->  ref.w range: 26..40   (w_offset = 26)
+            h does NOT need an offset (per OminiControl: "only need to avoid
+            spatial overlap"; with different w ranges, (h, w) plane is already
+            disjoint).
+            w_offset=None means "auto = target.width // token_spatial_stride".
+
+      - f-axis is SPECIAL:
+            placing ref at any fixed f>0 would (a) be misread as a 'future
+            frame' and (b) put different base frames at unequal temporal
+            distances to ref. So we DISABLE the f-RoPE on ref entirely
+            (treat ref as effectively f=0). When Q_base attends to K_ref, we
+            also disable Q_base's f-RoPE on that path so delta_f = 0
+            (achieved by both branches using f_freqs[0:1] which is the
+            identity rotation exp(i*0) = 1+0j).
+
+    Other:
+      timestep: clean signal (typically 0) injected into ref's per-branch
+                AdaLN modulation, so the model treats it as a fixed feature.
+      kv_cache: inference-time only; training does not cache.
+    """
     image_size: int = 480
-    f_offset: int = 21                      # place ref token f index at 21 (right of latent grid f=[0..20])
+    h_offset: int = 0                       # no h-axis shift; matches OminiControl design
+    w_offset: Optional[int] = None          # None -> auto = target.width // token_spatial_stride (26 for 480x832@stride32)
     detach_latent: bool = True
     timestep: float = 0.0                   # clean signal for ref branch
     injection_mode: str = "branch_attention"
@@ -136,3 +240,5 @@ class FACETTrainingConfig:
     loss_type: str = "mse"
     ref_dropout_prob: float = 0.05
     text_dropout_prob: float = 0.10
+
+
