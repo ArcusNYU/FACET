@@ -84,14 +84,8 @@ def facet_block_forward(
     t_mod_cond: torch.Tensor,
     context: torch.Tensor,
     freqs_base: torch.Tensor,
-    freqs_base_no_f: torch.Tensor,  #FIXME: 太生硬了 不如直接使用freqs_base 然后计算的时候特殊处理 这样做使得接口复杂化了 
-    # 因为这不是没有f轴或者取消f轴 而是delta_f=0 这样称呼变量名易引起歧义
-    # 然后我去看了一下该链路的代码 freqs_base其实应该叫做 freqs_src 
-    # freqs_base_no_f其实应该叫做 freqs_base
-    # 具体的做法是 在 build_freqs 函数中 正常生成 freqs_base, freqs_src, freqs_ref 先不要考虑no不no f的问题
-    # 然后在此block计算apply rope之前 再进行针对性调整 要不然看的人头大 逻辑复杂 
-    # 在 freqs_base = freqs_src的情况下 甚至都不需要传入 freqs_src 直接在代码中显式声明 freqs_src = freqs_base就行了
-    freqs_ref_no_f: torch.Tensor,  #FIXME: 太生硬了 改名为freqs_ref 然后计算的时候特殊处理
+    freqs_src: torch.Tensor,
+    freqs_ref: torch.Tensor,
     mask_coverage: torch.Tensor,
     gamma: float = 1.0,
     safe_epsilon: float = 1e-3,
@@ -104,23 +98,28 @@ def facet_block_forward(
     Args:
         block             : DiffSynth WanModel DiTBlock (in dit.blocks)
         x_base            : [B, L_base, dim]
-        x_src             : [B, L_src,  dim]   (L_src == L_base)
+        x_src             : [B, L_src,  dim]    (L_src == L_base)
         x_ref             : [B, L_ref,  dim]
         t_mod_base        : [B, 6, dim]   per-batch modulation for base (current t)
         t_mod_cond        : [B, 6, dim]   per-batch modulation for src AND ref (t=0)
-        context           : [B, L_text, dim]  already passed through dit.text_embedding
-        freqs_base        : [L_base, 1, head_dim/2]   full (f, h, w) RoPE
-        freqs_base_no_f   : [L_base, 1, head_dim/2]   (h, w) RoPE; f component = identity #FIXME: 不需要
-        freqs_ref_no_f    : [L_ref,  1, head_dim/2]   (h, w) RoPE for ref (w_offset applied),#FIXME: 改成freqs_ref
-                                                       f component = identity
+        context           : [B, L_text, dim]   already passed through dit.text_embedding
+        freqs_base        : [L_base, 1, head_dim/2]  full (f, h, w) RoPE  (f=[0..F-1])
+        freqs_src         : [L_src,  1, head_dim/2]  full (f, h, w) RoPE  (shares base coords)
+        freqs_ref         : [L_ref,  1, head_dim/2]  RoPE with w_offset; ref has 1 frame so its
+                                                     f-component is naturally f_freqs[0:1] = identity.
         mask_coverage     : [B, L_base]  in [0, 1], token-grid-aligned soft mask
         gamma             : scalar bias scale
         safe_epsilon      : numerical floor inside log
         bias_floor        : clamp lower bound after log (-1e4 keeps bf16 stable)
-        attention_mode    : "asymmetric" (default; only supported in current version)
+        attention_mode    : "asymmetric" (default; only supported in the current version)
+
+    Inside the block we additionally derive `freqs_base_f0` from `freqs_base` by
+    overwriting its f-axis sub-channels with the identity rotation (1+0j). It is
+    consumed ONLY in the Q_base -> K_ref pathway so the f-phase contribution
+    cancels out (delta_f = 0 between base and ref).
 
     Returns:
-        (x_base_out, x_src_out, x_ref_out) - same shapes as inputs
+        (x_base_out, x_src_out, x_ref_out) - same shapes as inputs.
     """
     if attention_mode != "asymmetric":
         raise NotImplementedError(
@@ -132,7 +131,7 @@ def facet_block_forward(
 
     # ---- 1. Six-way modulation per branch ----
     # block.modulation: [1, 6, dim]; t_mod_*: [B, 6, dim] -> chunk(6, dim=1) -> 6 x [B, 1, dim]
-    def expand_chunks(t_mod: torch.Tensor):  #TODO: 这里的 .modulation属性是什么?
+    def expand_chunks(t_mod: torch.Tensor):
         return (block.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
 
     sm_b, sc_b, gm_b, sl_b, scl_b, gl_b = expand_chunks(t_mod_base)
@@ -151,7 +150,7 @@ def facet_block_forward(
     # ---- 3. Q/K/V projections (shared weights & LoRA across branches) ----
     q_b = sa.norm_q(sa.q(input_b))
     k_b = sa.norm_k(sa.k(input_b))
-    v_b = sa.v(input_b)  # 为什么对于value 不需要使用norm_v?
+    v_b = sa.v(input_b)
 
     q_s = sa.norm_q(sa.q(input_s))
     k_s = sa.norm_k(sa.k(input_s))
@@ -161,26 +160,32 @@ def facet_block_forward(
     k_r = sa.norm_k(sa.k(input_r))
     v_r = sa.v(input_r)
 
-    # ---- 4. Apply RoPE ----
-    freqs_src = freqs_base
-    # FIXME: 调整此部分逻辑
-    q_b = rope_apply(q_b, freqs_base, n_heads)
-    # q_b_no_f = rope_apply(q_b, freqs_base_no_f, n_heads)
-    # TODO: 将 freqs_base的f维度上的数值全部设置为 1 + 0j计算出来的内容 使用该内容进行覆盖
-    # 也就是f轴的值与 ref的f值相同 都是由f=0对应计算出来的 相当于在这里才计算 f_disable
-    freqs_base_f0 = ...
-    # 然后将 freqs_base_f0 传入 rope_apply 得到所谓的 q_b_no_f 这里叫作q_b_f0
-    q_b_f0 = rope_apply(q_b, freqs_base_f0, n_heads)
-    k_b = rope_apply(k_b, freqs_base, n_heads)
+    # ---- 4. Build freqs_base_f0 from freqs_base ----
+    # freqs_* layout along the last dim:  [ f-channels | h-channels | w-channels ]
+    # for WAN's precompute, c_f = (head_dim - 2 * (head_dim // 3)) // 2.
+    # For head_dim=128 -> c_f = 22 (and c_h = c_w = 21, summing to 64 = head_dim/2).
+    # `f_freqs[0]` corresponds to position f=0, which evaluates to exp(i*0) = 1+0j
+    # (the identity rotation). Replacing the f sub-channels of freqs_base with this
+    # identity makes rope_apply leave the f-phase of q_b untouched, so when we
+    # later dot it with k_r (whose f-phase is ALREADY identity because ref has
+    # f=1), the delta_f contribution becomes 1 * conj(1) = 1 (i.e. no phase shift).
+    # Result: Q_base sees every K_ref token without temporal misalignment.
+    # FIXME: 这个地方还是有问题 ref的f值是0 并不是1 所以这里的freqs_base_f0的f都应该是0
+    c_f = (head_dim - 2 * (head_dim // 3)) // 2
+    freqs_base_f0 = freqs_base.clone()
+    # For complex tensors, torch.ones_like returns 1+0j with the same complex dtype.
+    freqs_base_f0[..., :c_f] = torch.ones_like(freqs_base_f0[..., :c_f])
 
-    # src shares freqs_base (spatially aligned).
+    # ---- 5. Apply RoPE ----
+    q_b      = rope_apply(q_b, freqs_base,    n_heads)
+    q_b_f0   = rope_apply(q_b, freqs_base_f0, n_heads)
+    k_b      = rope_apply(k_b, freqs_base,    n_heads)
+
     q_s = rope_apply(q_s, freqs_src, n_heads)
     k_s = rope_apply(k_s, freqs_src, n_heads)
 
-    # ref uses (h, w) RoPE with w_offset.
-    # 使用正常按照f=0 build出来的ref_freqs
-    q_r = rope_apply(q_r, freqs_ref, n_heads) 
-    k_r = rope_apply(k_r, freqs_ref, n_heads) 
+    q_r = rope_apply(q_r, freqs_ref, n_heads)
+    k_r = rope_apply(k_r, freqs_ref, n_heads)
 
     # ---- 5. Base Branch: Q_base global attention with mask-aware bias ----
     # Customized attention logic for FACET base branch:
@@ -189,15 +194,13 @@ def facet_block_forward(
     # (b) Q_base uses different RoPE for K_ref vs K_base/K_src.
     B = x_base.shape[0]
     L_base = x_base.shape[1]
-    L_src = x_src.shape[1]
-    L_ref = x_ref.shape[1]
 
     def to_heads(t: torch.Tensor) -> torch.Tensor:
         # [B, S, n*d] -> [B, n, S, d]
         return t.view(B, -1, n_heads, head_dim).transpose(1, 2)
 
     q_b_h = to_heads(q_b)
-    q_b_f0_h = to_heads(q_b_f0)
+    q_b_f0_h   = to_heads(q_b_f0)
     k_b_h = to_heads(k_b)
     v_b_h = to_heads(v_b)
     k_s_h = to_heads(k_s)
@@ -209,19 +212,18 @@ def facet_block_forward(
 
     # Scores: [B, n_heads, L_base, L_*]
     score_to_base = (q_b_h @ k_b_h.transpose(-2, -1)) * scale
-    score_to_src = (q_b_h @ k_s_h.transpose(-2, -1)) * scale
-    score_to_ref = (q_b_f0_h @ k_r_h.transpose(-2, -1)) * scale # 此时在计算的时候 base token相较于ref token的f轴 delta_f=0
+    score_to_src  = (q_b_h @ k_s_h.transpose(-2, -1)) * scale
+    score_to_ref  = (q_b_f0_h   @ k_r_h.transpose(-2, -1)) * scale   # delta_f = 0 here
 
     # Mask-aware bias: per-Q-base routing.
     # m_q = m[:, None, :, None]  -> [B, 1, L_base, 1]; broadcasts over heads and K dim.
     m_q = mask_coverage.to(score_to_src.dtype)[:, None, :, None]  
-    #TODO:为啥这里偏偏选择score_to_src的dtype 能不能选择一个系统层面统一的dtype
-    # 例如传进来的参数的dtype 哪怕是x_base都可以 这样所有dtype统一 
+
     m_q_reverse = (1.0 - m_q).clamp_min(safe_epsilon)
     m_q = m_q.clamp_min(safe_epsilon)
     
     bias_src = (gamma * torch.log(m_q_reverse)).clamp_min(bias_floor)
-    bias_ref = (gamma * torch.log(m_q)).clamp_min(bias_floor)
+    bias_ref = (gamma * torch.log(m_q)        ).clamp_min(bias_floor)
 
     score_to_src = score_to_src + bias_src
     score_to_ref = score_to_ref + bias_ref
@@ -229,36 +231,34 @@ def facet_block_forward(
     # Global softmax over [K_base | K_src | K_ref].
     # Cast to fp32 for numerical stability in softmax (matches DiffSynth's pattern
     # of doing time/modulation math in fp32).
-    # TODO: fp32体现在哪里??? 通过.float()?
     score = torch.cat([score_to_base, score_to_src, score_to_ref], dim=-1)
     attn_weights = torch.softmax(score.float(), dim=-1).to(v_b_h.dtype)
-    # TODO: 为什么这里又是v_b_h的dtype
 
-    # Weighted sum: split V's by K-block sizes.
+    # Weighted sum: concat V's along the K axis.
     v_all = torch.cat([v_b_h, v_s_h, v_r_h], dim=2)   # [B, n_heads, L_all, head_dim]
-    y_b = attn_weights @ v_all                        # [B, n_heads, L_base, head_dim]
+    y_b = attn_weights @ v_all                         # [B, n_heads, L_base, head_dim]
 
     # Back to [B, L_base, n_heads*head_dim]
     y_b = y_b.transpose(1, 2).reshape(B, L_base, n_heads * head_dim)
     y_b = sa.o(y_b)
 
-    # ---- 6. Src Branch: Q_src self-attention ----
+    # ---- 7. Src Branch: Q_src self-attention (standard, flash-able) ----
     y_s = sa.attn(q_s, k_s, v_s)
     y_s = sa.o(y_s)
 
-    # ---- 7. Ref Branch: Q_ref self-attention ----
+    # ---- 8. Ref Branch: Q_ref self-attention (standard, flash-able) ----
     y_r = sa.attn(q_r, k_r, v_r)
     y_r = sa.o(y_r)
 
-    # ---- 8. Gate (residual + attn output) ----
+    # ---- 9. Gate (residual + attn output) ----
     x_base = block.gate(x_base, gm_b, y_b)
     x_src  = block.gate(x_src,  gm_c, y_s)
     x_ref  = block.gate(x_ref,  gm_c, y_r)
 
-    # ---- 9. Cross-attention (text) - Base Branch only ----
+    # ---- 10. Cross-attention (text) - Base Branch only ----
     x_base = x_base + block.cross_attn(block.norm3(x_base), context)
 
-    # ---- 10. FFN per branch ----
+    # ---- 11. FFN per branch ----
     input_b = modulate(block.norm2(x_base), sl_b, scl_b)
     input_s = modulate(block.norm2(x_src),  sl_c, scl_c)
     input_r = modulate(block.norm2(x_ref),  sl_c, scl_c)
@@ -514,12 +514,12 @@ class FACETWanModel(nn.Module):
 
         Returns:
             pred: [B, 16, F_lat, h, w]  velocity-target prediction.
-        """
-        # ---- 0. Move/cast inputs to model device & dtype ----
-        noisy_latents = noisy_latents.to(device=self.device, dtype=self.dtype)
-        ref_latents = ref_latents.to(device=self.device, dtype=self.dtype)
-        src_latents = src_latents.to(device=self.device, dtype=self.dtype)
 
+        NOTE: All tensor inputs (noisy_latents, ref_latents, src_latents,
+        src_mask, prompt_embeds elements) MUST already live on `self.device`
+        with dtype = `self.dtype` (= accelerate's mixed-precision dtype,
+        typically bf16 on A100). The caller (train.py / generate) is responsible.
+        """
         B = noisy_latents.shape[0]
 
         # ---- 1. Patchify base branch ----
@@ -534,7 +534,7 @@ class FACETWanModel(nn.Module):
         x_src = self.dit.patch_embedding(src_latents)
         f_src, h_src, w_src = x_src.shape[2:]
         x_src = x_src.flatten(2).transpose(1, 2)
-        # x_src: [B, L_src, dim]; spatially aligned with base so L_src == L_base.
+        # x_src: [B, L_src, dim]; spatially aligned with base: L_src == L_base.
 
         # ---- 3. Patchify ref branch (shares dit.patch_embedding) ----
         x_ref = self.dit.patch_embedding(ref_latents)
@@ -545,36 +545,37 @@ class FACETWanModel(nn.Module):
         # ---- 4. Time features ----
         # base uses the actual diffusion timestep; src and ref share t=0.
         t_base, t_mod_base = self.compute_time_features(timesteps)
-        clean_t = torch.full_like(
+        # t_base: [B, dim] -> head(t_base); t_mod_base: [B, 6, dim] -> dit.blocks(t_mod_base)
+        t_cond = torch.full_like(
             timesteps, fill_value=float(self.cfg.source.timestep),
         )
-        _, t_mod_cond = self.compute_time_features(clean_t)
+        _, t_mod_cond = self.compute_time_features(t_cond)
 
         # ---- 5. Text context (pad + dit.text_embedding -> [B, 512, dim]) ----
         context = self._prepare_text_context(prompt_embeds)
 
-        # ---- 6. RoPE freqs per attention pathway ----
-        # See module-level docstring of facet_block_forward for the three RoPE roles.
+        # ---- 6. RoPE freqs per branch ----
+        # All three share the SAME dit.freqs table (a single shared rotary
+        # coordinate space). Their differences are just which f/h/w slice they
+        # use. The "delta_f = 0" special case for Q_base -> K_ref is handled
+        # INSIDE facet_block_forward by deriving freqs_base_f0 from freqs_base.
         freqs_base = self.build_freqs(
             f_base, h_base, w_base,
-            f_offset=self.cfg.source.f_offset,   # 0 by default; src shares
-            h_offset=0, w_offset=0,
-            f_disabled=False,
-            device=x_base.device,
-        )
-        freqs_base_no_f = self.build_freqs(
-            f_base, h_base, w_base,
             f_offset=0, h_offset=0, w_offset=0,
-            f_disabled=True,
-            device=x_base.device,
+            device=self.device,
         )
-        freqs_ref_no_f = self.build_freqs(
+        freqs_src = self.build_freqs(
+            f_src, h_src, w_src,
+            f_offset=int(self.cfg.source.f_offset),
+            h_offset=0, w_offset=0,
+            device=self.device,
+        )
+        freqs_ref = self.build_freqs(
             f_ref, h_ref, w_ref,
             f_offset=0,
             h_offset=int(self.cfg.reference.h_offset),
-            w_offset=self._resolve_ref_w_offset(), # 直接用config中的值 不需要这个_resolve_ref_w_offset函数了
-            f_disabled=True,
-            device=x_base.device,
+            w_offset=int(self.cfg.reference.w_offset),
+            device=self.device,
         )
 
         # ---- 7. Mask coverage (Q_base routing prior) ----
@@ -597,7 +598,7 @@ class FACETWanModel(nn.Module):
                     facet_block_forward,
                     block, x_base, x_src, x_ref,
                     t_mod_base, t_mod_cond, context,
-                    freqs_base, freqs_base_no_f, freqs_ref_no_f,
+                    freqs_base, freqs_src, freqs_ref,
                     mask_coverage,
                     gamma=gamma,
                     safe_epsilon=safe_epsilon,
@@ -608,7 +609,7 @@ class FACETWanModel(nn.Module):
                 x_base, x_src, x_ref = facet_block_forward(
                     block, x_base, x_src, x_ref,
                     t_mod_base, t_mod_cond, context,
-                    freqs_base, freqs_base_no_f, freqs_ref_no_f,
+                    freqs_base, freqs_src, freqs_ref,
                     mask_coverage,
                     gamma=gamma,
                     safe_epsilon=safe_epsilon,
@@ -634,7 +635,7 @@ class FACETWanModel(nn.Module):
         self,
         prompt: Optional[Union[str, List[str]]] = None,
         prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
+        reference_images: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
         ref_latents: Optional[torch.Tensor] = None,
         src_video: Optional[torch.Tensor] = None,
         src_latents: Optional[torch.Tensor] = None,
@@ -656,30 +657,21 @@ class FACETWanModel(nn.Module):
 
         Required (one from each pair):
             - prompt OR prompt_embeds
-            - reference_image OR ref_latents
+            - reference_images OR ref_latents
             - (src_video AND src_mask)   OR  (src_latents AND src_mask)
-              (src_mask is ALWAYS required; without it the mask-aware bias
-              cannot be computed.)
 
         Batch-size resolution priority:
             1. src_video.shape[0] / src_latents.shape[0] if provided
-            2. else inferred from prompt / ref shapes (must agree).
+            2. else inferred from prompt / ref shapes.
 
         CFG (classifier-free guidance) - TODO scaffolding:
             Currently implements text-only CFG. cfg_scale > 1.0 triggers two
             forward passes: cond (full prompt) and uncond (negative prompt or "").
             src + ref + mask are ALWAYS provided to both branches (the task
             inherently requires them; the user always uploads ref + masked video).
+            TODO: reference_guidance_scale / image-CFG variants. 
 
-            TODO: reference_guidance_scale / image-CFG variants. See frame.txt
-            for the design intent: when a user runs inference, the masked source
-            video and the reference image must be provided. The text prompt is
-            optional, which is what text-CFG covers.
-
-        TODO: KV-cache for src/ref branches (cfg.source.kv_cache /
-              cfg.reference.kv_cache) is NOT implemented yet; ref/src tokens
-              are re-computed every step. forward() interface is stable to add
-              caching later.
+        TODO: KV-cache for src/ref branches (cfg.source.kv_cache / cfg.reference.kv_cache) 
         """
         # ---- 0. Resolve scalar defaults ----
         height = height or self.cfg.target.height
@@ -693,13 +685,21 @@ class FACETWanModel(nn.Module):
             temporal_stride=self.cfg.wan.vae_temporal_stride,
         )
 
-        # ---- 1. src branch (latents) ----
+        # ---- 1. src branch + mask ----
         if src_latents is None and src_video is None:
             raise ValueError("Either src_video or src_latents must be provided.")
         if src_mask is None:
             raise ValueError(
-                "src_mask is required for FACET inference (mask-aware bias)."
+                "src_mask is required for FACET inference (mask-aware attention bias)."
             )
+
+        # Latent grid the model will operate on.
+        f_lat = latent_frames_from_num_frames(
+            num_frames, temporal_stride=self.cfg.wan.vae_temporal_stride,
+        )
+        h_lat = height // self.cfg.wan.vae_spatial_stride
+        w_lat = width // self.cfg.wan.vae_spatial_stride
+        z_dim = getattr(self.dit, "in_dim", 16)
 
         if src_latents is not None:
             if src_video is not None:
@@ -708,19 +708,50 @@ class FACETWanModel(nn.Module):
                 )
             if src_latents.ndim == 4:
                 src_latents = src_latents.unsqueeze(0)
+            if src_latents.ndim != 5:
+                raise ValueError(
+                    f"src_latents should be [B, {z_dim}, F_lat, h, w] or [{z_dim}, F_lat, h, w], "
+                    f"got shape {tuple(src_latents.shape)}"
+                )
+            if tuple(src_latents.shape[1:]) != (z_dim, f_lat, h_lat, w_lat):
+                raise ValueError(
+                    f"src_latents shape mismatch: got {tuple(src_latents.shape)}, "
+                    f"expected (B, {z_dim}, {f_lat}, {h_lat}, {w_lat}) "
+                    f"for target ({height}x{width}x{num_frames})."
+                )
             src_latents = src_latents.to(device=self.device, dtype=self.dtype)
         else:
             if src_video.ndim == 4:
                 src_video = src_video.unsqueeze(0)
+            if src_video.ndim != 5:
+                raise ValueError(
+                    f"src_video should be [B, 3, F, H, W] or [3, F, H, W], "
+                    f"got shape {tuple(src_video.shape)}"
+                )
+            if tuple(src_video.shape[1:]) != (3, num_frames, height, width):
+                raise ValueError(
+                    f"src_video shape mismatch: got {tuple(src_video.shape)}, "
+                    f"expected (B, 3, {num_frames}, {height}, {width})."
+                )
             src_latents = self.encode_src_video(src_video)
 
-        # Normalize src_mask shape now (for batch broadcast below).
+        # src_mask: must be at PIXEL resolution (same H/W/F as src_video).
         if src_mask.ndim == 4:
             src_mask = src_mask.unsqueeze(0)
         if src_mask.ndim != 5:
             raise ValueError(
                 f"src_mask should be [B, 1, F, H, W] or [1, F, H, W], "
                 f"got shape {tuple(src_mask.shape)}"
+            )
+        if src_mask.shape[1] != 1:
+            raise ValueError(
+                f"src_mask must have exactly 1 channel; got {src_mask.shape[1]}."
+            )
+        if tuple(src_mask.shape[2:]) != (num_frames, height, width):
+            raise ValueError(
+                f"src_mask spatial/temporal shape mismatch: got "
+                f"{tuple(src_mask.shape[2:])}, expected ({num_frames}, {height}, {width}). "
+                "src_mask must live in PIXEL space; compute_mask_coverage pools it down."
             )
 
         batch_size = src_latents.shape[0]
@@ -735,6 +766,7 @@ class FACETWanModel(nn.Module):
             )
 
         def _broadcast_tensor(t, name):
+            # NOTE: check / broadcast
             if t.shape[0] == batch_size:
                 return t
             if t.shape[0] == 1:
@@ -763,20 +795,36 @@ class FACETWanModel(nn.Module):
             uncond_context = None
 
         # ---- 3. Reference latents ----
-        if ref_latents is None and reference_image is None:
+        if ref_latents is None and reference_images is None:
             raise ValueError(
-                "Either reference_image or ref_latents must be provided."
+                "Either reference_images or ref_latents must be provided."
             )
+
+        ref_img_size = self.cfg.reference.image_size
+        ref_lat_hw = ref_img_size // self.cfg.wan.vae_spatial_stride  # e.g. 30 for 480
+
         if ref_latents is not None:
-            if reference_image is not None:
+            if reference_images is not None:
                 logger.info(
-                    "[FACET] Both reference_image and ref_latents given; "
+                    "[FACET] Both reference_images and ref_latents given; "
                     "using ref_latents."
                 )
             if ref_latents.ndim == 4:
                 ref_latents = ref_latents.unsqueeze(0)
+            if ref_latents.ndim != 5:
+                raise ValueError(
+                    f"ref_latents should be [B, {z_dim}, 1, h_ref, w_ref] or "
+                    f"[{z_dim}, 1, h_ref, w_ref], got shape {tuple(ref_latents.shape)}"
+                )
+            if tuple(ref_latents.shape[1:3]) != (z_dim, 1):
+                raise ValueError(
+                    f"ref_latents shape mismatch: got {tuple(ref_latents.shape)}, "
+                    f"expected (B, {z_dim}, 1, h_ref, w_ref). "
+                    "ref_latents must be a single-frame latent."
+                )
+            ref_latents = ref_latents.to(device=self.device, dtype=self.dtype)
         else:
-            ref_latents = self.encode_reference_image(reference_image)
+            ref_latents = self.encode_reference_image(reference_images)
         ref_latents = _broadcast_tensor(ref_latents, "ref_latents")
 
         # ---- 4. Initial noisy latents ----
@@ -788,6 +836,16 @@ class FACETWanModel(nn.Module):
             )
         else:
             cur_latents = latents.unsqueeze(0) if latents.ndim == 4 else latents
+            if cur_latents.ndim != 5:
+                raise ValueError(
+                    f"latents should be [B, {z_dim}, F_lat, h, w] or "
+                    f"[{z_dim}, F_lat, h, w], got shape {tuple(cur_latents.shape)}"
+                )
+            if tuple(cur_latents.shape[1:]) != (z_dim, f_lat, h_lat, w_lat):
+                raise ValueError(
+                    f"latents shape mismatch: got {tuple(cur_latents.shape)}, "
+                    f"expected (B, {z_dim}, {f_lat}, {h_lat}, {w_lat})."
+                )
             cur_latents = _broadcast_tensor(cur_latents, "latents")
             cur_latents = cur_latents.to(device=self.device, dtype=self.dtype)
 
@@ -836,9 +894,11 @@ class FACETWanModel(nn.Module):
             )
 
         # ---- 7. Decode final latents ----
+        # Returned as [B, 3, F, H, W] in [-1, 1]; FACETPipeline.__call__ handles
+        # the final mapping back to uint8 / PIL frames when output_type=="frames".
         return self.decode_latents(cur_latents)
 
-    
+
     # --------------------------------------------------------
     # Encoding helpers
     # --------------------------------------------------------
@@ -1193,8 +1253,6 @@ class FACETWanModel(nn.Module):
         f_offset: int = 0,
         h_offset: int = 0,
         w_offset: int = 0,
-        f_disabled: bool = False, # FIXME: 不需要传入f_disable 正常计算就行了
-        # 在facet_block_forward中 让 f_freqs在apply_rope前自行执行disable操作
         device: Optional[Union[str, torch.device]] = None,
     ) -> torch.Tensor:
         """
@@ -1206,17 +1264,12 @@ class FACETWanModel(nn.Module):
         (sums to head_dim/2 = 64).
 
         Args:
-            f, h, w:       grid sizes in patchified-token space.
-            f_offset:      starting index along the f-axis. 0 for base/src.
-            h_offset:      starting index along the h-axis. 0 for all branches
-            w_offset:      starting index along the w-axis. 0 for base/src;
-                           cfg.reference.w_offset for ref (default 26 for 480x832).
-            f_disabled:    if True, use f_freqs[0:1] (identity = exp(i*0) = 1+0j)
-                           replicated to all f positions. Used by:
-                             (a) freqs_base_no_f - applied to Q_base when
-                                 attending to K_ref (delta_f cancellation)
-                             (b) freqs_ref_no_f  - applied to ref's Q/K
-                                 (ref has 1 frame so f-RoPE is moot anyway) # FIXME: 取消该参数
+            f, h, w:      grid sizes in patchified-token space.
+            f_offset:     starting index along the f-axis. 0 for base/src.
+            h_offset:     starting index along the h-axis. 0 for all branches.
+            w_offset:     starting index along the w-axis. 0 for base/src;
+                          cfg.reference.w_offset for ref (default 26 for 480x832).
+            device:       target device; defaults to dit.freqs[0].device.
 
         Returns:
             freqs of shape [f*h*w, 1, head_dim/2], complex tensor ready for rope_apply.
@@ -1228,17 +1281,13 @@ class FACETWanModel(nn.Module):
             device = f_freqs.device
 
         # --- f-axis ---
-        if f_disabled:  # FIXME: 取消该部分
-            # Identity rotation: f_freqs[0] = exp(i*0) = 1+0j.
-            f_part = f_freqs[0:1].view(1, 1, 1, -1).expand(f, h, w, -1)
-        else:
-            max_f = f_freqs.shape[0]
-            if f_offset + f > max_f:
-                raise ValueError(
-                    f"f_offset({f_offset}) + f({f}) = {f_offset + f} exceeds "
-                    f"precomputed freqs length {max_f}."
-                )
-            f_part = f_freqs[f_offset : f_offset + f].view(f, 1, 1, -1).expand(f, h, w, -1)
+        max_f = f_freqs.shape[0]
+        if f_offset + f > max_f:
+            raise ValueError(
+                f"f_offset({f_offset}) + f({f}) = {f_offset + f} exceeds "
+                f"precomputed freqs length {max_f}."
+            )
+        f_part = f_freqs[f_offset : f_offset + f].view(f, 1, 1, -1).expand(f, h, w, -1)
 
         # --- h-axis ---
         max_h = h_freqs.shape[0]
@@ -1284,13 +1333,12 @@ class FACETWanModel(nn.Module):
             raise RuntimeError("DiT not loaded.")
 
         dit = self.dit
-        device = next(dit.parameters()).device
-        timestep = timestep.to(device=device)
+        timestep = timestep.to(device=self.device)
 
         # Cast to the dtype the rest of the dit expects.
-        t_emb = sinusoidal_embedding_1d(dit.freq_dim, timestep).to(self.dtype) # freq_dim = 1024
+        t_emb = sinusoidal_embedding_1d(dit.freq_dim, timestep).to(self.dtype)  # freq_dim = 256
         t = dit.time_embedding(t_emb)
-        t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim)) # [B, 6, dim]
+        t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))  # [B, 6, dim=3072]
         return t, t_mod
 
     def _prepare_text_context(
@@ -1307,17 +1355,6 @@ class FACETWanModel(nn.Module):
             for u in prompt_embeds
         ])
         return self.dit.text_embedding(padded.to(self.device, dtype=self.dtype))
-
-    def _resolve_ref_w_offset(self) -> int: # FIXME: 保留该函数 但是暂时不进行使用
-        """
-        Resolve cfg.reference.w_offset. None means 'auto = right edge of base'
-        based on cfg.target.width / cfg.wan.token_spatial_stride.
-        """
-        w_off = self.cfg.reference.w_offset
-        if w_off is None:
-            return self.cfg.target.width // self.cfg.wan.token_spatial_stride
-        return int(w_off)
-
 
     # --------------------------------------------------------
     # Scheduler helpers
@@ -1338,7 +1375,7 @@ class FACETWanModel(nn.Module):
             shift > 1 squeezes more steps into the high-noise region. Wan default = 5.
 
         denoising_strength:
-            Scales the starting sigma. 1.0 = start from pure noise. FACET always 1.0.
+            Scales the starting sigma. 1.0 = start from pure noise. FACET uses 1.0.
 
         Returns CPU tensor of timesteps in [0, 1000].
         """
@@ -1389,7 +1426,7 @@ class FACETPipeline:
         self,
         prompt: Optional[Union[str, List[str]]] = None,
         prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
+        reference_images: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
         ref_latents: Optional[torch.Tensor] = None,
         src_video: Optional[torch.Tensor] = None,
         src_latents: Optional[torch.Tensor] = None,
@@ -1416,7 +1453,7 @@ class FACETPipeline:
         video = self.model.generate(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
-            reference_image=reference_image,
+            reference_images=reference_images,
             ref_latents=ref_latents,
             src_video=src_video,
             src_latents=src_latents,
@@ -1434,6 +1471,11 @@ class FACETPipeline:
 
         output_type = output_type or self.model.cfg.inference.output_type
         if output_type == "video":
+            # Return the raw decoded tensor in [-1, 1]. This is the canonical
+            # research output (downstream metrics like LPIPS / SSIM / VBench
+            # operate on this range or trivially shift to [0, 1]). Conversion
+            # to uint8 / [0, 255] is the caller's responsibility (see
+            # _to_pil_frames for the standard mapping).
             return video
         if output_type == "frames":
             return self._to_pil_frames(video)
