@@ -161,16 +161,17 @@ def facet_block_forward(
     v_r = sa.v(input_r)
 
     # ---- 4. Build freqs_base_f0 from freqs_base ----
-    # freqs_* layout along the last dim:  [ f-channels | h-channels | w-channels ]
-    # for WAN's precompute, c_f = (head_dim - 2 * (head_dim // 3)) // 2.
-    # For head_dim=128 -> c_f = 22 (and c_h = c_w = 21, summing to 64 = head_dim/2).
-    # `f_freqs[0]` corresponds to position f=0, which evaluates to exp(i*0) = 1+0j
-    # (the identity rotation). Replacing the f sub-channels of freqs_base with this
-    # identity makes rope_apply leave the f-phase of q_b untouched, so when we
-    # later dot it with k_r (whose f-phase is ALREADY identity because ref has
-    # f=1), the delta_f contribution becomes 1 * conj(1) = 1 (i.e. no phase shift).
+    #   position index 0  ->  exp(i * 0 * theta_k)  =  1 + 0j  (identity rotation)
+    # In WAN's precompute (DiffSynth wan_video_dit.precompute_freqs_cis):
+    #     freqs_cis[pos, k] = torch.polar(1.0, pos * theta_k)
+    # so freqs_cis[0, k] = (cos 0) + i (sin 0) = 1 + 0j for every channel k.
+    #
+    # Layout of freqs_* along the last dim:
+    #     [ f-channels (length c_f) | h-channels (c_h) | w-channels (c_w) ]
+    # For WAN's split, c_f = (head_dim - 2*(head_dim // 3)) // 2.
+    # head_dim=128  ->  c_f = 22, c_h = c_w = 21, total = 64 = head_dim/2.
+    #
     # Result: Q_base sees every K_ref token without temporal misalignment.
-    # FIXME: 这个地方还是有问题 ref的f值是0 并不是1 所以这里的freqs_base_f0的f都应该是0
     c_f = (head_dim - 2 * (head_dim // 3)) // 2
     freqs_base_f0 = freqs_base.clone()
     # For complex tensors, torch.ones_like returns 1+0j with the same complex dtype.
