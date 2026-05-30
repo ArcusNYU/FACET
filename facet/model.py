@@ -485,6 +485,360 @@ class FACETWanModel(nn.Module):
                 len(missing),
             )
 
+
+    # --------------------------------------------------------
+    # Training forward
+    # --------------------------------------------------------
+
+    def forward(
+        self,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: List[torch.Tensor],
+        ref_latents: torch.Tensor,
+        src_latents: torch.Tensor,
+        src_mask: torch.Tensor,
+        return_dict: bool = True,
+    ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        One denoising step (shared by training & generation).
+
+        Args:
+            noisy_latents:  [B, 16, F_lat, h, w]                       (REQUIRED)
+            timesteps:      [B]  fp32                                  (REQUIRED)
+            prompt_embeds:  List length B, each [L_i, 4096]            (REQUIRED)
+            ref_latents:    [B, 16, 1, h_ref, w_ref]                   (REQUIRED)
+            src_latents:    [B, 16, F_lat, h, w]                       (REQUIRED)
+            src_mask:       [B, 1, F, H, W] in [0, 1]                  (REQUIRED)
+            return_dict:    if True returns {"pred": ...}, else returns tensor
+
+        Returns:
+            pred: [B, 16, F_lat, h, w]  velocity-target prediction.
+        """
+        # ---- 0. Move/cast inputs to model device & dtype ----
+        noisy_latents = noisy_latents.to(device=self.device, dtype=self.dtype)
+        ref_latents = ref_latents.to(device=self.device, dtype=self.dtype)
+        src_latents = src_latents.to(device=self.device, dtype=self.dtype)
+
+        B = noisy_latents.shape[0]
+
+        # ---- 1. Patchify base branch ----
+        # patch_embedding: Conv3d (k=s=(1,2,2)): [B, 16, F_lat, H/16, W/16]
+        #   -> [B, dim, F_lat, H/32, W/32]
+        x_base = self.dit.patch_embedding(noisy_latents)
+        f_base, h_base, w_base = x_base.shape[2:]
+        x_base = x_base.flatten(2).transpose(1, 2)
+        # x_base: [B, L_base, dim]    L_base = f_base * h_base * w_base
+
+        # ---- 2. Patchify src branch (shares dit.patch_embedding) ----
+        x_src = self.dit.patch_embedding(src_latents)
+        f_src, h_src, w_src = x_src.shape[2:]
+        x_src = x_src.flatten(2).transpose(1, 2)
+        # x_src: [B, L_src, dim]; spatially aligned with base so L_src == L_base.
+
+        # ---- 3. Patchify ref branch (shares dit.patch_embedding) ----
+        x_ref = self.dit.patch_embedding(ref_latents)
+        f_ref, h_ref, w_ref = x_ref.shape[2:]
+        x_ref = x_ref.flatten(2).transpose(1, 2)
+        # x_ref: [B, L_ref, dim];  L_ref = 1 * h_ref * w_ref
+
+        # ---- 4. Time features ----
+        # base uses the actual diffusion timestep; src and ref share t=0.
+        t_base, t_mod_base = self.compute_time_features(timesteps)
+        clean_t = torch.full_like(
+            timesteps, fill_value=float(self.cfg.source.timestep),
+        )
+        _, t_mod_cond = self.compute_time_features(clean_t)
+
+        # ---- 5. Text context (pad + dit.text_embedding -> [B, 512, dim]) ----
+        context = self._prepare_text_context(prompt_embeds)
+
+        # ---- 6. RoPE freqs per attention pathway ----
+        # See module-level docstring of facet_block_forward for the three RoPE roles.
+        freqs_base = self.build_freqs(
+            f_base, h_base, w_base,
+            f_offset=self.cfg.source.f_offset,   # 0 by default; src shares
+            h_offset=0, w_offset=0,
+            f_disabled=False,
+            device=x_base.device,
+        )
+        freqs_base_no_f = self.build_freqs(
+            f_base, h_base, w_base,
+            f_offset=0, h_offset=0, w_offset=0,
+            f_disabled=True,
+            device=x_base.device,
+        )
+        freqs_ref_no_f = self.build_freqs(
+            f_ref, h_ref, w_ref,
+            f_offset=0,
+            h_offset=int(self.cfg.reference.h_offset),
+            w_offset=self._resolve_ref_w_offset(), # 直接用config中的值 不需要这个_resolve_ref_w_offset函数了
+            f_disabled=True,
+            device=x_base.device,
+        )
+
+        # ---- 7. Mask coverage (Q_base routing prior) ----
+        # [B, L_base], same flatten order as patch_embedding output.
+        mask_coverage = self.compute_mask_coverage(
+            src_mask,
+            f_lat=f_base, h_tok=h_base, w_tok=w_base,
+        )
+
+        gamma = float(self.cfg.source.gamma)
+        safe_epsilon = float(self.cfg.source.safe_epsilon)
+        attention_mode = self.cfg.source.attention_mode
+
+        # ---- 8. Iterate DiT blocks with custom branch attention ----
+        gc_enabled = bool(self.cfg.gradient_checkpointing) and self.training
+
+        for block in self.dit.blocks:
+            if gc_enabled:
+                x_base, x_src, x_ref = torch.utils.checkpoint.checkpoint(
+                    facet_block_forward,
+                    block, x_base, x_src, x_ref,
+                    t_mod_base, t_mod_cond, context,
+                    freqs_base, freqs_base_no_f, freqs_ref_no_f,
+                    mask_coverage,
+                    gamma=gamma,
+                    safe_epsilon=safe_epsilon,
+                    attention_mode=attention_mode,
+                    use_reentrant=False,
+                )
+            else:
+                x_base, x_src, x_ref = facet_block_forward(
+                    block, x_base, x_src, x_ref,
+                    t_mod_base, t_mod_cond, context,
+                    freqs_base, freqs_base_no_f, freqs_ref_no_f,
+                    mask_coverage,
+                    gamma=gamma,
+                    safe_epsilon=safe_epsilon,
+                    attention_mode=attention_mode,
+                )
+
+        # ---- 9. Head (base branch only) + unpatchify ----
+        # OminiControl convention: src and ref are 'register' branches; only
+        # base produces the noise/velocity prediction.
+        x_base = self.dit.head(x_base, t_base)
+        out = self.dit.unpatchify(x_base, (f_base, h_base, w_base))
+
+        if return_dict:
+            return {"pred": out}
+        return out
+
+    # --------------------------------------------------------
+    # Inference
+    # --------------------------------------------------------
+
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: Optional[Union[str, List[str]]] = None,
+        prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
+        ref_latents: Optional[torch.Tensor] = None,
+        src_video: Optional[torch.Tensor] = None,
+        src_latents: Optional[torch.Tensor] = None,
+        src_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[Union[str, List[str]]] = "",
+        negative_prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        cfg_scale: float = 1.0,
+        latents: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        sigma_shift: float = 5.0,
+        denoising_strength: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Full inference loop. Returns decoded video tensor [B, 3, F, H, W] in [-1, 1].
+
+        Required (one from each pair):
+            - prompt OR prompt_embeds
+            - reference_image OR ref_latents
+            - (src_video AND src_mask)   OR  (src_latents AND src_mask)
+              (src_mask is ALWAYS required; without it the mask-aware bias
+              cannot be computed.)
+
+        Batch-size resolution priority:
+            1. src_video.shape[0] / src_latents.shape[0] if provided
+            2. else inferred from prompt / ref shapes (must agree).
+
+        CFG (classifier-free guidance) - TODO scaffolding:
+            Currently implements text-only CFG. cfg_scale > 1.0 triggers two
+            forward passes: cond (full prompt) and uncond (negative prompt or "").
+            src + ref + mask are ALWAYS provided to both branches (the task
+            inherently requires them; the user always uploads ref + masked video).
+
+            TODO: reference_guidance_scale / image-CFG variants. See frame.txt
+            for the design intent: when a user runs inference, the masked source
+            video and the reference image must be provided. The text prompt is
+            optional, which is what text-CFG covers.
+
+        TODO: KV-cache for src/ref branches (cfg.source.kv_cache /
+              cfg.reference.kv_cache) is NOT implemented yet; ref/src tokens
+              are re-computed every step. forward() interface is stable to add
+              caching later.
+        """
+        # ---- 0. Resolve scalar defaults ----
+        height = height or self.cfg.target.height
+        width = width or self.cfg.target.width
+        num_frames = num_frames or self.cfg.target.num_frames
+        num_inference_steps = num_inference_steps or self.cfg.inference.num_inference_steps
+
+        validate_video_size(
+            height=height, width=width, num_frames=num_frames,
+            hw_multiple=self.cfg.target.hw_multiple,
+            temporal_stride=self.cfg.wan.vae_temporal_stride,
+        )
+
+        # ---- 1. src branch (latents) ----
+        if src_latents is None and src_video is None:
+            raise ValueError("Either src_video or src_latents must be provided.")
+        if src_mask is None:
+            raise ValueError(
+                "src_mask is required for FACET inference (mask-aware bias)."
+            )
+
+        if src_latents is not None:
+            if src_video is not None:
+                logger.info(
+                    "[FACET] Both src_video and src_latents given; using src_latents."
+                )
+            if src_latents.ndim == 4:
+                src_latents = src_latents.unsqueeze(0)
+            src_latents = src_latents.to(device=self.device, dtype=self.dtype)
+        else:
+            if src_video.ndim == 4:
+                src_video = src_video.unsqueeze(0)
+            src_latents = self.encode_src_video(src_video)
+
+        # Normalize src_mask shape now (for batch broadcast below).
+        if src_mask.ndim == 4:
+            src_mask = src_mask.unsqueeze(0)
+        if src_mask.ndim != 5:
+            raise ValueError(
+                f"src_mask should be [B, 1, F, H, W] or [1, F, H, W], "
+                f"got shape {tuple(src_mask.shape)}"
+            )
+
+        batch_size = src_latents.shape[0]
+
+        def _broadcast_list(lst, name):
+            if len(lst) == batch_size:
+                return lst
+            if len(lst) == 1:
+                return lst * batch_size
+            raise ValueError(
+                f"{name} batch size {len(lst)} cannot be broadcast to {batch_size}."
+            )
+
+        def _broadcast_tensor(t, name):
+            if t.shape[0] == batch_size:
+                return t
+            if t.shape[0] == 1:
+                rep = [batch_size] + [1] * (t.ndim - 1)
+                return t.repeat(*rep)
+            raise ValueError(
+                f"{name} batch size {t.shape[0]} cannot be broadcast to {batch_size}."
+            )
+
+        src_mask = _broadcast_tensor(src_mask, "src_mask")
+
+        # ---- 2. Prompt embeddings (cond + optional uncond for text CFG) ----
+        cond_context = self.encode_prompt(prompt=prompt, prompt_embeds=prompt_embeds)
+        cond_context = _broadcast_list(cond_context, "prompt")
+
+        do_cfg = cfg_scale > 1.0
+        if do_cfg:
+            if negative_prompt is None and negative_prompt_embeds is None:
+                negative_prompt = ""
+            uncond_context = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+            )
+            uncond_context = _broadcast_list(uncond_context, "negative_prompt")
+        else:
+            uncond_context = None
+
+        # ---- 3. Reference latents ----
+        if ref_latents is None and reference_image is None:
+            raise ValueError(
+                "Either reference_image or ref_latents must be provided."
+            )
+        if ref_latents is not None:
+            if reference_image is not None:
+                logger.info(
+                    "[FACET] Both reference_image and ref_latents given; "
+                    "using ref_latents."
+                )
+            if ref_latents.ndim == 4:
+                ref_latents = ref_latents.unsqueeze(0)
+        else:
+            ref_latents = self.encode_reference_image(reference_image)
+        ref_latents = _broadcast_tensor(ref_latents, "ref_latents")
+
+        # ---- 4. Initial noisy latents ----
+        if latents is None:
+            cur_latents = self.prepare_latents(
+                batch_size=batch_size,
+                height=height, width=width, num_frames=num_frames,
+                generator=generator,
+            )
+        else:
+            cur_latents = latents.unsqueeze(0) if latents.ndim == 4 else latents
+            cur_latents = _broadcast_tensor(cur_latents, "latents")
+            cur_latents = cur_latents.to(device=self.device, dtype=self.dtype)
+
+        # ---- 5. Scheduler timesteps ----
+        timesteps = self._prepare_inference_timesteps(
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            denoising_strength=denoising_strength,
+        )
+
+        # ---- 6. Denoising loop ----
+        for t in timesteps:
+            # fp32 timestep avoids bf16 quantization (e.g. 999 -> 998) inside
+            # sinusoidal_embedding_1d / time_embedding.
+            t_batch = torch.full(
+                (batch_size,), float(t),
+                device=self.device, dtype=torch.float32,
+            )
+
+            pred_cond = self.forward(
+                noisy_latents=cur_latents,
+                timesteps=t_batch,
+                prompt_embeds=cond_context,
+                ref_latents=ref_latents,
+                src_latents=src_latents,
+                src_mask=src_mask,
+                return_dict=True,
+            )["pred"]
+
+            if do_cfg:
+                pred_uncond = self.forward(
+                    noisy_latents=cur_latents,
+                    timesteps=t_batch,
+                    prompt_embeds=uncond_context,
+                    ref_latents=ref_latents,
+                    src_latents=src_latents,
+                    src_mask=src_mask,
+                    return_dict=True,
+                )["pred"]
+                pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
+            else:
+                pred = pred_cond
+
+            cur_latents = self._scheduler_step(
+                pred=pred, timestep=t, latents=cur_latents,
+            )
+
+        # ---- 7. Decode final latents ----
+        return self.decode_latents(cur_latents)
+
+    
     # --------------------------------------------------------
     # Encoding helpers
     # --------------------------------------------------------
@@ -964,361 +1318,11 @@ class FACETWanModel(nn.Module):
             return self.cfg.target.width // self.cfg.wan.token_spatial_stride
         return int(w_off)
 
-    # --------------------------------------------------------
-    # Training forward
-    # --------------------------------------------------------
-
-    def forward(
-        self,
-        noisy_latents: torch.Tensor,
-        timesteps: torch.Tensor,
-        prompt_embeds: List[torch.Tensor],
-        ref_latents: torch.Tensor,
-        src_latents: torch.Tensor,
-        src_mask: torch.Tensor,
-        return_dict: bool = True,
-    ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
-        """
-        One denoising step (shared by training & generation).
-
-        Args:
-            noisy_latents:  [B, 16, F_lat, h, w]                       (REQUIRED)
-            timesteps:      [B]  fp32                                  (REQUIRED)
-            prompt_embeds:  List length B, each [L_i, 4096]            (REQUIRED)
-            ref_latents:    [B, 16, 1, h_ref, w_ref]                   (REQUIRED)
-            src_latents:    [B, 16, F_lat, h, w]                       (REQUIRED)
-            src_mask:       [B, 1, F, H, W] in [0, 1]                  (REQUIRED)
-            return_dict:    if True returns {"pred": ...}, else returns tensor
-
-        Returns:
-            pred: [B, 16, F_lat, h, w]  velocity-target prediction.
-        """
-        # ---- 0. Move/cast inputs to model device & dtype ----
-        noisy_latents = noisy_latents.to(device=self.device, dtype=self.dtype)
-        ref_latents = ref_latents.to(device=self.device, dtype=self.dtype)
-        src_latents = src_latents.to(device=self.device, dtype=self.dtype)
-
-        B = noisy_latents.shape[0]
-
-        # ---- 1. Patchify base branch ----
-        # patch_embedding: Conv3d (k=s=(1,2,2)): [B, 16, F_lat, H/16, W/16]
-        #   -> [B, dim, F_lat, H/32, W/32]
-        x_base = self.dit.patch_embedding(noisy_latents)
-        f_base, h_base, w_base = x_base.shape[2:]
-        x_base = x_base.flatten(2).transpose(1, 2)
-        # x_base: [B, L_base, dim]    L_base = f_base * h_base * w_base
-
-        # ---- 2. Patchify src branch (shares dit.patch_embedding) ----
-        x_src = self.dit.patch_embedding(src_latents)
-        f_src, h_src, w_src = x_src.shape[2:]
-        x_src = x_src.flatten(2).transpose(1, 2)
-        # x_src: [B, L_src, dim]; spatially aligned with base so L_src == L_base.
-
-        # ---- 3. Patchify ref branch (shares dit.patch_embedding) ----
-        x_ref = self.dit.patch_embedding(ref_latents)
-        f_ref, h_ref, w_ref = x_ref.shape[2:]
-        x_ref = x_ref.flatten(2).transpose(1, 2)
-        # x_ref: [B, L_ref, dim];  L_ref = 1 * h_ref * w_ref
-
-        # ---- 4. Time features ----
-        # base uses the actual diffusion timestep; src and ref share t=0.
-        t_base, t_mod_base = self.compute_time_features(timesteps)
-        clean_t = torch.full_like(
-            timesteps, fill_value=float(self.cfg.source.timestep),
-        )
-        _, t_mod_cond = self.compute_time_features(clean_t)
-
-        # ---- 5. Text context (pad + dit.text_embedding -> [B, 512, dim]) ----
-        context = self._prepare_text_context(prompt_embeds)
-
-        # ---- 6. RoPE freqs per attention pathway ----
-        # See module-level docstring of facet_block_forward for the three RoPE roles.
-        freqs_base = self.build_freqs(
-            f_base, h_base, w_base,
-            f_offset=self.cfg.source.f_offset,   # 0 by default; src shares
-            h_offset=0, w_offset=0,
-            f_disabled=False,
-            device=x_base.device,
-        )
-        freqs_base_no_f = self.build_freqs(
-            f_base, h_base, w_base,
-            f_offset=0, h_offset=0, w_offset=0,
-            f_disabled=True,
-            device=x_base.device,
-        )
-        freqs_ref_no_f = self.build_freqs(
-            f_ref, h_ref, w_ref,
-            f_offset=0,
-            h_offset=int(self.cfg.reference.h_offset),
-            w_offset=self._resolve_ref_w_offset(), # 直接用config中的值 不需要这个_resolve_ref_w_offset函数了
-            f_disabled=True,
-            device=x_base.device,
-        )
-
-        # ---- 7. Mask coverage (Q_base routing prior) ----
-        # [B, L_base], same flatten order as patch_embedding output.
-        mask_coverage = self.compute_mask_coverage(
-            src_mask,
-            f_lat=f_base, h_tok=h_base, w_tok=w_base,
-        )
-
-        gamma = float(self.cfg.source.gamma)
-        safe_epsilon = float(self.cfg.source.safe_epsilon)
-        attention_mode = self.cfg.source.attention_mode
-
-        # ---- 8. Iterate DiT blocks with custom branch attention ----
-        gc_enabled = bool(self.cfg.gradient_checkpointing) and self.training
-
-        for block in self.dit.blocks:
-            if gc_enabled:
-                x_base, x_src, x_ref = torch.utils.checkpoint.checkpoint(
-                    facet_block_forward,
-                    block, x_base, x_src, x_ref,
-                    t_mod_base, t_mod_cond, context,
-                    freqs_base, freqs_base_no_f, freqs_ref_no_f,
-                    mask_coverage,
-                    gamma=gamma,
-                    safe_epsilon=safe_epsilon,
-                    attention_mode=attention_mode,
-                    use_reentrant=False,
-                )
-            else:
-                x_base, x_src, x_ref = facet_block_forward(
-                    block, x_base, x_src, x_ref,
-                    t_mod_base, t_mod_cond, context,
-                    freqs_base, freqs_base_no_f, freqs_ref_no_f,
-                    mask_coverage,
-                    gamma=gamma,
-                    safe_epsilon=safe_epsilon,
-                    attention_mode=attention_mode,
-                )
-
-        # ---- 9. Head (base branch only) + unpatchify ----
-        # OminiControl convention: src and ref are 'register' branches; only
-        # base produces the noise/velocity prediction.
-        x_base = self.dit.head(x_base, t_base)
-        out = self.dit.unpatchify(x_base, (f_base, h_base, w_base))
-
-        if return_dict:
-            return {"pred": out}
-        return out
-
-    # --------------------------------------------------------
-    # Inference
-    # --------------------------------------------------------
-
-    @torch.no_grad()
-    def generate(
-        self,
-        prompt: Optional[Union[str, List[str]]] = None,
-        prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        reference_image: Optional[Union[Image.Image, List[Image.Image], torch.Tensor]] = None,
-        ref_latents: Optional[torch.Tensor] = None,
-        src_video: Optional[torch.Tensor] = None,
-        src_latents: Optional[torch.Tensor] = None,
-        src_mask: Optional[torch.Tensor] = None,
-        negative_prompt: Optional[Union[str, List[str]]] = "",
-        negative_prompt_embeds: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_frames: Optional[int] = None,
-        num_inference_steps: Optional[int] = None,
-        cfg_scale: float = 1.0,
-        latents: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
-        sigma_shift: float = 5.0,
-        denoising_strength: float = 1.0,
-    ) -> torch.Tensor:
-        """
-        Full inference loop. Returns decoded video tensor [B, 3, F, H, W] in [-1, 1].
-
-        Required (one from each pair):
-            - prompt OR prompt_embeds
-            - reference_image OR ref_latents
-            - (src_video AND src_mask)   OR  (src_latents AND src_mask)
-              (src_mask is ALWAYS required; without it the mask-aware bias
-              cannot be computed.)
-
-        Batch-size resolution priority:
-            1. src_video.shape[0] / src_latents.shape[0] if provided
-            2. else inferred from prompt / ref shapes (must agree).
-
-        CFG (classifier-free guidance) - TODO scaffolding:
-            Currently implements text-only CFG. cfg_scale > 1.0 triggers two
-            forward passes: cond (full prompt) and uncond (negative prompt or "").
-            src + ref + mask are ALWAYS provided to both branches (the task
-            inherently requires them; the user always uploads ref + masked video).
-
-            TODO: reference_guidance_scale / image-CFG variants. See frame.txt
-            for the design intent: when a user runs inference, the masked source
-            video and the reference image must be provided. The text prompt is
-            optional, which is what text-CFG covers.
-
-        TODO: KV-cache for src/ref branches (cfg.source.kv_cache /
-              cfg.reference.kv_cache) is NOT implemented yet; ref/src tokens
-              are re-computed every step. forward() interface is stable to add
-              caching later.
-        """
-        # ---- 0. Resolve scalar defaults ----
-        height = height or self.cfg.target.height
-        width = width or self.cfg.target.width
-        num_frames = num_frames or self.cfg.target.num_frames
-        num_inference_steps = num_inference_steps or self.cfg.inference.num_inference_steps
-
-        validate_video_size(
-            height=height, width=width, num_frames=num_frames,
-            hw_multiple=self.cfg.target.hw_multiple,
-            temporal_stride=self.cfg.wan.vae_temporal_stride,
-        )
-
-        # ---- 1. src branch (latents) ----
-        if src_latents is None and src_video is None:
-            raise ValueError("Either src_video or src_latents must be provided.")
-        if src_mask is None:
-            raise ValueError(
-                "src_mask is required for FACET inference (mask-aware bias)."
-            )
-
-        if src_latents is not None:
-            if src_video is not None:
-                logger.info(
-                    "[FACET] Both src_video and src_latents given; using src_latents."
-                )
-            if src_latents.ndim == 4:
-                src_latents = src_latents.unsqueeze(0)
-            src_latents = src_latents.to(device=self.device, dtype=self.dtype)
-        else:
-            if src_video.ndim == 4:
-                src_video = src_video.unsqueeze(0)
-            src_latents = self.encode_src_video(src_video)
-
-        # Normalize src_mask shape now (for batch broadcast below).
-        if src_mask.ndim == 4:
-            src_mask = src_mask.unsqueeze(0)
-        if src_mask.ndim != 5:
-            raise ValueError(
-                f"src_mask should be [B, 1, F, H, W] or [1, F, H, W], "
-                f"got shape {tuple(src_mask.shape)}"
-            )
-
-        batch_size = src_latents.shape[0]
-
-        def _broadcast_list(lst, name):
-            if len(lst) == batch_size:
-                return lst
-            if len(lst) == 1:
-                return lst * batch_size
-            raise ValueError(
-                f"{name} batch size {len(lst)} cannot be broadcast to {batch_size}."
-            )
-
-        def _broadcast_tensor(t, name):
-            if t.shape[0] == batch_size:
-                return t
-            if t.shape[0] == 1:
-                rep = [batch_size] + [1] * (t.ndim - 1)
-                return t.repeat(*rep)
-            raise ValueError(
-                f"{name} batch size {t.shape[0]} cannot be broadcast to {batch_size}."
-            )
-
-        src_mask = _broadcast_tensor(src_mask, "src_mask")
-
-        # ---- 2. Prompt embeddings (cond + optional uncond for text CFG) ----
-        cond_context = self.encode_prompt(prompt=prompt, prompt_embeds=prompt_embeds)
-        cond_context = _broadcast_list(cond_context, "prompt")
-
-        do_cfg = cfg_scale > 1.0
-        if do_cfg:
-            if negative_prompt is None and negative_prompt_embeds is None:
-                negative_prompt = ""
-            uncond_context = self.encode_prompt(
-                prompt=negative_prompt,
-                prompt_embeds=negative_prompt_embeds,
-            )
-            uncond_context = _broadcast_list(uncond_context, "negative_prompt")
-        else:
-            uncond_context = None
-
-        # ---- 3. Reference latents ----
-        if ref_latents is None and reference_image is None:
-            raise ValueError(
-                "Either reference_image or ref_latents must be provided."
-            )
-        if ref_latents is not None:
-            if reference_image is not None:
-                logger.info(
-                    "[FACET] Both reference_image and ref_latents given; "
-                    "using ref_latents."
-                )
-            if ref_latents.ndim == 4:
-                ref_latents = ref_latents.unsqueeze(0)
-        else:
-            ref_latents = self.encode_reference_image(reference_image)
-        ref_latents = _broadcast_tensor(ref_latents, "ref_latents")
-
-        # ---- 4. Initial noisy latents ----
-        if latents is None:
-            cur_latents = self.prepare_latents(
-                batch_size=batch_size,
-                height=height, width=width, num_frames=num_frames,
-                generator=generator,
-            )
-        else:
-            cur_latents = latents.unsqueeze(0) if latents.ndim == 4 else latents
-            cur_latents = _broadcast_tensor(cur_latents, "latents")
-            cur_latents = cur_latents.to(device=self.device, dtype=self.dtype)
-
-        # ---- 5. Scheduler timesteps ----
-        timesteps = self._prepare_inference_timesteps(
-            num_inference_steps=num_inference_steps,
-            sigma_shift=sigma_shift,
-            denoising_strength=denoising_strength,
-        )
-
-        # ---- 6. Denoising loop ----
-        for t in timesteps:
-            # fp32 timestep avoids bf16 quantization (e.g. 999 -> 998) inside
-            # sinusoidal_embedding_1d / time_embedding.
-            t_batch = torch.full(
-                (batch_size,), float(t),
-                device=self.device, dtype=torch.float32,
-            )
-
-            pred_cond = self.forward(
-                noisy_latents=cur_latents,
-                timesteps=t_batch,
-                prompt_embeds=cond_context,
-                ref_latents=ref_latents,
-                src_latents=src_latents,
-                src_mask=src_mask,
-                return_dict=True,
-            )["pred"]
-
-            if do_cfg:
-                pred_uncond = self.forward(
-                    noisy_latents=cur_latents,
-                    timesteps=t_batch,
-                    prompt_embeds=uncond_context,
-                    ref_latents=ref_latents,
-                    src_latents=src_latents,
-                    src_mask=src_mask,
-                    return_dict=True,
-                )["pred"]
-                pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
-            else:
-                pred = pred_cond
-
-            cur_latents = self._scheduler_step(
-                pred=pred, timestep=t, latents=cur_latents,
-            )
-
-        # ---- 7. Decode final latents ----
-        return self.decode_latents(cur_latents)
 
     # --------------------------------------------------------
     # Scheduler helpers
     # --------------------------------------------------------
+
 
     def _prepare_inference_timesteps(
         self,

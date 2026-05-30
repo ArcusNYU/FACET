@@ -201,7 +201,7 @@ class FACETReferenceConfig:
     """
     image_size: int = 480
     h_offset: int = 0                       # no h-axis shift; matches OminiControl design
-    w_offset: Optional[int] = None          # None -> auto = target.width // token_spatial_stride (26 for 480x832@stride32)
+    w_offset: int = 26                      # None -> auto = target.width // token_spatial_stride (26 for 480x832@stride32)
     detach_latent: bool = True
     timestep: float = 0.0                   # clean signal for ref branch
     injection_mode: str = "branch_attention"
