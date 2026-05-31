@@ -58,7 +58,7 @@ prepare:
     pants:         72
     dress:         96
     hat:           32
-    hair:          50     # !!!?
+    hair:          150     # !!!?
     person:        120
   # cv_mask_ratio: [low, high] for (mask_pixels / bbox_area).
   cv_mask_ratio:
@@ -67,7 +67,7 @@ prepare:
     pants:         [0.20, 0.85]
     dress:         [0.25, 0.90]
     hat:           [0.15, 0.80]
-    hair:          [0.15, 0.80]  # !!!? 需要尽可能调小 甚至于0.6~0.7
+    hair:          [0.20, 0.65]  # !!!? 需要尽可能调小 甚至于0.6~0.7
     person:        [0.30, 0.90]
   # 2) quality evaluation model (pyiqa + MANIQA):
   iqa_metric: maniqa

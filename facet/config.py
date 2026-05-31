@@ -6,82 +6,7 @@ import yaml
 
 
 # ============================================================
-# Top-level model config
-# ============================================================
-
-
-@dataclass
-class FACETConfig:
-    """
-    Aggregates every sub-config under `model:` in facet/config.yaml.
-
-    Construct via `FACETConfig.from_yaml(path)`.
-    """
-
-    name: str = "FACET-WAN2.2"
-    dtype: str = "bf16"
-    device: str = "cuda"
-    gradient_checkpointing: bool = True
-
-    base: FACETBaseConfig = field(default_factory=FACETBaseConfig)
-    wan: FACETWanConfig = field(default_factory=FACETWanConfig)
-    target: FACETTargetConfig = field(default_factory=FACETTargetConfig)
-    source: FACETSourceConfig = field(default_factory=FACETSourceConfig)
-    reference: FACETReferenceConfig = field(default_factory=FACETReferenceConfig)
-    lora: FACETLoRAConfig = field(default_factory=FACETLoRAConfig)
-    text: FACETTextConfig = field(default_factory=FACETTextConfig)
-    inference: FACETInferenceConfig = field(default_factory=FACETInferenceConfig)
-    training: FACETTrainingConfig = field(default_factory=FACETTrainingConfig)
-
-    _SUB_CONFIGS = {
-        "base": ("base", FACETBaseConfig),
-        "wan": ("wan", FACETWanConfig),
-        "target": ("target", FACETTargetConfig),
-        "source": ("source", FACETSourceConfig),
-        "reference": ("reference", FACETReferenceConfig),
-        "lora": ("lora", FACETLoRAConfig),
-        "text": ("text", FACETTextConfig),
-        "inference": ("inference", FACETInferenceConfig),
-        "training": ("training", FACETTrainingConfig),
-    }
-    _FLAT_FIELDS = {"name", "dtype", "device", "gradient_checkpointing"}
-
-    @staticmethod
-    def from_yaml(path: str) -> "FACETConfig":
-        with open(path, "r", encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
-
-        model_block = raw.get("model", {}) or {}
-        cfg = FACETConfig()
-
-        for k, v in model_block.items():
-            if k in FACETConfig._FLAT_FIELDS:
-                setattr(cfg, k, v)
-                continue
-
-            if k in FACETConfig._SUB_CONFIGS:
-                attr_name, _ = FACETConfig._SUB_CONFIGS[k]
-                sub = getattr(cfg, attr_name)
-                for sk, sv in (v or {}).items():
-                    if not hasattr(sub, sk):
-                        logger.warning(
-                            "Unknown key model.%s.%s in yaml, ignored.", k, sk
-                        )  #FIXME: logger.warning改成print
-                        continue
-                    if sk == "patch_size" and isinstance(sv, list):
-                        sv = tuple(sv)
-                    if sk == "target_modules" and isinstance(sv, list):
-                        sv = tuple(sv)
-                    setattr(sub, sk, sv)
-                continue
-
-            logger.warning("Unknown top-level key model.%s in yaml, ignored.", k) #FIXME: 同样改成print
-
-        return cfg
-
-
-# ============================================================
-# Config (loaded by FACETConfig.from_yaml)
+# Config
 # ============================================================
 
 
@@ -240,5 +165,78 @@ class FACETTrainingConfig:
     loss_type: str = "mse"
     ref_dropout_prob: float = 0.05
     text_dropout_prob: float = 0.10
+
+
+# ============================================================
+# Top-level model config
+# ============================================================
+
+
+@dataclass
+class FACETConfig:
+    """
+    Aggregates every sub-config under `model:` in facet/config.yaml.
+
+    Construct via `FACETConfig.from_yaml(path)`.
+    """
+
+    name: str = "FACET-WAN2.2"
+    dtype: str = "bf16"
+    device: str = "cuda"
+    gradient_checkpointing: bool = True
+
+    base: FACETBaseConfig = field(default_factory=FACETBaseConfig)
+    wan: FACETWanConfig = field(default_factory=FACETWanConfig)
+    target: FACETTargetConfig = field(default_factory=FACETTargetConfig)
+    source: FACETSourceConfig = field(default_factory=FACETSourceConfig)
+    reference: FACETReferenceConfig = field(default_factory=FACETReferenceConfig)
+    lora: FACETLoRAConfig = field(default_factory=FACETLoRAConfig)
+    text: FACETTextConfig = field(default_factory=FACETTextConfig)
+    inference: FACETInferenceConfig = field(default_factory=FACETInferenceConfig)
+    training: FACETTrainingConfig = field(default_factory=FACETTrainingConfig)
+
+    _SUB_CONFIGS = {
+        "base": ("base", FACETBaseConfig),
+        "wan": ("wan", FACETWanConfig),
+        "target": ("target", FACETTargetConfig),
+        "source": ("source", FACETSourceConfig),
+        "reference": ("reference", FACETReferenceConfig),
+        "lora": ("lora", FACETLoRAConfig),
+        "text": ("text", FACETTextConfig),
+        "inference": ("inference", FACETInferenceConfig),
+        "training": ("training", FACETTrainingConfig),
+    }
+    _FLAT_FIELDS = {"name", "dtype", "device", "gradient_checkpointing"}
+
+    @staticmethod
+    def from_yaml(path: str) -> "FACETConfig":
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+
+        model_block = raw.get("model", {}) or {}
+        cfg = FACETConfig()
+
+        for k, v in model_block.items():
+            if k in FACETConfig._FLAT_FIELDS:
+                setattr(cfg, k, v)
+                continue
+
+            if k in FACETConfig._SUB_CONFIGS:
+                attr_name, _ = FACETConfig._SUB_CONFIGS[k]
+                sub = getattr(cfg, attr_name)
+                for sk, sv in (v or {}).items():
+                    if not hasattr(sub, sk):
+                        print(f"[FACETConfig] Unknown key model.{k}.{sk} in yaml, ignored.")
+                        continue
+                    if sk == "patch_size" and isinstance(sv, list):
+                        sv = tuple(sv)
+                    if sk == "target_modules" and isinstance(sv, list):
+                        sv = tuple(sv)
+                    setattr(sub, sk, sv)
+                continue
+
+            print(f"[FACETConfig] Unknown top-level key model.{k} in yaml, ignored.")
+
+        return cfg
 
 

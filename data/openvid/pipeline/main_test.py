@@ -54,7 +54,7 @@ from data.openvid.pipeline.main import (
     build_ref_rgba,
     resolve_raw_mp4,
     part_of_csv_path,
-    _expand_csv_glob,
+    _resolve_single_csv,
 )
 
 
@@ -308,7 +308,10 @@ def prepare_clip_test(
 # ============================================================
 def main():
     p = argparse.ArgumentParser("OpenVid pipeline smoke test (verbose)")
-    p.add_argument("--config", default="data/openvid/config.yaml")
+    p.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
+    p.add_argument("--part", type=int, required=True,
+                   help="which OpenHumanVid part csv to inspect (e.g. 1, 2). "
+                        "Substituted into cfg.prepare.csv_glob's '*', mirrors main.py.")
     p.add_argument("--limit", type=int, default=10,
                    help="cap on total clips to inspect")
     p.add_argument("--device", default="cuda")
@@ -321,16 +324,13 @@ def main():
     out_root = Path(cfg.out_root)
     weight_dir = Path(cfg.weight_dir)
 
-    csv_pattern_name = Path(cfg.csv_glob).name
-    if csv_pattern_name.endswith(".csv"):
-        single_name = csv_pattern_name[:-4] + ".single.csv"
-    else:
-        single_name = csv_pattern_name + ".single.csv"
-    single_pattern = str(out_root / single_name)
-    csv_paths = _expand_csv_glob(single_pattern)
-    if not csv_paths:
-        print(f"[test] no .single.csv found for pattern {single_pattern}", file=sys.stderr)
+    # Resolve the single .single.csv for this part (same logic as main.py).
+    csv_path = _resolve_single_csv(cfg.csv_glob, out_root, args.part)
+    if not csv_path.exists():
+        print(f"[test] .single.csv not found: {csv_path}; run filters.py first.",
+              file=sys.stderr)
         sys.exit(1)
+    print(f"[test] part={args.part} csv={csv_path}")
 
     schp_path = str(weight_dir / cfg.schp_model)
     iqa_path = str(weight_dir / cfg.iqa_model)
@@ -350,35 +350,28 @@ def main():
     vlm = VlmFilter(model_dir=vlm_path, prompt_file=cfg.vlm_prompt)
 
     counters: Dict[str, int] = {}
-    seen = 0
-    for csv_path in csv_paths:
-        df = pd.read_csv(csv_path, low_memory=False)
-        df = df[df["single"].astype(str).str.lower() == "true"]
-        if 0 <= args.limit <= seen:
-            break
-        if args.limit > 0:
-            df = df.head(args.limit - seen)
+    df = pd.read_csv(csv_path, low_memory=False)
+    df = df[df["single"].astype(str).str.lower() == "true"]
+    if args.limit > 0:
+        df = df.head(args.limit)
 
-        for _, row in df.iterrows():
-            try:
-                res = prepare_clip_test(row, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
-            except Exception as e:
-                res = {"_status": "error", "clip_id": str(row.get("clip_id", "")),
-                       "error": f"{type(e).__name__}: {e}",
-                       "trace": traceback.format_exc(limit=4)}
-                print(f"[error] {res['error']}\n{res['trace']}", flush=True)
-                # OOM / cuda errors leave fragmented memory; release before next clip.
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            counters[res["_status"]] = counters.get(res["_status"], 0) + 1
-            seen += 1
-            if 0 <= args.limit <= seen:
-                break
+    for _, row in df.iterrows():
+        try:
+            res = prepare_clip_test(row, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
+        except Exception as e:
+            res = {"_status": "error", "clip_id": str(row.get("clip_id", "")),
+                   "error": f"{type(e).__name__}: {e}",
+                   "trace": traceback.format_exc(limit=4)}
+            print(f"[error] {res['error']}\n{res['trace']}", flush=True)
+            # OOM / cuda errors leave fragmented memory; release before next clip.
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        counters[res["_status"]] = counters.get(res["_status"], 0) + 1
 
     if _HAS_DISPLAY:
         cv2.destroyAllWindows()
-    print(f"\n[test] done. counters: {counters}")
+    print(f"\n[test] done. part={args.part} counters: {counters}")
 
 
 if __name__ == "__main__":

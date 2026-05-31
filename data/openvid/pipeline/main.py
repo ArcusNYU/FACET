@@ -297,6 +297,7 @@ def _pick_refs(
     vlm: VlmFilter,
     max_tries: int,
 ) -> List[Dict[str, Any]]:
+    # FIXME: 对于有帽子的视频 直接reject???
     """Random-sample from candidate_idx until we accept k_keep refs or exhaust max_tries
     using the L1 (cv_check) -> L2 (IQA) -> L3 (VLM) cascade.
 
@@ -351,6 +352,7 @@ def _pick_refs(
         # L3 VLM judge
         # NOTE: truncation 字段仍由 VLM 返回, 但当前不参与拒绝, 只看 match & occlusion.
         # 经验上 当前openhumanvid数据集的特性, 许多镜头为人物上半身, 使得VLM判断truncation为true, 导致 no_ref 过多.
+        # FIXME: 将 truncation的判断在category=hair的时候加回来 
         try:
             v = vlm.judge(rgb_only, category=cat)
         except Exception:

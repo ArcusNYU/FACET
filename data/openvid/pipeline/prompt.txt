@@ -6,7 +6,7 @@ Your task is to judge the image using exactly three boolean fields:
 
 1. match:
    Whether the main visible content in the image matches the target category.
-   For example, if category is "upper_clothes", the image should clearly contain upper-body clothing such as shirt, T-shirt, jacket, coat, sweater, hoodie, blouse, or top.
+   For example, if category is "hair", the image should clearly contain hair of the main character.
 
 2. occlusion:
    Whether the target category is severely occluded.
