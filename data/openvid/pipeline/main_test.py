@@ -23,7 +23,7 @@ imported from main.py to avoid drift.
 from __future__ import annotations
 import argparse
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3") 
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0") 
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
 import warnings
 warnings.filterwarnings(

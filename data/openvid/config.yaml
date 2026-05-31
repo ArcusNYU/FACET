@@ -36,7 +36,7 @@ prepare:
   # ==== a. Parsing ====
   schp_model: SCHP/schp.pth
   schp_batch: 32                 # frames per SCHP forward; A100 80GB can take 81 if memory permits
-  lip_label_ids: [2]          # Upper-clothes(5), Coat(7); merged into single mask
+  lip_label_ids: [2]             # hair(category number - 2)
   temporal_smooth_k: 3           # mask temporal median filter window
 
   # ==== b. Caption ====
@@ -49,23 +49,25 @@ prepare:
   ref_max_tries: 15              # cap rejection sampling tries (L1+L2+L3 per try)
   ref_pad_ratio: 0.20            # bbox outer padding ratio; square pad then resize
   # 1) computer vision Metrics:
-  # Calibrated at target resolution (cfg.height x cfg.width = 480 x 832).
-  # When SCHP runs on raw video, main.py scales these thresholds by
-  # the raw->target fit_pad factor so the "min bbox in target space" semantic
-  # stays consistent across portrait / landscape / mixed sources.
+  # cv_min_size: minimum bbox short-edge in TARGET resolution (480x832).
+  # main.py rescales when SCHP runs on raw frames, so the semantic stays "min
+  # bbox in target space" regardless of source aspect / resolution.
   cv_min_size:
     face:          48
     upper_clothes: 100
     pants:         72
     dress:         96
     hat:           32
+    hair:          50     # !!!?
     person:        120
+  # cv_mask_ratio: [low, high] for (mask_pixels / bbox_area).
   cv_mask_ratio:
     face:          [0.30, 0.90]
     upper_clothes: [0.35, 0.85]
     pants:         [0.20, 0.85]
     dress:         [0.25, 0.90]
     hat:           [0.15, 0.80]
+    hair:          [0.15, 0.80]  # !!!? 需要尽可能调小 甚至于0.6~0.7
     person:        [0.30, 0.90]
   # 2) quality evaluation model (pyiqa + MANIQA):
   iqa_metric: maniqa

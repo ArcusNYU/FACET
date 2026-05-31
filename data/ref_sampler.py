@@ -1,66 +1,72 @@
 """
 Ref image sampling with on-the-fly background augmentation in dataloader __getitem__ function.
 
-ref_pool: prepare.py already stored N 480x480 RGBA png, each is tight bbox + 20% pad + square pad.
+ref_pool: main.py already stored N 480x480 RGBA png, each is tight bbox + 20% pad + square pad.
           foreground bbox alpha=255, padding region alpha=0.
-pick():   randomly sample 1 image from ref_pool, then fill the padding region with
-          either a contrast-aware solid grayscale or a low-frequency distract texture.
-          purpose: make the model robust to different backgrounds at inference time
-                   while AVOIDING two failure modes:
-                   (a) keeping the original surrounding background -> shortcut bias
-                       (here ref is sampled from the same clip's later frames, so the
-                        surrounding context overlaps with tgt video context)
-                   (b) filling a fixed-palette solid that happens to match the garment
-                       (e.g. black pad on a black hoodie -> indistinct boundary).
+pick():   randomly sample 1 image from the pool, then fill the alpha=0 padding
+          region with one of:
+            (1) a fixed gray=127 solid       (p_solid branch)
+            (2) a contrast-aware random gray (p_random branch)
+            (3) a low-frequency RGB noise    (p_distract branch -- DISABLED)
 
-Why RGBA (not jpg):
-    the foreground garment may happen to be pure black/white/gray,
-    so alpha-channel based bg detection is strictly safer than color-threshold guessing.
+Why bg augmentation at all:
+   ref crops come from the same clip's later frames, so the *natural*
+   surrounding pixels overlap with target-video context. Keeping them would
+   leak that context into the model as a shortcut. We fill the padding with a
+   neutral / contrast-aware color instead.
 """
 # NOTE: prepare.py reference image bbox crop pad ratio currently 20%.
 
 from __future__ import annotations
 import random
-from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 from PIL import Image
 
 
+# 127 is mid-gray in uint8 -- the same neutral colour used to fill the masked
+# region of src_video, so the network treats "padded-out background" identically
+# whether it appears in the ref crop or in the masked source frames.
+GRAY_127 = 127
 
-# FIXME: 把物体的背景颜色更改为不太接近物体的颜色任意之一 而不是现在的最远灰度 同样避免产生归纳偏置
+
 class RefSampler:
     """
-    Pick one reference image from the pool and implement random augmentation on the padding region.
-    Two probability branches:
-        p < p_solid                  -> contrast-aware random grayscale in padding region
-        p_solid <= p < 1             -> low-frequency distract texture in padding region
+    Pick one reference image from the pool and fill its alpha=0 padding.
+
+    Three probability branches (mutually exclusive, must sum to <= 1.0):
+        [0,                       p_solid)               -> constant gray=127
+        [p_solid,        p_solid + p_random)             -> contrast-aware random gray
+        [p_solid+p_random, p_solid+p_random+p_distract)  -> low-freq RGB noise (DISABLED)
+        anything beyond                                   -> no-op (raw RGB returned)
 
     Output: numpy [H,W,3] uint8 (alpha consumed and fused into RGB).
     """
 
     def __init__(
         self,
-        p_solid: float = 1.0,
-        p_distract: float = 0.0,
-        solid_min_dist: int = 60,      # min |candidate_gray - fg_gray| on [0,255] luminance 
-        solid_max_tries: int = 20,     # rejection-sampling cap before falling back to extreme
+        p_solid:   float = 1.0,        # constant gray=127 padding
+        p_random:  float = 0.0,        # contrast-aware random gray padding
+        p_distract: float = 0.0,       # low-freq RGB noise padding (disabled by default)
+        solid_min_dist: int = 60,      # min |gray - fg_gray| on [0,255] luminance
+        solid_max_tries: int = 20,     # rejection-sampling cap before extreme fallback
     ):
-        s = p_solid + p_distract
-        if abs(s - 1.0) > 1e-3:
-            # non-strict probability sum limit currently
-            pass
-        self.p_solid = p_solid
-        self.p_distract = p_distract
+        s = p_solid + p_random + p_distract
+        if not (0.0 <= s <= 1.0 + 1e-3):
+            raise ValueError(
+                f"require p_solid + p_random + p_distract <= 1.0, got {s:.3f}"
+            )
+        self.p_solid = float(p_solid)
+        self.p_random = float(p_random)
+        self.p_distract = float(p_distract)
         self.solid_min_dist = int(solid_min_dist)
         self.solid_max_tries = int(solid_max_tries)
 
     def pick(self, ref_pool, mask_seq=None) -> np.ndarray:
         """
         Args:
-            ref_pool:  List[Path|str], RGBA png path list
-            mask_seq:  keep interface, currently unused
+            ref_pool: List[Path|str], RGBA png path list
+            mask_seq: kept for interface compat, currently unused
         Returns:
             numpy [H,W,3] uint8
         """
@@ -69,46 +75,38 @@ class RefSampler:
         path = random.choice(ref_pool)
         rgba = np.asarray(Image.open(path).convert("RGBA"))   # [H,W,4]
         rgb, alpha = rgba[..., :3], rgba[..., 3]
-        bg = (alpha == 0)                                     # [H,W] background boolean mask
+        bg = (alpha == 0)                                     # background bool mask
         return self._aug(rgb, bg)
 
+    # ---- branching --------------------------------------------------------
     def _aug(self, rgb: np.ndarray, bg: np.ndarray) -> np.ndarray:
-        """random augmentation on padding region: solid (contrast-aware) or distract texture."""
-        # If the image has no padding (bbox already filled the canvas), return as-is.
+        """random-branch padding fill. raw RGB if no padding."""
         if not bg.any():
             return rgb
-        if random.random() < self.p_solid:
-            return self._fill_solid(rgb, bg)
-        return self._fill_distract(rgb, bg)
+        r = random.random()
+        if r < self.p_solid:
+            return self._fill_const_gray(rgb, bg, GRAY_127)
+        if r < self.p_solid + self.p_random:
+            return self._fill_contrast_gray(rgb, bg)
+        # if r < self.p_solid + self.p_random + self.p_distract:
+        #     return self._fill_distract(rgb, bg)
+        return rgb
 
+    # ---- branch implementations -------------------------------------------
     @staticmethod
-    def _fg_gray(rgb: np.ndarray, bg: np.ndarray) -> float:
-        """Median luminance (BT.601 Y) over the foreground (alpha != 0) region."""
-        fg = ~bg  # obtain the foreground region by inverting the background mask
-        if not fg.any():
-            return 128.0
-        fg_rgb = np.median(rgb[fg].astype(np.float32), axis=0) # median is robust to outliers
-        return float(0.299 * fg_rgb[0] + 0.587 * fg_rgb[1] + 0.114 * fg_rgb[2])
-        # BT.601 Y standard formula: Y = 0.299 * R + 0.587 * G + 0.114 * B
-
-    def _pick_contrast_gray(self, rgb: np.ndarray, bg: np.ndarray) -> int:
-        """Rejection-sample a grayscale value in [0, 255] that is at least
-        solid_min_dist away from the foreground median luminance.
-        Falls back to the farthest extreme if sampling exhausts.
-        """
-        fg_gray = self._fg_gray(rgb, bg)
-        for _ in range(self.solid_max_tries):
-            v = random.randint(0, 255)
-            if abs(v - fg_gray) >= self.solid_min_dist:
-                return v
-        return 0 if fg_gray > 127 else 255
-
-    def _fill_solid(self, rgb: np.ndarray, bg: np.ndarray) -> np.ndarray:
-        """fill the padding region with a contrast-aware solid grayscale."""
-        v = self._pick_contrast_gray(rgb, bg)
+    def _fill_const_gray(rgb: np.ndarray, bg: np.ndarray, value: int) -> np.ndarray:
+        """Constant grayscale `value` on the bg region. value=127 matches the
+        masked-region fill in src_video so the model sees one neutral colour."""
         out = rgb.copy()
-        out[bg] = np.array([v, v, v], dtype=np.uint8)
+        out[bg] = np.array([value, value, value], dtype=np.uint8)
         return out
+
+    def _fill_contrast_gray(self, rgb: np.ndarray, bg: np.ndarray) -> np.ndarray:
+        """Rejection-sample a grayscale that contrasts the foreground median."""
+        v = self._pick_contrast_gray(rgb, bg)
+        # out = rgb.copy()
+        # out[bg] = np.array([v, v, v], dtype=np.uint8)
+        return self._fill_const_gray(rgb, bg, v)
 
     def _fill_distract(self, rgb: np.ndarray, bg: np.ndarray) -> np.ndarray:
         """fill the padding region with low-frequency noise texture."""
@@ -121,11 +119,33 @@ class RefSampler:
         out[bg] = tex[bg]
         return out
 
+    # ---- helpers ----------------------------------------------------------
+    @staticmethod
+    def _fg_gray(rgb: np.ndarray, bg: np.ndarray) -> float:
+        """Median luminance (BT.601 Y) of the foreground (alpha != 0) region."""
+        fg = ~bg
+        if not fg.any():
+            return 128.0
+        fg_rgb = np.median(rgb[fg].astype(np.float32), axis=0)
+        return float(0.299 * fg_rgb[0] + 0.587 * fg_rgb[1] + 0.114 * fg_rgb[2])
+
+    def _pick_contrast_gray(self, rgb: np.ndarray, bg: np.ndarray) -> int:
+        """Sample a grayscale at least solid_min_dist away from fg luminance.
+        Falls back to the farthest extreme if rejection sampling exhausts."""
+        fg_gray = self._fg_gray(rgb, bg)
+        for _ in range(self.solid_max_tries):
+            v = random.randint(0, 255)
+            if abs(v - fg_gray) >= self.solid_min_dist:
+                return v
+        return 0 if fg_gray > 127 else 255
+
+    # ---- factory ----------------------------------------------------------
     @classmethod
     def from_cfg(cls, shared) -> "RefSampler":
         """ref_aug is dataset-agnostic, read from data/config.yaml shared block."""
         a = shared["ref_aug"]
         return cls(
-            p_solid=a["p_solid"],
-            p_distract=a["p_distract"],
+            p_solid=a.get("p_solid", 1.0),
+            p_random=a.get("p_random", 0.0),
+            p_distract=a.get("p_distract", 0.0),
         )

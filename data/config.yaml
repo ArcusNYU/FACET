@@ -54,9 +54,15 @@ mask_perturb:
   elastic_sigma: 12.0    # smoothness
 
 # 3) Reference image background augmentation, applied inside RefSampler.pick().
-#    Solid branch rejection-samples a grayscale value that contrasts the
-#    garment; distract branch fills bg with low-frequency RGB noise. Together
-#    they prevent the model from learning a fixed-background shortcut.
+#    Three mutually-exclusive branches; weights must sum to <= 1.0:
+#      p_solid    : fill the alpha=0 padding with constant gray 127 (matches the
+#                   masked-region fill of src_video, so the network sees one
+#                   neutral colour for "this area is unknown").
+#      p_random   : fill with a randomly sampled grayscale that contrasts the
+#                   garment foreground (rejection-sampled).
+#      p_distract : low-freq RGB noise (kept implemented but disabled by default).
+#    Any leftover probability -> raw RGB returned (no fill).
 ref_aug:
-  p_solid: 1.0
+  p_solid:    1.0
+  p_random:   0.0
   p_distract: 0.0

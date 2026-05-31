@@ -140,7 +140,7 @@ def facet_block_forward(
     sa = block.self_attn
     n_heads = sa.num_heads # 24
     head_dim = sa.head_dim # 128
-    dim = sa.dim           # 3072
+    # dim = sa.dim           # 3072
 
     # ---- 2. Pre-attention modulation ----
     input_b = modulate(block.norm1(x_base), sm_b, sc_b)
@@ -201,7 +201,7 @@ def facet_block_forward(
         return t.view(B, -1, n_heads, head_dim).transpose(1, 2)
 
     q_b_h = to_heads(q_b)
-    q_b_f0_h   = to_heads(q_b_f0)
+    q_b_f0_h = to_heads(q_b_f0)
     k_b_h = to_heads(k_b)
     v_b_h = to_heads(v_b)
     k_s_h = to_heads(k_s)
@@ -214,7 +214,7 @@ def facet_block_forward(
     # Scores: [B, n_heads, L_base, L_*]
     score_to_base = (q_b_h @ k_b_h.transpose(-2, -1)) * scale
     score_to_src  = (q_b_h @ k_s_h.transpose(-2, -1)) * scale
-    score_to_ref  = (q_b_f0_h   @ k_r_h.transpose(-2, -1)) * scale   # delta_f = 0 here
+    score_to_ref  = (q_b_f0_h @ k_r_h.transpose(-2, -1)) * scale   # delta_f = 0 here
 
     # Mask-aware bias: per-Q-base routing.
     # m_q = m[:, None, :, None]  -> [B, 1, L_base, 1]; broadcasts over heads and K dim.
@@ -1404,7 +1404,7 @@ class FACETWanModel(nn.Module):
 
 
 # ============================================================
-# D. Public pipeline
+# C. Public pipeline
 # ============================================================
 
 
@@ -1499,7 +1499,7 @@ class FACETPipeline:
 
 
 # ============================================================
-# E. Utilities
+# D. Utilities
 # ============================================================
 
 

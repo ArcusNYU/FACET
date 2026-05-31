@@ -11,16 +11,16 @@ Usage in train.py / eval.py:
     for epoch in range(n_epochs):
         train_sampler.set_epoch(epoch)
         for batch in train_loader:
-            x       = batch["masked_video"]   # List[Tensor [T,3,H,W]] in [-1,1]
-            ref_imgs = batch["ref_img"]       # List[Tensor [3,H,W]]   in [-1,1]
-            context = batch["t5_emb"]         # List[Tensor [L,4096]]  or List[None]
-            tgt     = batch["tgt_latent"]     # List[Tensor [48,T',H',W']] or List[None]
+            clip_id    = batch["clip_id"]     # List[str]
+            src_video  = batch["src_video"]   # List[Tensor [T,3,H,W]] in [-1,1]
+            src_mask   = batch["src_mask"]    # List[Tensor [T,1,H,W]] in {0,1}
+            ref_img    = batch["ref_img"]     # List[Tensor [3,H,W]]   in [-1,1]
+            tgt_video  = batch["tgt_video"]   # List[Tensor [T,3,H,W]] in [-1,1]
+            tgt_latent = batch["tgt_latent"]  # List[Tensor [48,T',H',W']] or List[None]
+            t5_emb     = batch["t5_emb"]      # List[Tensor [L,4096]]  or List[None]
 
 collate design:
-    WanModel.forward takes  x: List[Tensor [C_in, F, H, W]] natively -- each sample
-    has NO extra batch dim.  All fields are kept as plain Python lists so training
-    code can pass them straight to vae.encode(x) / model(x, context=context, ...).
-    Nothing is stacked; no shape assumptions are imposed here.
+    FacetModel.forward takes src_video, src_mask, ref_img, tgt_video, tgt_latent, t5_emb natively 
 """
 
 from __future__ import annotations

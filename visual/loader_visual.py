@@ -1,15 +1,19 @@
 """
 Dataloader smoke test + visual dump.
 
-Iterates the train loader for --n samples (default 20) and:
-  - Prints clip_id / category / tensor shapes to terminal.
-  - Dumps ref_img.png / masked_video.mp4 to ./visual_exampler/{cid}/.
-  - Checks tgt_latent / t5_emb shape (shape only -- they are encoded).
+For --n samples (default 20) iterated from the train loader:
+  - Prints: clip_id / category / per-tensor shape & range / latent shape
+  - file dump under ./visual_exampler/{cid}/:
+        ref_img.png       : the picked reference
+        tgt_video.mp4     : clean target video
+        src_video.mp4     : tgt with masked region filled with specific content
+        src_mask.mp4      : binary perturbed mask (white = foreground)
+        summary.json      : metadata + tensor shapes
 
 build_loaders / collate_batch  -> loader.py
 tensor helpers / write_mp4     -> utils.py
 
-Run:
+Run from the repo root:
     cd /Facet
     python visual/loader_visual.py [--cfg data/config.yaml] [--n 20] [--out ./visual_exampler]
 """
@@ -27,11 +31,11 @@ from typing import Optional
 
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0") # for A100
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")  # for A100
 import torch
 
 from loader import build_loaders
-from utils import image_to_uint8, video_to_uint8, write_mp4, write_png
+from utils import image_to_uint8, mask_to_uint8, video_to_uint8, write_mp4, write_png
 
 
 def report_shape(name: str, t: Optional[torch.Tensor]) -> str:
@@ -41,6 +45,12 @@ def report_shape(name: str, t: Optional[torch.Tensor]) -> str:
     if not torch.is_tensor(t):
         return f"{name}: not a tensor ({type(t).__name__})"
     return f"{name}: shape={tuple(t.shape)}  dtype={t.dtype}"
+
+
+def _range_line(name: str, t: torch.Tensor, extra: str = "") -> str:
+    return (f"{name:<13}: {tuple(t.shape)}"
+            f"  min={t.min().item():+.3f}  max={t.max().item():+.3f}"
+            + (f"  {extra}" if extra else ""))
 
 
 def main():
@@ -73,33 +83,39 @@ def main():
         if seen >= args.n:
             break
 
-        cid     = batch["clip_id"][0]
-        cat     = batch["category"][0]
-        masked  = batch["masked_video"][0]   # [T,3,H,W] in [-1,1]
-        ref_img = batch["ref_img"][0]        # [3,H,W]   in [-1,1]
-        tgt_lat = batch["tgt_latent"][0]     # Tensor or None
-        t5_emb  = batch["t5_emb"][0]        # Tensor or None
+        # 此处可视化选取batch size=1
+        cid       = batch["clip_id"][0]
+        cat       = batch["category"][0]
+        tgt_video = batch["tgt_video"][0]    # [T,3,H,W] in [-1,1]
+        src_video = batch["src_video"][0]    # [T,3,H,W] in [-1,1] (gray-127 in mask region)
+        src_mask  = batch["src_mask"][0]     # [T,1,H,W] in {0,1}
+        ref_img   = batch["ref_img"][0]      # [3,H,W]   in [-1,1]
+        tgt_lat   = batch["tgt_latent"][0]   # Tensor or None
+        t5_emb    = batch["t5_emb"][0]       # Tensor or None
         # source   = batch["source"][0]
         # path     = batch["path"][0]
         # caption  = batch["caption"][0]
-        # mask     = batch["mask"][0]         # [T,1,H,W] in {0,1}
-        # FIXME: loader更改后这里的内容获取也要添加mask的可视化&形状检查
 
-
+        # ---- terminal ----------------------------------------------------
         print(f"[{seen+1:02d}/{args.n}] clip_id      = {cid}")
         print(f"        category     = {cat}")
-        print(f"        masked_video : {tuple(masked.shape)}"
-              f"  min={masked.min().item():+.3f}  max={masked.max().item():+.3f}")
-        print(f"        ref_img      : {tuple(ref_img.shape)}"
-              f"  min={ref_img.min().item():+.3f}  max={ref_img.max().item():+.3f}")
+        print(f"        {_range_line('tgt_video', tgt_video)}")
+        print(f"        {_range_line('src_video', src_video)}")
+        print(f"        {_range_line('src_mask',  src_mask, extra=f'fg_ratio={src_mask.mean().item():.3f}')}")
+        print(f"        {_range_line('ref_img',   ref_img)}")
         print(f"        {report_shape('tgt_latent', tgt_lat)}")
         print(f"        {report_shape('t5_emb    ', t5_emb)}")
 
+        # ---- file dump ---------------------------------------------------
         cdir = out_root / cid
         cdir.mkdir(parents=True, exist_ok=True)
 
         write_png(image_to_uint8(ref_img), cdir / "ref_img.png")
-        write_mp4(video_to_uint8(masked),  cdir / "masked_video.mp4",
+        write_mp4(video_to_uint8(tgt_video), cdir / "tgt_video.mp4",
+                  fps=args.fps, allow_fallback=True)
+        write_mp4(video_to_uint8(src_video), cdir / "src_video.mp4",
+                  fps=args.fps, allow_fallback=True)
+        write_mp4(mask_to_uint8(src_mask),   cdir / "src_mask.mp4",
                   fps=args.fps, allow_fallback=True)
 
         summary = {
@@ -109,12 +125,14 @@ def main():
             # "path":     path,
             # "caption":  caption,
             "shapes": {
-                # "mask":         list(mask.shape),
-                "masked_video": list(masked.shape),
-                "ref_img":      list(ref_img.shape),
-                "tgt_latent":   list(tgt_lat.shape) if torch.is_tensor(tgt_lat) else None,
-                "t5_emb":       list(t5_emb.shape)  if torch.is_tensor(t5_emb)  else None,
+                "tgt_video":  list(tgt_video.shape),
+                "src_video":  list(src_video.shape),
+                "src_mask":   list(src_mask.shape),
+                "ref_img":    list(ref_img.shape),
+                "tgt_latent": list(tgt_lat.shape) if torch.is_tensor(tgt_lat) else None,
+                "t5_emb":     list(t5_emb.shape)  if torch.is_tensor(t5_emb)  else None,
             },
+            # "src_mask_fg_ratio": float(src_mask.mean()),
         }
         with open(cdir / "summary.json", "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)

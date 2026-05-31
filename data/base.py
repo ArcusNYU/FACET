@@ -35,10 +35,18 @@ class BaseVideoDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         meta = self._load(idx)
-        video = self.tfm.video(meta["video"])           # [T,3,H,W] in [-1,1]
-        mask  = self.tfm.mask(meta["mask"])             # [T,1,H,W] in {0,1}, perturbed
-        masked_video = video * (1.0 - mask)             # [T,3,H,W]
-        # FIXME: 因为模型结构变化 dataloader提供的内容需要有所变化 对话 - Loader Chain v2
+        # tgt_video: clean ground-truth signal; in [-1, 1]
+        tgt_video = self.tfm.video(meta["video"])             # [T,3,H,W]
+        # src_mask : perturbed binary mask in {0, 1}
+        src_mask  = self.tfm.mask(meta["mask"])               # [T,1,H,W]
+        # src_video: tgt_video with the masked region painted to neutral gray 127.
+        GRAY_127_NORM = 0.0
+        src_video = torch.where(
+            src_mask > 0.5,
+            torch.full_like(tgt_video, GRAY_127_NORM),
+            tgt_video,
+        )                                                     # [T,3,H,W]
+        # ref_sampler picks one reference image from the pool and fills its alpha=0 padding.
         ref_img = self.ref_sampler.pick(meta["ref_pool"], meta["mask"])
         ref_img = self.tfm.ref(ref_img)                 # [3,H,W] in [-1,1]
         #NOTE: difference of ref_sampler and ref_tfm:
@@ -46,14 +54,14 @@ class BaseVideoDataset(Dataset):
         # ref_tfm: resize the reference image to the target size and normalize to [-1,1] (for VAE encoding).
 
         return {
-            "clip_id":      meta["clip_id"],
-            "category":     meta["category"],
-            "masked_video": masked_video,
-            "ref_img":      ref_img,
-            "tgt_latent":   meta.get("tgt_latent"),     # Tensor or None 
-            "t5_emb":       meta.get("t5_emb"),         # Tensor or None 
-            # "video": video,
-            # "mask": mask,
+            "clip_id":    meta["clip_id"],
+            "category":   meta["category"],
+            "tgt_video":  tgt_video,
+            "tgt_latent": meta.get("tgt_latent"),
+            "src_video":  src_video,
+            "src_mask":   src_mask,
+            "ref_img":    ref_img,
+            "t5_emb":     meta.get("t5_emb"),
             # "caption": meta["caption"],
             # "source": meta["source"], # source: original dataset name
             # "path": meta["path"],
