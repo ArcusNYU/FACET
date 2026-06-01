@@ -160,11 +160,33 @@ class FACETInferenceConfig:
 
 @dataclass
 class FACETTrainingConfig:
+    """
+    Training-side knobs read by train.py and the model. Authoritative source
+    is `training:` block in train.yaml; values here are defaults.
+
+    Fields used by trainer/loss.py and trainer/batch.prepare:
+        prediction_type    : FlowMatch target ("velocity" | "noise").
+        timestep_sampling  : timestep distribution ("uniform" | "logit_normal").
+        loss_type          : "mse" only (extend in trainer/loss.py if needed).
+        cfg_training       : whether to drop text/ref to train unconditional
+                             branches. False = standard supervised training.
+        text_dropout_prob  : consulted only when cfg_training=True.
+        ref_dropout_prob   : consulted only when cfg_training=True.
+        cached_t5          : True -> batch["t5_emb"] is used directly,
+                             skipping model.encode_prompt at train time.
+        cached_tgt_latent  : True -> batch["tgt_latent"] is used directly,
+                             skipping VAE encode for the target video.
+                             (src_video / ref_img are ALWAYS encoded online
+                             because of mask perturbation.)
+    """
     prediction_type: str = "velocity"       # "noise" | "velocity"
     timestep_sampling: str = "logit_normal" # "uniform" | "logit_normal"
     loss_type: str = "mse"
-    ref_dropout_prob: float = 0.05
-    text_dropout_prob: float = 0.10
+    cfg_training: bool = False              # train unconditional branches
+    text_dropout_prob: float = 0.0          # only consulted when cfg_training=True
+    ref_dropout_prob: float = 0.0           # only consulted when cfg_training=True
+    cached_t5: bool = True                  # batch["t5_emb"] is pre-encoded
+    cached_tgt_latent: bool = True          # batch["tgt_latent"] is pre-encoded
 
 
 # ============================================================

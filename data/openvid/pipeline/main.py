@@ -357,7 +357,7 @@ def _pick_refs(
             v = vlm.judge(rgb_only, category=cat)
         except Exception:
             v = {"match": False, "occlusion": True, "truncation": True}
-        if not v["match"] or v["occlusion"]:
+        if not v["match"] or v["occlusion"] or v["truncation"]:
             continue
 
         accepted.append({

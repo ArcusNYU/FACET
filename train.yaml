@@ -1,0 +1,127 @@
+# =============================================================================
+# FACET training config.
+#
+# Loaded by launch_train.py and trainer/config.py.
+# Overrides selected fields in facet/config.yaml (everything under
+# `facet_overrides:`) and owns all training-only knobs (under `train:`,
+# `training:`, `run:`, `log:`, `validate:`).
+#
+# Priority: train.yaml > facet/config.yaml (defaults).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. Pointers to other config files / weights / output roots
+# -----------------------------------------------------------------------------
+paths:
+  facet_config: "facet/config.yaml"        # model config (single source of truth)
+  data_config:  "data/config.yaml"         # dataset registry (already wired in loader.py)
+  weight_dir:   "weights/WAN2.2"           # base checkpoint root
+  runs_root:    "runs"                     # per-run output_root parent
+  ckpt_root:    "ckpt"                     # exported LoRA + manifest.json
+
+# -----------------------------------------------------------------------------
+# 1. facet_overrides
+#    Anything written here REPLACES the matching key in facet/config.yaml.
+#    Everything else in facet/config.yaml is kept as-is.
+#    Convention: only override what differs between train and inference.
+# -----------------------------------------------------------------------------
+facet_overrides:
+  gradient_checkpointing: true   # required for 5B + 81f on 80GB
+  device: "cuda"                 # auto-overridden per rank in trainer/setup.py
+  target:
+    num_frames: 49               # shorter clips during training (was 81 in inference cfg)
+
+# -----------------------------------------------------------------------------
+# 2. training:
+#    Owns prediction_type / timestep_sampling / loss_type / dropout probs.
+#    Moved out of facet/config.yaml (see trainer.txt L194).
+#    Lands at cfg.facet.training.* after merge.
+# -----------------------------------------------------------------------------
+training:
+  prediction_type:    "velocity"       # "noise" | "velocity"  (Wan / DiffSynth FlowMatch -> velocity)
+  timestep_sampling:  "logit_normal"   # "uniform" | "logit_normal"  (SD3-style; DiffSynth uses uniform)
+  loss_type:          "mse"
+  cfg_training:       false            # placeholder: drop text/ref to train uncond branch
+  text_dropout_prob:  0.0              # only consulted when cfg_training=true
+  ref_dropout_prob:   0.0              # only consulted when cfg_training=true
+  cached_t5:          true             # if true, batch["t5_emb"] is used directly
+  cached_tgt_latent:  true             # if true, batch["tgt_latent"] is used directly
+
+# -----------------------------------------------------------------------------
+# 3. accel:
+#    Compute-stack switches consumed by trainer.setup.init_env.
+# -----------------------------------------------------------------------------
+accel:
+  precision:                 "bf16"     # "no" | "fp16" | "bf16"
+  cudnn_benchmark:           true       # benchmark mode for throughput (ablation runs)
+  cudnn_deterministic:       false      # off; bench mode wins; flip on for bit-exact debug
+  allow_tf32:                true       # A100 fast matmul
+  matmul_precision:          "high"     # "highest" | "high" | "medium"
+  find_unused_parameters:    false      # 3-branch attn uses every LoRA param every step
+  launcher:                  "auto"     # "auto" | "python" | "accelerate"  (read by launch_train.py)
+  num_gpus:                  1          # used by launch_train.py to pick the launcher
+
+# -----------------------------------------------------------------------------
+# 4. train:
+#    Loop-level knobs. Step counts are in OPTIMIZER STEPS (post-accum).
+# -----------------------------------------------------------------------------
+train:
+  seed:                       42
+  epochs:                     5
+  max_steps:                  null            # null = use epochs * len(loader) / grad_accum
+  batch_size:                 1
+  num_workers:                4
+  gradient_accumulation_steps: 1
+  max_grad_norm:              1.0
+
+  optimizer:
+    name:          "adamw"
+    lr:            1.0e-4                     # DiffSynth Wan2.2-TI2V-5B.sh default
+    betas:         [0.9, 0.999]
+    weight_decay:  1.0e-2                     # DiffSynth default; set 0.0 if you find LoRA drift
+    eps:           1.0e-8
+
+  scheduler:
+    name:          "constant_with_warmup"     # "constant" | "constant_with_warmup"
+    warmup_steps:  200
+
+  log_every_steps:  10
+  val_every_steps:  500
+  save_every_steps: 1000                      # ckpt snapshot cadence (top-K bookkeeping)
+
+# -----------------------------------------------------------------------------
+# 5. run:
+#    Output_root naming + suffix. trainer/setup.py builds:
+#        run_name = f"{YYYYMMDD_HHMMSS}_s{total_steps}_{suffix}"
+# -----------------------------------------------------------------------------
+run:
+  suffix:    "facet_r32"     # short tag; appended to run_name
+  resume_from: null          # path to a runs/<run>/ckpts/step_xxx.pt (Phase 2+)
+
+# -----------------------------------------------------------------------------
+# 6. log:
+#    Cloud + console logging. project_name defaults to run_name.
+#    For Phase 1 this block is read by trainer.config; trainer.logger comes
+#    online in Phase 1.5.
+# -----------------------------------------------------------------------------
+log:
+  backend:         "mlflow"     # "mlflow" | "tensorboard" | "none"
+  project_name:    "facet"
+  cloud_run_name:  null         # null -> use run_name
+  log_every_steps: 10           # console / mlflow scalar cadence
+  log_grad_norm:   true
+  log_timestep_hist: true       # histogram of sampled t (debug logit_normal shape)
+
+# -----------------------------------------------------------------------------
+# 7. validate:
+#    Knobs for the in-loop validation that runs every cfg.train.val_every_steps.
+#    Phase 3 will implement; placeholder kept for cfg roundtrip.
+# -----------------------------------------------------------------------------
+validate:
+  num_samples:        10           # videos generated per validation pass
+  num_inference_steps: 25          # cheaper than 50 during training
+  cfg_scale:          5.0
+  metrics:            ["psnr", "ssim", "lpips", "clipsim"]
+  primary_metric:     "lpips"
+  primary_metric_direction: "min"  # "min" | "max"
+  topk:               3            # how many best ckpts to keep in ckpt/
