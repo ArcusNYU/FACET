@@ -1,14 +1,14 @@
 """
 trainer/setup.py
 
-Process-level setup for the FACET training pipeline.
+FACET training pipeline Step 2.
+Also implemented in test.py.
 
 Responsibilities:
   1. Lock HuggingFace to OFFLINE mode (no implicit network fetches).
   2. Seed every RNG (Python / NumPy / torch CPU+GPU / accelerate / per-rank).
   3. Wire cudnn / tf32 / matmul_precision knobs.
-  4. Construct accelerate.Accelerator with the right mixed_precision dtype
-     and DDP kwargs.
+  4. Construct accelerate.Accelerator with the specified mixed_precision dtype and DDP kwargs.
   5. Build the output_root directory (runs/<run_name>/...) on rank 0 only,
      then barrier so workers see the same path.
   6. Mint per-rank torch.Generator objects (cpu_gen + gpu_gen) for explicit
@@ -19,9 +19,8 @@ Entry point: init_env(cfg, args) -> SetupContext
 
 from __future__ import annotations
 
-# ---- 0. HF offline lock (must run BEFORE any HF import) --------------------
-# Belt-and-suspenders: also set in train.py before any heavy import. Repeating
-# here in case someone imports trainer.setup directly from a notebook.
+# ---- 0. HF offline lock --------------------
+# supposed to be run very-firstly before any HF import in any .py file
 import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -56,17 +55,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SetupContext:
     """
-    Everything init_env produces, in one bag, passed around train.py.
-
     Attributes:
         accelerator   : the accelerate.Accelerator (mixed precision wrapped).
         device        : torch.device for THIS rank (alias of accelerator.device).
         dtype         : torch.dtype matching cfg.accel.precision (bf16/fp16/fp32).
-        run_name      : <YYYYMMDD_HHMMSS>_s<total_steps>_<suffix>  (final at step 11).
+        run_name      : <MMDD>_s<total_steps>_<suffix>.
         output_root   : runs/<run_name>/   (created on rank 0).
-        ckpt_dir      : output_root/ckpts/ (created lazily).
-        logs_dir      : output_root/logs/  (created lazily).
-        samples_dir   : output_root/samples/ (created lazily).
+        ckpt_dir      : output_root/ckpts/.
+        logs_dir      : output_root/logs/.
+        samples_dir   : output_root/samples/.
         cpu_gen       : torch.Generator on CPU, seeded with cfg.train.seed.
         gpu_gen       : torch.Generator on accelerator.device, seeded with
                         seed + rank (so each rank draws DIFFERENT noise).
@@ -109,12 +106,12 @@ def _resolve_mixed_precision(precision: str) -> Tuple[torch.dtype, str]:
     return dtype, acc_str
 
 
-def _apply_backend_switches(cfg_accel) -> None:
+def _backend_setup(cfg_accel) -> None:
     """
     cudnn / tf32 / matmul_precision wiring.
 
     NOTE: cudnn.benchmark and cudnn.deterministic are mutually exclusive;
-    we let benchmark win when both are true and log a warning.
+    let benchmark win when both are true and log a warning.
     """
     bench = bool(cfg_accel.cudnn_benchmark)
     det = bool(cfg_accel.cudnn_deterministic)
@@ -138,7 +135,7 @@ def _apply_backend_switches(cfg_accel) -> None:
     torch.set_float32_matmul_precision(mp)
 
 
-def _seed_everything(seed: int, rank: int) -> Tuple[torch.Generator, torch.Generator]:
+def _global_seed_setup(seed: int, rank: int) -> Tuple[torch.Generator, torch.Generator]:
     """
     Seed every layer of RNG and mint explicit generators.
 
@@ -160,7 +157,7 @@ def _seed_everything(seed: int, rank: int) -> Tuple[torch.Generator, torch.Gener
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     # device_specific=True -> each rank gets (seed + process_index).
-    set_seed(seed, device_specific=True)
+    set_seed(seed, device_specific=True) # accelerate.utils.set_seed
 
     cpu_gen = torch.Generator(device="cpu").manual_seed(int(seed))
     if torch.cuda.is_available():
@@ -170,14 +167,32 @@ def _seed_everything(seed: int, rank: int) -> Tuple[torch.Generator, torch.Gener
     return cpu_gen, gpu_gen
 
 
+def _resolve_log_with(backend: str):
+    """
+    Map cfg.log.backend to accelerate's `log_with` argument.
+
+    Accelerator requires log_with at construction time (trackers cannot be
+    attached afterwards); trainer.logger.setup later calls init_trackers.
+    Returns None for "none" so no tracker is wired.
+    把配置里的日志后端名称(cfg.log.backend)转换成 Accelerate 库的 log_with 参数所需要的值
+    """
+    key = (backend or "none").lower()
+    if key == "none":
+        return None
+    if key in ("mlflow", "tensorboard", "wandb"):
+        return key
+    logger.warning("[setup] unknown log.backend=%r; disabling trackers.", backend)
+    return None
+
+
 def _build_run_name(cfg: MergedConfig, total_steps: int) -> str:
     """
-    run_name = <YYYYMMDD_HHMMSS>_s<total_steps>_<suffix>
+    run_name = <MMDD>_s<total_steps>_<suffix>
 
-    suffix is `cfg.run.suffix` (sanitized to filesystem-safe chars). When
-    empty, the trailing underscore is dropped.
+    suffix is `cfg.run.suffix` (input by user); when empty the trailing
+    underscore is dropped.
     """
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = dt.datetime.now().strftime("%m%d")
     suffix = (cfg.run.suffix or "").strip()
     suffix = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in suffix)
     base = f"{stamp}_s{total_steps}"
@@ -215,9 +230,7 @@ def init_env(
         cfg          : MergedConfig from trainer.config.load_merge.
         args         : argparse.Namespace from train.py (currently unused but
                        kept in the signature for forward compatibility).
-        total_steps  : output of trainer.config.estimate_total_steps.
-                       Used to build run_name and ALSO recorded on the context
-                       so trainer.optim can size the warmup schedule.
+        total_steps  : Used to build run_name and to size the lr warmup schedule.
 
     Returns:
         SetupContext with accelerator, device, dtype, run paths, generators.
@@ -228,10 +241,18 @@ def init_env(
         accelerator._set_gradient_checkpointing or similar helpers - that
         double-wraps and can deadlock NCCL.
     """
-    # 4.1  Mixed precision
+    # 4.1  Mixed precision + tracker backend
     dtype, precision_str = _resolve_mixed_precision(cfg.accel.precision)
+    log_with = _resolve_log_with(cfg.log.backend)
 
-    # 4.2  Accelerator
+    # 4.2  run_name + output_root
+    run_name = _build_run_name(cfg, total_steps)
+    output_root = Path(cfg.paths.run_root) / run_name
+    logs_dir = output_root / "logs"
+    ckpt_dir = output_root / "ckpts"
+    samples_dir = output_root / "samples"
+
+    # 4.3  Accelerator (trackers land under output_root/logs)
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=bool(cfg.accel.find_unused_parameters),
     )
@@ -239,41 +260,34 @@ def init_env(
         mixed_precision=precision_str,
         gradient_accumulation_steps=int(cfg.train.gradient_accumulation_steps),
         kwargs_handlers=[ddp_kwargs],
-        # log_with is set by trainer.logger later (Phase 1.5) via init_trackers.
+        log_with=log_with,
+        project_dir=str(logs_dir),
     )
 
-    # 4.3  Backend switches AFTER Accelerator (so its own probing has run)
-    _apply_backend_switches(cfg.accel)
+    # 4.4  Backend switches AFTER Accelerator (so its own probing has run)
+    #NOTE: 由于accelerate的创建会有probing及修改计算底层配置的操作 
+    # 所以将此步骤放置在accelerator创建之后
+    _backend_setup(cfg.accel)
 
-    # 4.4  Seed every RNG layer
+    # 4.5  Seed every RNG layer
     seed = int(cfg.train.seed)
-    cpu_gen, gpu_gen = _seed_everything(seed, accelerator.process_index)
+    cpu_gen, gpu_gen = _global_seed_setup(seed, accelerator.process_index)
 
-    # 4.5  Override cfg.facet.device per rank.
+    # 4.6  Override cfg.facet.device per rank.
     #      facet/config.yaml ships with device="cuda"; under DDP every rank
     #      must own its own cuda:i. accelerator.device already encodes that.
     cfg.facet.device = str(accelerator.device)
+    # NOTE: 从此开始全局大部分的模型权重和变量将在此device上计算和存储
 
-    # 4.6  run_name + output_root (rank 0 creates, all wait at barrier)
-    run_name = _build_run_name(cfg, total_steps)
-    output_root = Path(cfg.paths.runs_root) / run_name
-
+    # 4.7  Create the run directory tree on rank 0, then barrier.
     if accelerator.is_main_process:
-        ckpt_dir, logs_dir, samples_dir = _make_run_dirs(output_root)
-        # Also ensure the shared ckpt_root exists (lazily) so trainer.ckpt
-        # can drop manifest.json + per-run *.safetensors files later.
+        _make_run_dirs(output_root)
         Path(cfg.paths.ckpt_root).mkdir(parents=True, exist_ok=True)
-    else:
-        # Best-effort: workers compute the same paths from cfg; rank 0
-        # creates them. Wait until rank 0 is done.
-        ckpt_dir = output_root / "ckpts"
-        logs_dir = output_root / "logs"
-        samples_dir = output_root / "samples"
     accelerator.wait_for_everyone()
 
-    # 4.7  Boot banner on rank 0
+    # 4.8  Boot banner on rank 0
     if accelerator.is_main_process:
-        logger.info("=" * 78)
+        logger.info("=" * 50)
         logger.info("[setup] FACET trainer init")
         logger.info("  run_name      : %s", run_name)
         logger.info("  output_root   : %s", output_root.resolve())
@@ -287,7 +301,7 @@ def init_env(
                     torch.backends.cudnn.deterministic,
                     torch.backends.cuda.matmul.allow_tf32,
                     cfg.accel.matmul_precision)
-        logger.info("=" * 78)
+        logger.info("=" * 50)
 
     return SetupContext(
         accelerator=accelerator,

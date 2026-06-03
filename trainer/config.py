@@ -1,20 +1,27 @@
 """
 trainer/config.py
+FACET training pipeline Step 1.
 
-Load + merge + snapshot the FACET training config.
+Load + record the FACET training config.
 
 Responsibilities:
-  - Parse train.yaml into typed dataclasses (TrainConfig, AccelConfig, ...).
-  - Build a FACETConfig from `paths.facet_config` and apply `facet_overrides`.
-  - Land train.yaml's `training:` block onto cfg.facet.training (the only block
-    that the model itself reads at training time; see trainer.txt L194).
-  - Expose a single MergedConfig object with .facet / .train / .accel / .run
-    / .log / .validate / .paths sub-configs.
+  - Parse train.yaml into typed dataclasses (TrainingConfig, TrainConfig,
+    AccelConfig, RunConfig, LogConfig, ValidateConfig, PathsConfig).
+  - Load the model config separately via FACETConfig.from_yaml(paths.facet_config).
+  - Resolve every entry in PathsConfig to an ABSOLUTE path rooted at the project
+    directory, so downstream code never has to re-resolve cwd-relative paths.
+  - Expose a single MergedConfig object with
+    .facet / .training / .train / .accel / .run / .log / .validate / .paths.
   - .flat()         : dict of "ns.key" -> scalar, suitable for mlflow logging.
-  - .dump_snapshot(): write merged yaml into runs/<run>/config_snapshot.yaml.
+  - .dump_snapshot(): write the effective config to runs/<run>/config_snapshot.yaml.
 
-Authoritative for: optimizer / scheduler / loop / cached / cfg-training flags.
-NOT authoritative for: model dims (those still live in facet/config.yaml).
+facet/config.yaml and train.yaml are managed INDEPENDENTLY. There is no cross-yaml
+override anymore: model knobs are edited in facet/config.yaml, training knobs in
+train.yaml. load_merge only LOADS + RECORDS; it does not reconcile the two.
+NOTE: when a new config block is added, update this docstring + MergedConfig.
+
+Difference between 'training' and 'train':
+- training is for entire strategy, while train is for controlling specific loop-level hyperparameters.
 """
 
 from __future__ import annotations
@@ -32,22 +39,41 @@ import yaml
 from facet.config import FACETConfig
 
 
+# Project root = parent of the `trainer/` package (i.e. the dir that holds
+# train.py). All relative paths in train.yaml are resolved against this so the
+# trainer behaves identically regardless of the shell's cwd.
+_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
+
+def _to_abs(p: str | Path) -> str:
+    """Resolve a (possibly relative) path against the project root -> absolute str."""
+    p = Path(p)
+    if not p.is_absolute():
+        p = (_PROJECT_ROOT / p).resolve()
+    return str(p)
+
+
 # 2. Sub-config dataclasses ---------------------------------------------------
 
 
 @dataclass
 class PathsConfig:
-    """Filesystem roots referenced across the trainer."""
+    """
+    Filesystem roots referenced across the trainer.
+
+    All fields are rewritten to ABSOLUTE paths inside load_merge (rooted at the
+    project directory), so callers can use them directly.
+    """
     facet_config: str = "facet/config.yaml"
     data_config: str = "data/config.yaml"
     weight_dir: str = "weights/WAN2.2"
-    runs_root: str = "runs"
-    ckpt_root: str = "ckpt"
+    run_root: str = "runs"
+    ckpt_root: str = "ckpts"
 
 
 @dataclass
 class AccelConfig:
-    """Compute-stack switches consumed by trainer/setup.py."""
+    """Compute-stack switches consumed by trainer/setup.py + launch_train.py."""
     precision: str = "bf16"                      # "no" | "fp16" | "bf16"
     cudnn_benchmark: bool = True
     cudnn_deterministic: bool = False
@@ -55,7 +81,49 @@ class AccelConfig:
     matmul_precision: str = "high"               # "highest" | "high" | "medium"
     find_unused_parameters: bool = False
     launcher: str = "auto"                       # "auto" | "python" | "accelerate"
-    num_gpus: int = 1
+    # (sets CUDA_VISIBLE_DEVICES in launch_train.py). Single id -> python launcher; multiple -> accelerate.
+    gpu_ids: List[int] = field(default_factory=lambda: [0])
+
+    @property
+    def num_gpus(self) -> int:
+        """Inferred from gpu_ids (launch_train.py picks the launcher off this)."""
+        return len(self.gpu_ids)
+
+
+@dataclass
+class TrainingConfig:
+    """
+    FlowMatch / objective knobs.
+
+    Combination presets (see trainer/loss.py header for full rationale):
+      A (SD3)       : timestep_sampling=logit_normal,      sigma_shift=1.0, loss_weighting=none
+      B (DiffSynth) : timestep_sampling=uniform(discrete), sigma_shift=5.0, loss_weighting=bsmnt   <- FACET default
+      C             : timestep_sampling=logit_normal,      sigma_shift=5.0, loss_weighting=none    <- stage2 ablation
+
+    Fields:
+        prediction_type    : FlowMatch target ("velocity" | "noise").
+        timestep_sampling  : timestep density ("uniform" | "logit_normal").
+        sigma_shift        : flow-matching shift; 1.0 = linear, 5.0 = shift (WAN/DiffSynth default).
+        loss_weighting     : per-timestep loss weight ("none" | "bsmnt").
+        loss_type          : "mse" only (extend in trainer/loss.py if needed).
+        cfg_training       : drop text/ref to train unconditional branches.
+        text_dropout_prob  : consulted only when cfg_training=True.
+        ref_dropout_prob   : consulted only when cfg_training=True.
+        cached_t5          : True -> batch["t5_emb"] used directly.
+        cached_tgt_latent  : True -> batch["tgt_latent"] used directly.
+                             (src_video / ref_img are ALWAYS encoded online
+                             because of per-epoch mask perturbation.)
+    """
+    prediction_type: str = "velocity"            # "noise" | "velocity"
+    timestep_sampling: str = "uniform"           # "uniform" | "logit_normal"
+    sigma_shift: float = 5.0                     # 1.0 = linear, 5.0 = shift
+    loss_weighting: str = "bsmnt"                # "none" | "bsmnt"
+    loss_type: str = "mse"
+    cfg_training: bool = False
+    text_dropout_prob: float = 0.0
+    ref_dropout_prob: float = 0.0
+    cached_t5: bool = True
+    cached_tgt_latent: bool = True
 
 
 @dataclass
@@ -70,7 +138,7 @@ class OptimizerConfig:
 @dataclass
 class SchedulerConfig:
     name: str = "constant_with_warmup"           # "constant" | "constant_with_warmup"
-    warmup_steps: int = 200
+    warmup_steps: int = 1000
 
 
 @dataclass
@@ -78,7 +146,7 @@ class TrainConfig:
     """Loop-level training knobs. Step counts here are OPTIMIZER STEPS."""
     seed: int = 42
     epochs: int = 5
-    max_steps: Optional[int] = None              # null in yaml -> None
+    max_steps: int = 20000    #TODO: 后期考虑调整此参数
     batch_size: int = 1
     num_workers: int = 4
     gradient_accumulation_steps: int = 1
@@ -101,7 +169,7 @@ class RunConfig:
 
 @dataclass
 class LogConfig:
-    """Cloud + console logging (consumed by trainer.logger in Phase 1.5)."""
+    """Cloud + console logging."""
     backend: str = "mlflow"                      # "mlflow" | "tensorboard" | "none"
     project_name: str = "facet"
     cloud_run_name: Optional[str] = None         # None -> use run_name
@@ -112,13 +180,16 @@ class LogConfig:
 
 @dataclass
 class ValidateConfig:
-    """Validation pass knobs (consumed by trainer.valid in Phase 3)."""
+    """
+    Validation pass knobs.
+
+    primary_metric drives top-K selection.
+    """
     num_samples: int = 10
     num_inference_steps: int = 25
     cfg_scale: float = 5.0
     metrics: List[str] = field(default_factory=lambda: ["psnr", "ssim", "lpips", "clipsim"])
     primary_metric: str = "lpips"
-    primary_metric_direction: str = "min"        # "min" | "max"
     topk: int = 3
 
 
@@ -131,16 +202,18 @@ class MergedConfig:
     Bundle of everything `train.py` consumes.
 
     Layout:
-      cfg.facet      -> FACETConfig            (model side, from facet/config.yaml + overrides)
-      cfg.train      -> TrainConfig            (loop knobs)
-      cfg.accel      -> AccelConfig            (compute stack)
-      cfg.run        -> RunConfig              (run_name suffix, resume)
-      cfg.log        -> LogConfig              (cloud / console)
-      cfg.validate   -> ValidateConfig         (in-loop val)
-      cfg.paths      -> PathsConfig            (roots)
+      cfg.facet      -> FACETConfig            (model; from facet/config.yaml)
+      cfg.training   -> TrainingConfig         (objective / FlowMatch knobs)
+      cfg.train      -> TrainConfig            (loop)
+      cfg.accel      -> AccelConfig            (compute)
+      cfg.run        -> RunConfig              (name)
+      cfg.log        -> LogConfig              (cloud)
+      cfg.validate   -> ValidateConfig         (valid)
+      cfg.paths      -> PathsConfig            (absolute paths)
       cfg._raw       -> dict                   (verbatim train.yaml; for snapshot)
     """
     facet: FACETConfig
+    training: TrainingConfig
     train: TrainConfig
     accel: AccelConfig
     run: RunConfig
@@ -154,7 +227,6 @@ class MergedConfig:
         """
         Return a flat dict of scalar-ish values keyed by "ns.key".
 
-        Skips nested dataclasses, lists, dicts (mlflow doesn't render those well).
         Used by trainer.logger to upload config to the run tracker.
         """
         out: Dict[str, Any] = {}
@@ -172,18 +244,13 @@ class MergedConfig:
                 return
             # other types ignored on purpose; snapshot yaml has the full picture.
 
-        for name in ("facet", "train", "accel", "run", "log", "validate", "paths"):
+        for name in ("facet", "training", "train", "accel", "run", "log", "validate", "paths"):
             walk(name, getattr(self, name))
         return out
 
     # 3.2  Snapshot dump.
     def dump_snapshot(self, out_path: str | Path) -> None:
-        """
-        Write a single yaml capturing the merged effective config.
-
-        We dump as plain dict (not dataclass repr) so the file is human-readable
-        and can be re-loaded with safe_load.
-        """
+        """Write a single yaml capturing the effective (loaded) config."""
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -198,6 +265,7 @@ class MergedConfig:
 
         payload = {
             "facet":    to_plain(self.facet),
+            "training": to_plain(self.training),
             "train":    to_plain(self.train),
             "accel":    to_plain(self.accel),
             "run":      to_plain(self.run),
@@ -213,24 +281,26 @@ class MergedConfig:
 # 4. Helpers ------------------------------------------------------------------
 
 
-def _override_dataclass(dc: Any, overrides: Dict[str, Any]) -> None:
+def _load_into_dataclass(dc: Any, block: Dict[str, Any]) -> None:
     """
-    In-place overlay a dict of overrides onto a dataclass.
+    Populate a dataclass IN PLACE from a yaml block.
 
-    - Unknown keys are warned and ignored (won't silently typo).
-    - Nested dicts recurse into nested dataclasses.
-    - List-to-tuple coercion is applied for fields typed as tuple (betas, ...).
+    - Unknown keys are warned and ignored (so typos surface instead of silently
+      vanishing).
+    - Nested dicts recurse into nested dataclasses (e.g. train.optimizer).
+    - List values are coerced to tuple when the target field is typed as tuple
+      (e.g. optimizer.betas).
     """
-    if not overrides:
+    if not block:
         return
-    field_names = {f.name for f in dataclasses.fields(dc)}
-    for k, v in overrides.items():
-        if k not in field_names:
+    field_types = {f.name: f.type for f in dataclasses.fields(dc)}
+    for k, v in block.items():
+        if k not in field_types:
             print(f"[trainer.config] Unknown key {type(dc).__name__}.{k} in train.yaml, ignored.")
             continue
         cur = getattr(dc, k)
         if dataclasses.is_dataclass(cur) and isinstance(v, dict):
-            _override_dataclass(cur, v)
+            _load_into_dataclass(cur, v)
         else:
             # Coerce list to tuple if field is declared as tuple.
             if isinstance(cur, tuple) and isinstance(v, list):
@@ -238,68 +308,15 @@ def _override_dataclass(dc: Any, overrides: Dict[str, Any]) -> None:
             setattr(dc, k, v)
 
 
-def _override_facet(facet_cfg: FACETConfig, overrides: Dict[str, Any]) -> None:
-    """
-    Apply train.yaml's `facet_overrides:` block onto a FACETConfig.
-
-    Reuses FACETConfig's own _SUB_CONFIGS / _FLAT_FIELDS schema so we never
-    drift from facet/config.py's notion of which keys are scalars vs blocks.
-    """
-    if not overrides:
-        return
-    for k, v in overrides.items():
-        if k in FACETConfig._FLAT_FIELDS:
-            setattr(facet_cfg, k, v)
-            continue
-        if k in FACETConfig._SUB_CONFIGS:
-            attr_name, _ = FACETConfig._SUB_CONFIGS[k]
-            sub = getattr(facet_cfg, attr_name)
-            for sk, sv in (v or {}).items():
-                if not hasattr(sub, sk):
-                    print(f"[trainer.config] Unknown key facet_overrides.{k}.{sk}, ignored.")
-                    continue
-                if sk == "patch_size" and isinstance(sv, list):
-                    sv = tuple(sv)
-                if sk == "target_modules" and isinstance(sv, list):
-                    sv = tuple(sv)
-                setattr(sub, sk, sv)
-            continue
-        print(f"[trainer.config] Unknown top-level key facet_overrides.{k}, ignored.")
-
-
-def _apply_training_block(facet_cfg: FACETConfig, training_block: Dict[str, Any]) -> None:
-    """
-    Land train.yaml's `training:` block onto cfg.facet.training.
-
-    This is the ONE place where train.yaml feeds into the model-side config.
-    Done explicitly (not via facet_overrides) because the user requested this
-    block to live in train.yaml, NOT facet/config.yaml (see trainer.txt L194).
-    """
-    if not training_block:
-        return
-    # FACETTrainingConfig in facet/config.py is the schema.
-    sub = facet_cfg.training
-    for sk, sv in training_block.items():
-        if not hasattr(sub, sk):
-            print(f"[trainer.config] Unknown key training.{sk}, ignored.")
-            continue
-        setattr(sub, sk, sv)
-
-
 # 5. Public API ---------------------------------------------------------------
 
 
 def load_merge(args: argparse.Namespace) -> MergedConfig:
     """
-    Load train.yaml + facet/config.yaml and merge them.
+    Load train.yaml + facet/config.yaml into a single MergedConfig.
+    Paths are resolved to absolute.
 
     args.train_yaml: path to train.yaml (set by launch_train.py / parse_args).
-
-    Merge order (later wins):
-      1. FACETConfig defaults
-      2. facet/config.yaml
-      3. train.yaml: facet_overrides:
-      4. train.yaml: training:                   -> cfg.facet.training
     """
     train_yaml_path = Path(getattr(args, "train_yaml", "train.yaml")).resolve()
     if not train_yaml_path.is_file():
@@ -308,33 +325,37 @@ def load_merge(args: argparse.Namespace) -> MergedConfig:
     with open(train_yaml_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
 
-    # 5.1  paths
+    # 5.1  paths  (load, then resolve every entry to an absolute path)
     paths = PathsConfig()
-    _override_dataclass(paths, raw.get("paths", {}))
+    _load_into_dataclass(paths, raw.get("paths", {}))
+    for fld in dataclasses.fields(paths):
+        setattr(paths, fld.name, _to_abs(getattr(paths, fld.name)))
 
-    # 5.2  facet (model) config
+    # 5.2  facet (model) config -- loaded independently from facet/config.yaml
     facet_cfg = FACETConfig.from_yaml(paths.facet_config)
-    _override_facet(facet_cfg, raw.get("facet_overrides", {}))
-    _apply_training_block(facet_cfg, raw.get("training", {}))
 
     # 5.3  trainer-side blocks
+    training = TrainingConfig()
+    _load_into_dataclass(training, raw.get("training", {}))
+
     train = TrainConfig()
-    _override_dataclass(train, raw.get("train", {}))
+    _load_into_dataclass(train, raw.get("train", {}))
 
     accel = AccelConfig()
-    _override_dataclass(accel, raw.get("accel", {}))
+    _load_into_dataclass(accel, raw.get("accel", {}))
 
     run = RunConfig()
-    _override_dataclass(run, raw.get("run", {}))
+    _load_into_dataclass(run, raw.get("run", {}))
 
     log_cfg = LogConfig()
-    _override_dataclass(log_cfg, raw.get("log", {}))
+    _load_into_dataclass(log_cfg, raw.get("log", {}))
 
     validate_cfg = ValidateConfig()
-    _override_dataclass(validate_cfg, raw.get("validate", {}))
+    _load_into_dataclass(validate_cfg, raw.get("validate", {}))
 
     return MergedConfig(
         facet=facet_cfg,
+        training=training,
         train=train,
         accel=accel,
         run=run,
@@ -343,25 +364,3 @@ def load_merge(args: argparse.Namespace) -> MergedConfig:
         paths=paths,
         _raw=copy.deepcopy(raw),
     )
-
-
-def estimate_total_steps(
-    train_cfg: TrainConfig,
-    len_train_loader: int,
-) -> int:
-    """
-    Compute the total optimizer-step count for this run.
-
-    Priority:
-      - cfg.train.max_steps if set    (cap)
-      - else epochs * len(loader) / grad_accum_steps  (ceil)
-
-    Used by trainer.setup to:
-      a) build run_name = "...s<total_steps>..."
-      b) build lr_scheduler (so warmup ratio is well-defined)
-    """
-    if train_cfg.max_steps is not None and train_cfg.max_steps > 0:
-        return int(train_cfg.max_steps)
-    micro_per_epoch = max(1, len_train_loader)
-    grad_accum = max(1, int(train_cfg.gradient_accumulation_steps))
-    return -((-(train_cfg.epochs * micro_per_epoch)) // grad_accum)   # ceil div

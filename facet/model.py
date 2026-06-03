@@ -434,18 +434,18 @@ class FACETWanModel(nn.Module):
         if len(replaced) > 20:
             logger.info("  ... and %d more", len(replaced) - 20)
 
-    # def set_lora_trainable(self, trainable: bool = True) -> None:
-    #     """
-    #     Optional helper for the trainer: re-set requires_grad on lora_down/lora_up.
+    def set_lora(self, trainable: bool = True) -> None:
+        """
+        Optional helper for the trainer: re-set requires_grad on lora_down/lora_up.
 
-    #     Not called from __init__ on purpose; the default PyTorch behavior after
-    #     injection already matches `trainable=True`. Call this explicitly if you
-    #     ever need to freeze LoRA (e.g. for a sanity-check inference of the
-    #     loaded weights, where requires_grad=False saves a tiny bit of bookkeeping).
-    #     """
-    #     for name, p in self.named_parameters():
-    #         if ("lora_down" in name) or ("lora_up" in name):
-    #             p.requires_grad_(bool(trainable))
+        Not called from __init__ on purpose; the default PyTorch behavior after
+        injection already matches `trainable=True`. Call this explicitly if you
+        ever need to freeze LoRA (e.g. for a sanity-check inference of the
+        loaded weights, where requires_grad=False saves a tiny bit of bookkeeping).
+        """
+        for name, p in self.named_parameters():
+            if ("lora_down" in name) or ("lora_up" in name):
+                p.requires_grad_(bool(trainable))
 
     # --------------------------------------------------------
     # Save / load LoRA

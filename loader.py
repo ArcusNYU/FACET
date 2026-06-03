@@ -1,23 +1,10 @@
 """
 Training dataloader factory.
+FACET Training pipeline Step 5.
 
 Exported:
     build_loaders   -> (train_loader, val_loader, train_sampler, val_sampler)
     collate_batch   -> DataLoader collate_fn
-
-Usage in train.py / eval.py:
-    from loader import build_loaders
-    train_loader, val_loader, train_sampler, _ = build_loaders(...)
-    for epoch in range(n_epochs):
-        train_sampler.set_epoch(epoch)
-        for batch in train_loader:
-            clip_id    = batch["clip_id"]     # List[str]
-            src_video  = batch["src_video"]   # List[Tensor [T,3,H,W]] in [-1,1]
-            src_mask   = batch["src_mask"]    # List[Tensor [T,1,H,W]] in {0,1}
-            ref_img    = batch["ref_img"]     # List[Tensor [3,H,W]]   in [-1,1]
-            tgt_video  = batch["tgt_video"]   # List[Tensor [T,3,H,W]] in [-1,1]
-            tgt_latent = batch["tgt_latent"]  # List[Tensor [48,T',H',W']] or List[None]
-            t5_emb     = batch["t5_emb"]      # List[Tensor [L,4096]]  or List[None]
 
 collate design:
     FacetModel.forward takes src_video, src_mask, ref_img, tgt_video, tgt_latent, t5_emb natively 
