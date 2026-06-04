@@ -106,15 +106,15 @@ def _extract_json(text: str) -> Dict[str, bool]:
     text = re.sub(r"\s*```$", "", text)
     m = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not m:
-        return {"match": False, "occlusion": True, "truncation": True}
+        return {"match": False, "occlusion": True, "multiple": True}
     try:
         d = json.loads(m.group(0))
     except json.JSONDecodeError:
-        return {"match": False, "occlusion": True, "truncation": True}
+        return {"match": False, "occlusion": True, "multiple": True}
     return {
-        "match":      bool(d.get("match", False)),
-        "occlusion":  bool(d.get("occlusion", True)),
-        "truncation": bool(d.get("truncation", True)),
+        "match":     bool(d.get("match", False)),
+        "occlusion": bool(d.get("occlusion", True)),
+        "multiple":  bool(d.get("multiple", True)),
     }
 
 
@@ -124,7 +124,7 @@ class VlmFilter:
     Interface:
         vlm = VlmFilter(model_dir, prompt_file)
         d = vlm.judge(rgb_uint8, category="upper_clothes")
-        accept = d["match"] and not d["occlusion"] and not d["truncation"]
+        accept = d["match"] and not d["occlusion"] and not d["multiple"]
     """
 
     def __init__(

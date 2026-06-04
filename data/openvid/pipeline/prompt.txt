@@ -12,9 +12,10 @@ Your task is to judge the image using exactly three boolean fields:
    Whether the target category is severely occluded.
    Mark true only if the target object is heavily blocked by hands, arms, hair, bag, another person, animal, object, or foreground item, so that its appearance is not clearly visible.
 
-3. truncation:
-   Whether the target category is severely truncated by the image boundary.
-   Mark true only if the target object is cut off so much that its overall shape, style, or category cannot be reliably recognized.
+3. multiple:
+   Whether the image contains more than one clearly separate, prominent region of the target category.
+   Mark true if two or more distinct large instances of the target category appear at the same time. Common cases: the main subject together with a mirror or window reflection, a second person, or another person shown on a screen, poster, photo, or painting in the background.
+   Mark false when there is only one dominant instance of the target category, even if small, blurry, or partial hints of others exist.
 
 Be conservative. If the target category is unclear, match should be false.
 
@@ -26,5 +27,5 @@ Required JSON format:
 {{
   "match": true/false,
   "occlusion": true/false,
-  "truncation": true/false
+  "multiple": true/false
 }}

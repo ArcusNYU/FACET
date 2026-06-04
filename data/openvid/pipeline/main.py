@@ -17,9 +17,7 @@ keeps rows with `single == True`. For each clip:
   4. Pick up to `ref_candidates_k` reference frames via cascade:
          L1 cv_check        (bbox size + mask ratio range)
          L2 IQA >= iqa_thresh
-         L3 VLM judge       (match=True, occlusion=False).
-                            `truncation` is still requested from the VLM but
-                            currently NOT used as a reject criterion.
+         L3 VLM judge       (match=True, occlusion=False, multiple=False).
      Rejection sampling on random post-tgt indices, cap at ref_max_tries.
   5. fit_pad the first num_frames of raw video AND raw mask to (height, width)
      -> tgt video.mp4 (raw normalized, NOT masked) + masks.npz
@@ -349,15 +347,12 @@ def _pick_refs(
         if iqa_score < iqa_thresh:
             continue
 
-        # L3 VLM judge
-        # NOTE: truncation 字段仍由 VLM 返回, 但当前不参与拒绝, 只看 match & occlusion.
-        # 经验上 当前openhumanvid数据集的特性, 许多镜头为人物上半身, 使得VLM判断truncation为true, 导致 no_ref 过多.
-        # FIXME: 将 truncation的判断在category=hair的时候加回来 
+        # L3 VLM judge on RGB only
         try:
             v = vlm.judge(rgb_only, category=cat)
         except Exception:
-            v = {"match": False, "occlusion": True, "truncation": True}
-        if not v["match"] or v["occlusion"] or v["truncation"]:
+            v = {"match": False, "occlusion": True, "multiple": True}
+        if not v["match"] or v["occlusion"] or v["multiple"]:
             continue
 
         accepted.append({

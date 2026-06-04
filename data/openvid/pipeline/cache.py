@@ -2,7 +2,7 @@
 Dataset Pipeline Stage 3: Latent cache (T5 caption embedding + Wan VAE video latent).
 Reference: https://github.com/Wan-Video/Wan2.2
 
-Reads {out_root}/index.jsonl produced by main.py. For each ok clip:
+Reads {out_root}/index.jsonl produced by main.py. For each qualified clip:
   1. Load {clip_dir}/meta.json -> caption.
   2. Load {clip_dir}/{cid}.mp4 -> first cfg.num_frames frames as [3,T,H,W] in [-1,1].
   3. Encode caption with T5EncoderModel -> [L, 4096] (variable length, padded by DiT at runtime).
@@ -23,7 +23,6 @@ Wan weights layout (cfg.prepare.weight_dir / WAN):
     Wan2.2_VAE.pth                           # video VAE ckpt
 """
 
-# FIXME: 转为WAN2.1-VACE的版本
 # TODO: 单进程串行版本; 大数据集时可用 CUDA_VISIBLE_DEVICES + --shard 切片并发
 # TODO: 若后续允许 negative-prompt CFG dropout, 在此一并 cache null T5 embedding
 
