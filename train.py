@@ -80,63 +80,51 @@ def parse_args() -> argparse.Namespace:
 # 3. batch preparation (OmniControl-specific data path)
 # =============================================================================
 def prepare_batch(raw_model, batch, cfg, device, dtype):
-    # FIXME: loader给出的内容目前除了prompt embeds 都不是list
-    # tgt_latent似乎也是一个list 这部分目前逻辑混乱需要进行溯源
     """
-    Turn a raw dataloader batch into model.forward kwargs.
-    
-    Loader layout:
-        src_video  : [T, 3, H, W] in [-1, 1]   (masked source video, pixel)
-        src_mask   : [T, 1, H, W] in {0, 1}
-        ref_img    : [3, H, W]    in [-1, 1]
-        tgt_video  : [T, 3, H, W] in [-1, 1]
-        tgt_latent : [16, F_lat, h, w] or None  (cached)
-        t5_emb     : [L, 4096]    or None       (cached)
+    Turn a collated dataloader batch into FACETWanModel.forward kwargs.
 
-    NOTE on layout: the loader is FRAME-first ([T, C, H, W]); the WAN VAE /
-    model is CHANNEL-first ([B, C, T, H, W]). Videos/masks are permuted here.
+    Batch layout from loader.collate_batch (B = batch size):
+        src_video  : [B, T, 3, H, W] in [-1, 1]   (masked source video, pixel)
+        src_mask   : [B, T, 1, H, W] in {0, 1}
+        ref_img    : [B, 3, H, W]    in [-1, 1]
+        tgt_video  : [B, T, 3, H, W] in [-1, 1]
+        tgt_latent : [B, z, T', H', W']  (cached) | List[None] (cache miss)
+        t5_emb     : List[[L_i, 4096]]   (cached) | List[None] (cache miss)
 
-    src_video / ref_img are ALWAYS VAE-encoded online because of real-time mask perturbation
-    tgt_latent / t5_emb use the cache when cfg.training.cached_* is set.
-
-    Returns a dict of forward kwargs + the target latents 
-    (for the FlowMatch target) on `device`/`dtype`.
+    Returns forward kwargs + the target latents (for the FlowMatch target):
+        prompt_embeds : List[[L_i, 4096]]
+        ref_latents   : [B, 16, 1, h_ref, w_ref]
+        src_latents   : [B, 16, F_lat, h, w]
+        src_mask      : [B, 1, T, H, W]
+        tgt_latents   : [B, 16, F_lat, h, w]
     """
-    src_video = batch["src_video"]    # List[[T,3,H,W]]
-    src_mask  = batch["src_mask"]     # List[[T,1,H,W]]
-    ref_img   = batch["ref_img"]      # List[[3,H,W]]
+    # a. src branch: [B,T,3,H,W] -> [B,3,T,H,W], VAE-encode (encode moves to device).
+    src_video = batch["src_video"].permute(0, 2, 1, 3, 4)            # [B,3,T,H,W]
+    src_latents = raw_model.encode_src_video(src_video)             # [B,16,F_lat,h,w]
 
-    # a. src branch: permute frame-first -> channel-first, stack, VAE-encode.
-    src_video = torch.stack([v.permute(1, 0, 2, 3) for v in src_video], dim=0)  # [B,3,T,H,W]
-    # FIXME: 改变处理方式 
-    src_latents = raw_model.encode_src_video(src_video)                          # [B,16,F_lat,h,w]
+    # b. ref branch: [B,3,H,W] VAE-encode to single-frame latents.
+    ref_latents = raw_model.encode_reference_image(batch["ref_img"])  # [B,16,1,hr,wr]
 
-    # b. ref branch: stack [3,H,W] -> [B,3,H,W], VAE-encode to 1-frame latents.
-    ref_img = torch.stack(ref_img, dim=0)                                        # [B,3,H,W]
-    # FIXME: 改变处理方式 
-    ref_latents = raw_model.encode_reference_image(ref_img)                      # [B,16,1,hr,wr]
+    # c. src_mask: [B,T,1,H,W] -> [B,1,T,H,W] (channel-first pixel space).
+    src_mask = batch["src_mask"].permute(0, 2, 1, 3, 4).to(device)    # [B,1,T,H,W]
 
-    # c. src_mask: [T,1,H,W] -> [1,T,H,W] -> stack -> [B,1,F,H,W] (pixel space).
-    src_mask = torch.stack([m.permute(1, 0, 2, 3) for m in src_mask], dim=0).to(device)
-    # FIXME: 改变处理方式 
-
-    # d. target latents: cached or encode tgt_video online.
+    # d. target latents: cached (already [B,z,T',H',W']) or encode tgt_video online.
     if cfg.training.cached_tgt_latent:
-        tgt_lat = batch["tgt_latent"]
-        if any(t is None for t in tgt_lat):
+        tgt_latents = batch["tgt_latent"]
+        if not torch.is_tensor(tgt_latents):
             raise RuntimeError(
-                "cached_tgt_latent=True but batch['tgt_latent'] has None entries "
-                "(cache miss). Run the latent cache step or set cached_tgt_latent=false."
+                "cached_tgt_latent=True but batch['tgt_latent'] is not a stacked "
+                "tensor (cache miss). Run the latent cache step or set "
+                "cached_tgt_latent=false."
             )
-        tgt_latents = torch.stack(tgt_lat, dim=0).to(device=device, dtype=dtype)
+        tgt_latents = tgt_latents.to(device=device, dtype=dtype)
     else:
-        tgt_video = torch.stack([v.permute(1, 0, 2, 3) for v in batch["tgt_video"]], dim=0)
+        tgt_video = batch["tgt_video"].permute(0, 2, 1, 3, 4)         # [B,3,T,H,W]
         tgt_latents = raw_model.encode_src_video(tgt_video)
-    # FIXME: 如果tgt latent的确是list的话 那么可以使用 torch.stack 但是 tgt_video不是
 
-    # e. prompt embeds: cached t5 or encode captions. forward wants List[Tensor].
+    # e. prompt embeds: List[Tensor] (variable L). cached t5 or encode captions.
     if cfg.training.cached_t5:
-        t5 = batch["t5_emb"]
+        t5 = batch["t5_emb"]                       # List[[L_i,4096]] or List[None]
         if any(e is None for e in t5):
             raise RuntimeError(
                 "cached_t5=True but batch['t5_emb'] has None entries (cache miss)."
@@ -149,14 +137,12 @@ def prepare_batch(raw_model, batch, cfg, device, dtype):
     #    blank prompt_embeds / ref_latents here. Disabled for now.
 
     return {
-        "noisy_inputs": {
-            "prompt_embeds": prompt_embeds,
-            "ref_latents": ref_latents,
-            "src_latents": src_latents,
-            "src_mask": src_mask,
-        }, #FIXME: 为啥非要noisy inputs这个加一层?? 
-        "tgt_latents": tgt_latents,
-    } #TODO: 标注出来return中内容的形状
+        "prompt_embeds": prompt_embeds,   # List[[L_i, 4096]]
+        "ref_latents":   ref_latents,     # [B, 16, 1, h_ref, w_ref]
+        "src_latents":   src_latents,     # [B, 16, F_lat, h, w]
+        "src_mask":      src_mask,        # [B, 1, T, H, W]
+        "tgt_latents":   tgt_latents,     # [B, 16, F_lat, h, w]
+    }
 
 
 # =============================================================================
@@ -172,6 +158,7 @@ def main() -> None:
     total_steps = int(cfg.train.max_steps)
     ctx = trainer.setup.init_env(cfg, args, total_steps=total_steps)
     accelerator = ctx.accelerator
+    # ctx: 初始化之后的直接信息/对象映射表格 包含: acc, device, dtype, run_name, dir*, gen*
 
     # -------- 3. Build the FACET model --------------------------------------
     # FACETWanModel.__init__ runs: _load_base_components -> _freeze_base -> _init_lora.
@@ -184,7 +171,7 @@ def main() -> None:
     # 3.1 Mark LoRA params trainable (base already frozen in __init__).
     model.set_lora(trainable=True)
 
-    # -------- 4. Trainable-parameter stats (main process; clean names pre-prepare)
+    # -------- 4. Trainable-parameter stats ----------------------------------
     if accelerator.is_main_process:
         trainer.optim.model_stats(model, output_root=ctx.output_root)
 
@@ -253,19 +240,20 @@ def main() -> None:
     # =========================================================================
     # 11. Training loop
     # =========================================================================
+    # NOTE: valid loader没有被放置到acc上 意味着其loader iter出来的dtype&device有所不同
     done = False
     for epoch in range(start_epoch, int(cfg.train.epochs)):
         if done:
             break
-        train_sampler.set_epoch(epoch)   # refresh per-epoch shuffle deterministically
+        train_sampler.set_epoch(epoch)   #NOTE: refresh per-epoch shuffle deterministically
+        # seed = seed + epoch
         model.train()
 
         for batch in train_loader:
             with accelerator.accumulate(model):
-                # a. data prep (encode src/ref online; cached tgt latent + t5)
+                # a. data batch -> forward kwargs
                 prep = prepare_batch(raw_model, batch, cfg, ctx.device, ctx.dtype)
                 tgt_latents = prep["tgt_latents"]
-                fwd = prep["noisy_inputs"]  # FIXME: 不需要fwd 改成直接从prep中索引
                 B = tgt_latents.shape[0]
 
                 # b. FlowMatch noise + target
@@ -276,14 +264,14 @@ def main() -> None:
                 )
                 noisy, target = flow.add_noise(tgt_latents, noise, t)
 
-                # c. forward (3-branch OmniControl attention) -> velocity pred
+                # c. forward -> velocity pred
                 out = model(
                     noisy_latents=noisy,
                     timesteps=t,
-                    prompt_embeds=fwd["prompt_embeds"],
-                    ref_latents=fwd["ref_latents"],
-                    src_latents=fwd["src_latents"],
-                    src_mask=fwd["src_mask"],
+                    prompt_embeds=prep["prompt_embeds"],
+                    ref_latents=prep["ref_latents"],
+                    src_latents=prep["src_latents"],
+                    src_mask=prep["src_mask"],
                 )
                 loss = flow.compute_loss(out["pred"], target, t)
 
@@ -296,7 +284,7 @@ def main() -> None:
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # e. step-gated bookkeeping (only on real optimizer steps)
+            # e. step-gated bookkeeping
             if accelerator.sync_gradients:
                 global_step += 1
                 pbar.update(1)
@@ -312,8 +300,7 @@ def main() -> None:
                 if global_step % int(cfg.train.save_every_steps) == 0:
                     ckpt_mgr.save_last(model, global_step)
 
-                # Validation + metric-driven top-K land in Phase 3. valid.run is
-                # a stub returning {} for now, so log_metrics / save_topk no-op.
+                # TODO: full up validation in Phase 3
                 if global_step % int(cfg.train.val_every_steps) == 0:
                     metrics = trainer.valid.run(model, val_loader, val_sampler, cfg, epoch, global_step)
                     trainer.logger.log_metrics(metrics, global_step)
@@ -326,7 +313,7 @@ def main() -> None:
     pbar.close()
 
     # -------- 12. Tear-down --------------------------------------------------
-    ckpt_mgr.save_last(model, global_step)   # final rolling checkpoint
+    ckpt_mgr.save_last(model, global_step)
     trainer.logger.finish()
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
