@@ -67,7 +67,7 @@ prepare:
     pants:         [0.20, 0.85]
     dress:         [0.25, 0.90]
     hat:           [0.15, 0.80]
-    hair:          [0.30, 0.70]
+    hair:          [0.30, 0.75]
     person:        [0.30, 0.90]
   # 2) quality evaluation model (pyiqa + MANIQA):
   iqa_metric: maniqa

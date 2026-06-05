@@ -29,6 +29,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="deepspeed")
@@ -173,7 +174,7 @@ def main() -> None:
 
     # -------- 4. Trainable-parameter stats ----------------------------------
     if accelerator.is_main_process:
-        trainer.optim.model_stats(model, output_root=ctx.output_root)
+        trainer.optim.model_stats(model, lora_targets=cfg.facet.lora.target_modules, output_root=ctx.output_root)
 
     # -------- 5. Data loaders (rank-aware MultiSampler) ---------------------
     train_loader, val_loader, train_sampler, val_sampler = build_loaders(

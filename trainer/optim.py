@@ -133,7 +133,7 @@ def model_stats(
         if not p.requires_grad:
             continue
         if ("lora_down" in name) or ("lora_up" in name):
-            by_target[_match_target(name)] += p.numel()
+            by_target[_match_target(name, lora_targets)] += p.numel()
             if "lora_down" in name:        # count each LoRALinear once
                 n_lora_modules += 1
 

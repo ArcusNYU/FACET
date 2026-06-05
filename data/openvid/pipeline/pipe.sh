@@ -26,7 +26,7 @@ wait
 # wait
 
 # Stage 2 smoke test:
-# python -m data.openvid.pipeline.main --config "$CFG" --part 1 --limit 50
+# python -m data.openvid.pipeline.main_test --config "$CFG" --part 1 --limit 50
 
 # Stage 3: T5 caption + Wan VAE video latent cache
 #         -> dataset_root/latents/{part}/{ab}/{cd}/{cid}.pt
