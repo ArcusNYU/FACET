@@ -19,6 +19,7 @@ from __future__ import annotations
 from . import config       # noqa: F401
 from . import setup        # noqa: F401
 from . import optim        # noqa: F401
+from . import loader       # noqa: F401
 from . import loss         # noqa: F401
 from . import logger       # noqa: F401
 from . import ckpt         # noqa: F401

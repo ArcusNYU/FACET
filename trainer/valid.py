@@ -10,6 +10,10 @@ Final form:
   - return metrics dict so trainer.ckpt.save_topk can select top-K (cfg.validate.topk).
 """
 
+# TODO: valid.py中有一部分的内容可能是可以被test.py所复用的 
+# 包括但不限于: 实例化fvd feature extractor 以及计算对应的指标 
+# 所以可以让 test.py 使用 from trainer.valid import xxx 来实现复用
+
 from __future__ import annotations
 
 import logging

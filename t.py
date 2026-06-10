@@ -1,23 +1,3 @@
-"""
-train.py
-
-FACET / WAN2.2-TI2V-5B + OmniControl LoRA training entry point.
-
-Layout:
-    0.  argparse + HF offline lock
-    1.  trainer.config.load_merge
-    2.  trainer.setup.init_env
-    3.  FACETWanModel construction + set_lora(trainable)
-    4.  trainer.optim.model_stats
-    5.  loader.build_loaders
-    6.  trainer.optim.build_optimizer / build_lr_scheduler
-    7.  accelerator.prepare
-    8.  FlowMatch objective + CheckpointManager + grad-clip param view
-    9.  trainer.logger.setup
-    10. loop counters
-    11. training loop (validation + metrics land in Phase 3)
-    12. trainer.logger.finish()
-"""
 
 from __future__ import annotations
 
@@ -29,6 +9,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "8")
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="deepspeed")
@@ -53,6 +34,7 @@ from tqdm.auto import tqdm
 from facet.model import FACETWanModel
 from loader import build_loaders
 import trainer  # re-exports trainer.{config,setup,optim,loss,logger,ckpt,valid}
+import tools    # TEMP: non-essential inspection probes (shape/dtype/device/stats)
 
 
 logger = logging.getLogger("facet.train")
@@ -218,6 +200,7 @@ def main() -> None:
     # -------- 10. Loop counters ---------------------------------------------
     global_step = 0
     start_epoch = 0
+    debug = False
 
     if accelerator.is_main_process:
         logger.info(
@@ -267,6 +250,25 @@ def main() -> None:
                 )
                 noisy, target = flow.add_noise(tgt_latents, noise, t)
 
+                # b'. [TEMP/DEBUG] one-shot probe of everything entering the model
+                #     (prep kwargs) + the FlowMatch tensors (t / noisy / target).
+                #     Non-essential: delete once shapes/dtypes/ranges are verified.
+                if debug and accelerator.is_main_process:
+                    tools.inspect(
+                        f"prep + flowmatch @ step {global_step}",
+                        {
+                            "prompt_embeds": prep["prompt_embeds"],
+                            "ref_latents":   prep["ref_latents"],
+                            "src_latents":   prep["src_latents"],
+                            "src_mask":      prep["src_mask"],
+                            "tgt_latents":   prep["tgt_latents"],
+                            "t":             t,
+                            "noisy":         noisy,
+                            "target":        target,
+                        },
+                    )
+                    # debug = True
+
                 # c. forward -> velocity pred
                 out = model(
                     noisy_latents=noisy,
@@ -303,7 +305,6 @@ def main() -> None:
                 if global_step % int(cfg.train.save_every_steps) == 0:
                     ckpt_mgr.save_last(model, global_step)
 
-                # TODO: full up validation in Phase 3
                 if (global_step > int(cfg.train.start_eval_steps)
                         and global_step % int(cfg.train.val_every_steps) == 0):
                     metrics = trainer.valid.run(model, val_loader, val_sampler, cfg, epoch, global_step)

@@ -42,7 +42,7 @@ _STATE: Dict[str, Any] = {
 } # NOTE: 全局变量
 
 
-def setup(accelerator, cfg, output_root: Path) -> None:
+def setup(accelerator, cfg, output_root: Path, track_root: Path) -> None:
     """Dump snapshot, route the tracking store, and init cloud trackers."""
     _STATE["accelerator"] = accelerator
     _STATE["backend"] = (cfg.log.backend or "none").lower()
@@ -50,18 +50,18 @@ def setup(accelerator, cfg, output_root: Path) -> None:
 
     if accelerator.is_main_process:
         output_root = Path(output_root)
+        track_root = Path(track_root)
         # 1. config snapshot
         snap_path = output_root / "config_snapshot.yaml"
         cfg.dump_snapshot(snap_path)
         logger.info("[trainer.logger] config snapshot -> %s", snap_path)
         # 2. metrics.jsonl target (created lazily on first append)
         _STATE["jsonl_path"] = output_root / "metrics.jsonl"
-        # 3. mlflow: keep the tracking store local, under the run dir
+        # 3. mlflow: pin the tracking store to a FIXED path (track_root) so the
+        #    SSH->local mlflow UI mapping never has to change between runs.
         if _STATE["backend"] == "mlflow":
-            os.environ.setdefault(
-                "MLFLOW_TRACKING_URI",
-                (output_root / "logs" / "mlruns").resolve().as_uri(),
-            )
+            track_root.mkdir(parents=True, exist_ok=True)
+            os.environ["MLFLOW_TRACKING_URI"] = track_root.resolve().as_uri()
 
     # 4. init cloud trackers (no-op if accelerator built with log_with=None)
     if _STATE["backend"] in ("mlflow", "tensorboard", "wandb"):

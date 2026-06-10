@@ -44,11 +44,6 @@ from trainer.config import TrainConfig
 
 logger = logging.getLogger(__name__)
 
-# LoRA-able target module suffixes (matches facet/config.yaml lora.target_modules).
-_LORA_TARGETS: Tuple[str, ...] = ("q", "k", "v", "o", "ffn.0", "ffn.2")
-#FIXME: _lora_targets 应该从facet/config.yaml 或者说在需要使用的时候 让train.py传入cfg.facet.lora.target_modules进来
-# 否则后期可能忘了改这里 
-
 
 # 2. Param filtering ----------------------------------------------------------
 

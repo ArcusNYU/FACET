@@ -84,6 +84,7 @@ train:
   log_every_steps:  10
   val_every_steps:  500
   save_every_steps: 1000                      # ckpt snapshot cadence (top-K bookkeeping)
+  start_eval_steps: 10000
 
 # -----------------------------------------------------------------------------
 # 4. run:

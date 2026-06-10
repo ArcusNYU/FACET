@@ -25,6 +25,7 @@ Hidden dims (WAN2.2-TI2V-5B):
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -46,6 +47,17 @@ from utils import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _suppress_stdout(enabled: bool = True):
+    """Silence stdout while DiffSynth loads its model components.
+    """
+    if not enabled or os.environ.get("FACET_DIFFSYNTH_VERBOSE") == "1":
+        yield
+        return
+    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+        yield
 
 
 # ============================================================
@@ -359,12 +371,15 @@ class FACETWanModel(nn.Module):
                 "(expected 'local' or 'huggingface')."
             )
 
-        self.pipe = WanVideoPipeline.from_pretrained(
-            torch_dtype=self.dtype,
-            device=self.device,
-            model_configs=model_configs,
-            tokenizer_config=tokenizer_config,
-        )
+        # DiffSynth prints a large block of load messages to stdout here; mute.
+        with _suppress_stdout():
+            self.pipe = WanVideoPipeline.from_pretrained(
+                torch_dtype=self.dtype,
+                device=self.device,
+                model_configs=model_configs,
+                tokenizer_config=tokenizer_config,
+            )
+        logger.info("[FACET] WanVideoPipeline loaded (dit/t5/vae) from %s", bcfg.dir)
 
         self.dit = self.pipe.dit
         self.vae = self.pipe.vae
@@ -429,10 +444,10 @@ class FACETWanModel(nn.Module):
 
         logger.info("[FACET] Injected LoRA into %d modules.", len(replaced))
         # TODO: 打印lora的模块名 可以删除 仅用于debug
-        for name in replaced[:20]:
-            logger.info("  - %s", name)
-        if len(replaced) > 20:
-            logger.info("  ... and %d more", len(replaced) - 20)
+        # for name in replaced[:20]:
+        #    logger.info("  - %s", name)
+        # if len(replaced) > 20:
+        #    logger.info("  ... and %d more", len(replaced) - 20)
 
     def set_lora(self, trainable: bool = True) -> None:
         """
@@ -1404,7 +1419,7 @@ class FACETWanModel(nn.Module):
 
 
 # ============================================================
-# C. Public pipeline
+# C. Public pipeline (for users)
 # ============================================================
 
 

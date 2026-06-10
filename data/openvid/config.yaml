@@ -58,7 +58,7 @@ prepare:
     pants:         72
     dress:         96
     hat:           32
-    hair:          150
+    hair:          120
     person:        120
   # cv_mask_ratio: [low, high] for (mask_pixels / bbox_area).
   cv_mask_ratio:

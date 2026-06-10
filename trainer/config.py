@@ -158,6 +158,7 @@ class TrainConfig:
     log_every_steps: int = 10
     val_every_steps: int = 500
     save_every_steps: int = 1000
+    start_eval_steps: int = 10000
 
 
 @dataclass
