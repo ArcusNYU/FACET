@@ -32,7 +32,7 @@ import torch
 from tqdm.auto import tqdm
 
 from facet.model import FACETWanModel
-from loader import build_loaders
+import metrics  # root-level shared metric tools (light/heavy + FVD extractor)
 import trainer  # re-exports trainer.{config,setup,optim,loss,logger,ckpt,valid}
 import tools    # TEMP: non-essential inspection probes (shape/dtype/device/stats)
 
@@ -159,7 +159,7 @@ def main() -> None:
         trainer.optim.model_stats(model, lora_targets=cfg.facet.lora.target_modules, output_root=ctx.output_root)
 
     # -------- 5. Data loaders (rank-aware MultiSampler) ---------------------
-    train_loader, val_loader, train_sampler, val_sampler = build_loaders(
+    train_loader, val_loader, train_sampler, val_sampler = trainer.loader.build_loaders(
         cfg_path=cfg.paths.data_config,
         batch_size=int(cfg.train.batch_size),
         num_workers=int(cfg.train.num_workers),
@@ -173,8 +173,9 @@ def main() -> None:
     lr_scheduler = trainer.optim.build_lr_scheduler(optimizer, cfg.train, total_steps=total_steps)
 
     # -------- 7. accelerator.prepare ----------------------------------------
-    # val_loader is intentionally NOT prepared: validation runs as rank-0
-    # inference (avoids DDP all-gather inside the scheduler step).
+    # val_loader is intentionally NOT prepared: trainer.valid forwards through the
+    # UNWRAPPED model on each rank's own shard (no DDP collectives on unequal
+    # per-rank batch counts) and reduces metrics across ranks at the end.
     model, optimizer, train_loader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_loader, lr_scheduler,
     )
@@ -226,7 +227,6 @@ def main() -> None:
     # =========================================================================
     # 11. Training loop
     # =========================================================================
-    # NOTE: valid loader没有被放置到acc上 意味着其loader iter出来的dtype&device有所不同
     done = False
     for epoch in range(start_epoch, int(cfg.train.epochs)):
         if done:
@@ -249,25 +249,6 @@ def main() -> None:
                     device=tgt_latents.device, dtype=tgt_latents.dtype,
                 )
                 noisy, target = flow.add_noise(tgt_latents, noise, t)
-
-                # b'. [TEMP/DEBUG] one-shot probe of everything entering the model
-                #     (prep kwargs) + the FlowMatch tensors (t / noisy / target).
-                #     Non-essential: delete once shapes/dtypes/ranges are verified.
-                if debug and accelerator.is_main_process:
-                    tools.inspect(
-                        f"prep + flowmatch @ step {global_step}",
-                        {
-                            "prompt_embeds": prep["prompt_embeds"],
-                            "ref_latents":   prep["ref_latents"],
-                            "src_latents":   prep["src_latents"],
-                            "src_mask":      prep["src_mask"],
-                            "tgt_latents":   prep["tgt_latents"],
-                            "t":             t,
-                            "noisy":         noisy,
-                            "target":        target,
-                        },
-                    )
-                    # debug = True
 
                 # c. forward -> velocity pred
                 out = model(
@@ -305,20 +286,45 @@ def main() -> None:
                 if global_step % int(cfg.train.save_every_steps) == 0:
                     ckpt_mgr.save_last(model, global_step)
 
+                # f. validation (gated): skip until start_eval_steps, since a full
+                #    val pass (loss over val set + sample generation) is costly.
                 if (global_step > int(cfg.train.start_eval_steps)
                         and global_step % int(cfg.train.val_every_steps) == 0):
-                    metrics = trainer.valid.run(model, val_loader, val_sampler, cfg, epoch, global_step)
-                    trainer.logger.log_metrics(metrics, global_step)
-                    ckpt_mgr.save_topk(model, metrics, global_step)
+                    metrics_dict = trainer.valid.run(
+                        prepare_batch, raw_model, flow,
+                        val_loader, val_sampler, cfg, ctx, global_step,
+                    )  #NOTE: 传入raw_model的原因在于prepare_batch函数中需要使用raw_model进行编码
+                    # 同时raw_model.forward不会触发DDP 能够避免batch大小不一致reduce时出现的卡死问题
+                    trainer.logger.log_metrics(metrics_dict, global_step)
+                    ckpt_mgr.save_topk(model, metrics_dict, global_step)
 
                 if global_step >= total_steps:
                     done = True
                     break
 
     pbar.close()
-
-    # -------- 12. Tear-down --------------------------------------------------
     ckpt_mgr.save_last(model, global_step)
+
+    # -------- 12. Final Evaluation -------------------------------------------
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        # NOTE: heavy metrics are only calculated on main process since it requires gathering all results
+        # reason: FIV / FVD is based on global covariance
+        best = ckpt_mgr.best()
+        if best is not None:
+            best_step = int(best["step"])
+            step_dir = ctx.samples_dir / f"step_{best_step:07d}"
+            fvd_ext = metrics.build_fvd_extractor(cfg.paths.fvd_dir, device=ctx.device)
+            heavy_metrics = trainer.valid.heavy_eval(step_dir, fvd_feature_extractor=fvd_ext)
+            if heavy_metrics:
+                trainer.logger.log_metrics(
+                    {f"heavy_{k}": v for k, v in heavy_metrics.items()}, best_step,
+                )
+                logger.info("[train] heavy metrics @ best step %d: %s", best_step, heavy_metrics)
+        else:
+            logger.info("[train] no best checkpoint recorded; skipping heavy metrics.")
+
+    # -------- 13. Tear-down --------------------------------------------------
     trainer.logger.finish()
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:

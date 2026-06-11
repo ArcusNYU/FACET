@@ -90,6 +90,15 @@ class CheckpointManager:
         """Is score a strictly better than score b under self.direction?"""
         return a < b if self.direction == "min" else a > b
 
+    def best(self) -> Optional[Dict[str, Any]]:
+        """
+        Return the current best registry entry {score, step, path, metrics}, or
+        None if no checkpoint has been ranked yet.
+
+        NOTE: Only the main process maintains the registry
+        """
+        return self._registry[0] if self._registry else None
+
     def _unwrap(self, model):
         return self.accelerator.unwrap_model(model)
 

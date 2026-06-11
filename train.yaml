@@ -18,6 +18,7 @@ paths:
   weight_dir:   "weights/WAN2.2"           # WAN2.2-TI2V-5B base checkpoint root
   run_root:     "runs"                     # per-run output_root parent
   ckpt_root:    "ckpts"                    # exported best/last LoRA + manifest.json
+  fvd_dir:      "weights/I3D"
 
 # -----------------------------------------------------------------------------
 # 1. training:
@@ -81,8 +82,8 @@ train:
     name:          "constant_with_warmup"     # "constant" | "constant_with_warmup"
     warmup_steps:  1000                        # TODO: 涉及更改
 
-  log_every_steps:  10
-  val_every_steps:  500
+  log_every_steps:  50
+  val_every_steps:  1000
   save_every_steps: 1000                      # ckpt snapshot cadence (top-K bookkeeping)
   start_eval_steps: 10000
 
@@ -103,7 +104,7 @@ log:
   backend:         "mlflow"     # "mlflow" | "tensorboard" | "none"
   project_name:    "facet"
   cloud_run_name:  null         # null -> use run_name
-  log_every_steps: 10           # console / mlflow scalar cadence
+  log_every_steps: 50           # console / mlflow scalar cadence
   log_grad_norm:   true
   log_timestep_hist: true       # histogram of sampled t (debug timestep distribution)
 
@@ -112,9 +113,9 @@ log:
 #    Knobs for the in-loop validation (Phase 3). primary_metric drives top-K;
 # -----------------------------------------------------------------------------
 validate:
-  num_samples:        10           # videos generated per validation pass
+  num_samples:        20           # videos generated per validation pass
   num_inference_steps: 50
   cfg_scale:          5.0
-  metrics:            ["psnr", "ssim", "lpips", "clipsim"]  # TODO: may adjust later
+  metrics:            ["psnr", "ssim", "lpips", "fid", "fvd"]  # TODO: may adjust later
   primary_metric:     "lpips"
   topk:               3

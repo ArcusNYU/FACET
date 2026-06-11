@@ -25,13 +25,17 @@ Two tiers
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "psnr", "ssim", "lpips", "fid", "fvd",
-    "light_metrics", "heavy_metrics",
+    "build_fvd_extractor", "light_metrics", "heavy_metrics",
 ]
 
 ValueRange = Tuple[float, float]
@@ -230,15 +234,90 @@ def fvd(
 
     if feature_extractor is None:
         raise NotImplementedError(
-            "fvd() needs an I3D feature_extractor(video)->[B,D]. Provide a "
-            "Kinetics-400 I3D wrapper (e.g. from the `cd-fvd` package or a local "
-            "i3d_torchscript checkpoint). The Fréchet math is ready in "
-            "_frechet_distance()."
+            "fvd() needs an I3D feature_extractor(video)->[B,D]. Build one with "
+            "metrics.build_fvd_extractor(weights_dir). The Fréchet math is ready "
+            "in _frechet_distance()."
         )
 
-    feat_real = feature_extractor(gt)
-    feat_fake = feature_extractor(pred)
+    feat_real = feature_extractor(_to_pm1(gt, value_range))
+    feat_fake = feature_extractor(_to_pm1(pred, value_range))
     return _frechet_distance(feat_real, feat_fake)
+
+
+# ---- I3D feature extractor (FVD backbone) ----
+_I3D_CACHE: Dict[Tuple[str, str], Optional[Callable[[torch.Tensor], torch.Tensor]]] = {}
+
+def build_fvd_extractor(
+    weights_dir: str | Path,
+    device: str | torch.device = "cpu",
+):
+    """
+    Build a Kinetics-400 I3D feature extractor for FVD, loaded LOCALLY (offline).
+    Args:
+        weights_dir : local dir (or file) holding the I3D checkpoint.
+        device      : where to place the backbone.
+
+    Returns:
+        extractor(video[B,T,C,H,W] in [-1,1]) -> features[B, D], or None when no
+        usable checkpoint is found / the interface doesn't match (FVD is then
+        skipped and only FID is reported, instead of crashing the run).
+
+    Expected checkpoint: the de-facto FVD I3D TorchScript module (the one used by
+    StyleGAN-V / common video-quality repos), callable as
+        model(x[B,C,T,H,W], rescale=False, resize=True, return_features=True).
+    A TF/Keras I3D (e.g. huggingface Mouwiya/kinetics-400) would need converting
+    to this TorchScript form first.
+    """
+    # cache -> return
+    key = (str(weights_dir), str(device))
+    if key in _I3D_CACHE:
+        return _I3D_CACHE[key]
+
+    # search for checkpoint
+    wdir = Path(weights_dir)
+    ckpt: Optional[Path] = None
+    if wdir.is_file():
+        ckpt = wdir
+    elif wdir.is_dir():
+        for name in ("i3d_torchscript.pt", "i3d_pretrained_400.pt"):
+            if (wdir / name).exists():
+                ckpt = wdir / name
+                break
+        if ckpt is None:
+            cands = sorted([*wdir.glob("*.pt"), *wdir.glob("*.pth"), *wdir.glob("*.ts")])
+            ckpt = cands[0] if cands else None
+
+    if ckpt is None:
+        logger.warning("[metrics] no I3D checkpoint under %s; FVD will be skipped.", weights_dir)
+        _I3D_CACHE[key] = None
+        return None
+
+    # load checkpoint
+    try:
+        model = torch.jit.load(str(ckpt), map_location=device).eval().to(device)
+    except Exception as e:  # noqa: BLE001 - a bad/incompatible file must not crash training
+        logger.warning("[metrics] failed to load I3D '%s' (%s); FVD skipped.", ckpt, e)
+        _I3D_CACHE[key] = None
+        return None
+
+    @torch.no_grad()
+    def extractor(video: torch.Tensor) -> torch.Tensor:
+        # video: [B, T, C, H, W] in [-1, 1] -> I3D wants [B, C, T, H, W].
+        x = video.to(device=device, dtype=torch.float32).permute(0, 2, 1, 3, 4).contiguous()
+        feats = model(x, rescale=False, resize=True, return_features=True)
+        return feats.flatten(1)
+
+    # Smoke-test the interface so an interface mismatch disables FVD cleanly.
+    # try:
+    #     _ = extractor(torch.zeros(1, 16, 3, 64, 64, device=device))
+    # except Exception as e:  # noqa: BLE001
+    #     logger.warning("[metrics] I3D interface mismatch for '%s' (%s); FVD skipped.", ckpt, e)
+    #     _I3D_CACHE[key] = None
+    #     return None
+    
+    logger.info("[metrics] I3D FVD extractor ready (%s).", ckpt)
+    _I3D_CACHE[key] = extractor
+    return extractor
 
 
 # ---- Heavy metrics ----

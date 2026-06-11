@@ -34,7 +34,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")  # for A100
 import torch
 
-from loader import build_loaders
+from trainer.loader import build_loaders
 from utils import image_to_uint8, mask_to_uint8, video_to_uint8, write_mp4, write_png
 
 

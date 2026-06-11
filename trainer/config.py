@@ -69,6 +69,7 @@ class PathsConfig:
     weight_dir: str = "weights/WAN2.2"
     run_root: str = "runs"
     ckpt_root: str = "ckpts"
+    fvd_dir: str = "weights/I3D"          # local Kinetics-400 I3D for FVD (offline)
 
 
 @dataclass

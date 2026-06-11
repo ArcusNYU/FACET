@@ -10,13 +10,16 @@ Shared by:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import numpy as np
 import subprocess
 
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 
 def image_to_uint8(img: torch.Tensor) -> np.ndarray:
@@ -35,6 +38,25 @@ def video_to_uint8(v: torch.Tensor) -> np.ndarray:
     v = v.detach().cpu().clamp(-1.0, 1.0)
     v = v.add(1.0).mul(127.5).clamp(0, 255).byte()
     return v.permute(0, 2, 3, 1).contiguous().numpy()
+
+
+def read_mp4(path: Union[str, Path]) -> Optional[torch.Tensor]:
+    """Read an mp4 -> [T, 3, H, W] float in [-1, 1]; None if missing/unreadable.
+    """
+    if not Path(path).exists():
+        return None
+    try:
+        from decord import VideoReader, cpu
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[utils] decord unavailable (%s); cannot read %s", e, path)
+        return None
+    try:
+        vr = VideoReader(str(path), ctx=cpu(0))
+        arr = vr.get_batch(range(len(vr))).asnumpy()        # [T, H, W, 3] uint8
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[utils] failed reading %s: %s", path, e)
+        return None
+    return torch.from_numpy(arr).permute(0, 3, 1, 2).float().div_(127.5).sub_(1.0)
 
 
 # ============================================================
