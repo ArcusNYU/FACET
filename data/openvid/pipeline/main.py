@@ -49,7 +49,7 @@ import fcntl
 import hashlib
 import json
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "8")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0") # for A100
 import warnings
 warnings.filterwarnings(

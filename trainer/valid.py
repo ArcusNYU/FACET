@@ -287,11 +287,17 @@ def _eval_gen(
 # =============================================================================
 def heavy_eval(
     step_dir,
-    fvd_feature_extractor=None,
+    fvd_dir=None,
+    fid_dir=None,
     value_range: Tuple[float, float] = (-1.0, 1.0),
 ) -> Dict[str, float]:
     """
     Heavy metrics over the pred/gt pairs saved under step_dir/<clip_id>/{pred,gt}.mp4.
+
+    `fvd_dir` / `fid_dir` are the local weight dirs (cfg.paths.fvd_dir /
+    cfg.paths.inception_dir); they are forwarded to metrics.heavy_metrics, which
+    resolves + caches the I3D / InceptionV3 backbones on demand. Either may be
+    None (FVD is then skipped; FID falls back to the torchmetrics default).
 
     NOTE: clips are stacked into one [N, T, 3, H, W] tensor (kept on CPU so FID's
     InceptionV3 never OOMs the GPU). For large N this should be batched/streamed.
@@ -323,5 +329,7 @@ def heavy_eval(
 
     logger.info("[trainer.valid] heavy_eval: %d clip pair(s), %d frames each.", pred.shape[0], t_min)
     return metrics.heavy_metrics(
-        pred, gt, value_range=value_range, fvd_feature_extractor=fvd_feature_extractor,
+        pred, gt, value_range=value_range,
+        fvd_dir=fvd_dir,
+        fid_dir=fid_dir,
     )

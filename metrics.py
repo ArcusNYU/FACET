@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "psnr", "ssim", "lpips", "fid", "fvd",
-    "build_fvd_extractor", "light_metrics", "heavy_metrics",
+    "light_metrics", "heavy_metrics",
 ]
 
 ValueRange = Tuple[float, float]
@@ -196,17 +196,84 @@ def _frechet_distance(feat_real: torch.Tensor, feat_fake: torch.Tensor, eps: flo
     # d^2 = (mu1 - mu2)^2 + trace(sigma1 + sigma2 - 2 * covmean)
 
 
+# ---- InceptionV3 feature extractor (FID backbone) ----
+_FID_INCEPTION_CACHE: Dict[Tuple[str, str], Optional["torch.nn.Module"]] = {}
+
+
+def _build_fid_inception(fid_dir: str | Path, device: str) -> Optional["torch.nn.Module"]:
+    """
+    Build (and cache) a NoTrainInceptionV3 feature extractor from local weights.
+    """
+    key = (str(fid_dir), str(device))
+    if key in _FID_INCEPTION_CACHE:
+        return _FID_INCEPTION_CACHE[key]
+
+    # resolve the checkpoint file:
+    p = Path(fid_dir)
+    ckpt: Optional[Path] = None
+    if p.is_file():
+        ckpt = p
+    elif p.is_dir():
+        preferred = p / "weights-inception-2015-12-05-6726825d.pth"
+        if preferred.exists():
+            ckpt = preferred
+        else:
+            cands = sorted([*p.glob("*.pth"), *p.glob("*.pt")])
+            ckpt = cands[0] if cands else None
+
+    if ckpt is None:
+        logger.warning(
+            "[metrics] no InceptionV3 checkpoint under %s; FID falls back to the "
+            "torchmetrics default (online download).", fid_dir,
+        )
+        _FID_INCEPTION_CACHE[key] = None
+        return None
+
+    try:
+        from torchmetrics.image.fid import NoTrainInceptionV3
+
+        inception = NoTrainInceptionV3(
+            name="inception-v3-compat",
+            features_list=["2048"],
+            feature_extractor_weights_path=str(ckpt),
+        ).to(device).eval()
+    except Exception as e:  # noqa: BLE001 - a bad file must not crash the run
+        logger.warning("[metrics] failed to load InceptionV3 '%s' (%s); using default.", ckpt, e)
+        _FID_INCEPTION_CACHE[key] = None
+        return None
+
+    logger.info("[metrics] InceptionV3 FID extractor ready (%s).", ckpt)
+    _FID_INCEPTION_CACHE[key] = inception
+    return inception
+
+
 # ---- FID ----
-def fid(pred: torch.Tensor, gt: torch.Tensor, value_range: ValueRange = _DEFAULT_RANGE) -> float:
+def fid(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    value_range: ValueRange = _DEFAULT_RANGE,
+    fid_dir: str | Path | None = None,
+) -> float:
     """
     Frame-level Fréchet Inception Distance (treats every frame as an image).
 
     Lower is better. Backed by torchmetrics' InceptionV3 feature extractor.
+
+    `fid_dir` points at the local InceptionV3-FID checkpoint (file or directory,
+    e.g. cfg.paths.inception_dir). When None, torchmetrics' default feature
+    extractor is used (which would download weights online).
     """
     from torchmetrics.image.fid import FrechetInceptionDistance
 
     p, g = _prep_pair(pred, gt, value_range)  # [N, 3, H, W] in [0, 1]
-    metric = FrechetInceptionDistance(feature=2048, normalize=True).to(p.device)
+
+    feature: object = 2048
+    if fid_dir is not None:
+        inception = _build_fid_inception(fid_dir, str(p.device))
+        if inception is not None:
+            feature = inception
+
+    metric = FrechetInceptionDistance(feature=feature, normalize=True).to(p.device)
     metric.update(g, real=True)
     metric.update(p, real=False)
     # real: whether the data is ground truth or generated
@@ -218,43 +285,47 @@ def fvd(
     pred: torch.Tensor,
     gt: torch.Tensor,
     value_range: ValueRange = _DEFAULT_RANGE,
-    feature_extractor: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> float:
+    fvd_dir: str | Path | None = None,
+) -> Optional[float]:
     """
     Clip-level Fréchet Video Distance, lower is better.
 
-    FVD = Fréchet distance between I3D features of the real vs generated clips,
-        feature_extractor(video) -> [B, D] features
-            video : [B, T, C, H, W] in `value_range`
+    `fvd_dir` points at the local I3D checkpoint (file or directory,
+    e.g. cfg.paths.fvd_dir). Returns None when fvd_dir is None or no usable I3D
+    backbone is found, so callers can simply skip reporting FVD.
+
+    FVD = Fréchet distance between I3D features of the real vs generated clips
+    (each clip: [B, T, C, H, W] in `value_range`).
     """
+    if fvd_dir is None:
+        return None
+
     pred = _as_5d(pred)
     gt = _as_5d(gt)
     if pred.shape != gt.shape:
         raise ValueError(f"pred/gt shape mismatch: {tuple(pred.shape)} vs {tuple(gt.shape)}")
 
-    if feature_extractor is None:
-        raise NotImplementedError(
-            "fvd() needs an I3D feature_extractor(video)->[B,D]. Build one with "
-            "metrics.build_fvd_extractor(weights_dir). The Fréchet math is ready "
-            "in _frechet_distance()."
-        )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    extractor = _build_fvd_extractor(fvd_dir, device=device)
+    if extractor is None:
+        return None
 
-    feat_real = feature_extractor(_to_pm1(gt, value_range))
-    feat_fake = feature_extractor(_to_pm1(pred, value_range))
+    feat_real = extractor(_to_pm1(gt, value_range))
+    feat_fake = extractor(_to_pm1(pred, value_range))
     return _frechet_distance(feat_real, feat_fake)
 
 
 # ---- I3D feature extractor (FVD backbone) ----
 _I3D_CACHE: Dict[Tuple[str, str], Optional[Callable[[torch.Tensor], torch.Tensor]]] = {}
 
-def build_fvd_extractor(
-    weights_dir: str | Path,
+def _build_fvd_extractor(
+    weights_dir: str | Path | None,
     device: str | torch.device = "cpu",
 ):
     """
     Build a Kinetics-400 I3D feature extractor for FVD, loaded LOCALLY (offline).
     Args:
-        weights_dir : local dir (or file) holding the I3D checkpoint.
+        weights_dir : local dir (or file) holding the I3D checkpoint (or None).
         device      : where to place the backbone.
 
     Returns:
@@ -268,6 +339,9 @@ def build_fvd_extractor(
     A TF/Keras I3D (e.g. huggingface Mouwiya/kinetics-400) would need converting
     to this TorchScript form first.
     """
+    if weights_dir is None:
+        return None
+
     # cache -> return
     key = (str(weights_dir), str(device))
     if key in _I3D_CACHE:
@@ -325,10 +399,19 @@ def heavy_metrics(
     pred: torch.Tensor,
     gt: torch.Tensor,
     value_range: ValueRange = _DEFAULT_RANGE,
-    fvd_feature_extractor: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    fvd_dir: str | Path | None = None,
+    fid_dir: str | Path | None = None,
 ) -> Dict[str, float]:
-    """Compute the distribution-level metrics (FID always; FVD if a backbone is given)."""
-    out: Dict[str, float] = {"fid": fid(pred, gt, value_range)}
-    if fvd_feature_extractor is not None:
-        out["fvd"] = fvd(pred, gt, value_range, feature_extractor=fvd_feature_extractor)
-    return out
+    """
+    Distribution-level metrics.
+
+    FID uses `fid_dir` (local InceptionV3 weights); FVD uses `fvd_dir` (local I3D
+    weights). Each backbone is resolved + cached inside fid()/fvd(); either dir
+    may be None — FID then falls back to the torchmetrics default, and FVD is
+    dropped from the result when its backbone is unavailable.
+    """
+    out: Dict[str, Optional[float]] = {
+        "fid": fid(pred, gt, value_range, fid_dir=fid_dir),
+        "fvd": fvd(pred, gt, value_range, fvd_dir=fvd_dir),
+    }
+    return {k: v for k, v in out.items() if v is not None}

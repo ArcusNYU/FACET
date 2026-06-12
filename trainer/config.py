@@ -70,6 +70,7 @@ class PathsConfig:
     run_root: str = "runs"
     ckpt_root: str = "ckpts"
     fvd_dir: str = "weights/I3D"          # local Kinetics-400 I3D for FVD (offline)
+    inception_dir: str = "weights/INC"    # local InceptionV3 weights for FID (offline)
 
 
 @dataclass

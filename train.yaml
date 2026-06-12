@@ -13,12 +13,13 @@
 #    project dir that holds train.py), so downstream code never re-resolves cwd.
 # -----------------------------------------------------------------------------
 paths:
-  facet_config: "facet/config.yaml"        # model config (single source of truth)
-  data_config:  "data/config.yaml"         # dataset registry (already wired in loader.py)
-  weight_dir:   "weights/WAN2.2"           # WAN2.2-TI2V-5B base checkpoint root
-  run_root:     "runs"                     # per-run output_root parent
-  ckpt_root:    "ckpts"                    # exported best/last LoRA + manifest.json
-  fvd_dir:      "weights/I3D"
+  facet_config:  "facet/config.yaml"        # model config (single source of truth)
+  data_config:   "data/config.yaml"         # dataset registry (already wired in loader.py)
+  weight_dir:    "weights/WAN2.2"           # WAN2.2-TI2V-5B base checkpoint root
+  run_root:      "runs"                     # per-run output_root parent
+  ckpt_root:     "ckpts"                    # exported best/last LoRA + manifest.json
+  fvd_dir:       "weights/I3D"
+  inception_dir: "weights/INC"
 
 # -----------------------------------------------------------------------------
 # 1. training:

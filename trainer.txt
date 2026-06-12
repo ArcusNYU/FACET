@@ -59,10 +59,10 @@ val: loss & metrics
 
 ===================================================
 train.py启动逻辑 & train.yaml
-launch_train.py根据train.yaml中的配置 在引用并覆盖部分 facet/config.yaml中的配置的情况下
+launch_train.py用于启动 train.py 目前train.py支持的args只有--train_yaml 其他都靠train.yaml & facet/config.py 在train.py内部自动实现
 拼装accelerate launch 命令 并启动训练 所以是一种很常规的启动方式
 对于启动方式可在train.yaml中选择 auto/python/accelerate三种shell命令启动方式 
-如果选择了 auto 那么就看 gpu 写的是几个 如果是1个就用python启动 如果是多个就用accelerate启动 
+如果选择了 auto 那么就看 gpu 写的是几个 如果是1个就用python启动 如果是多个就用accelerate启动 详见train.yaml
 
 train.yaml需要包含的内容:
 路径 例如如上提到的 path
