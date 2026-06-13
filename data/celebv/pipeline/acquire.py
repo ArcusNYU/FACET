@@ -1,9 +1,9 @@
 """
 CelebV-HQ downloader + raw clip extractor.
+Dataset Pipeline Stage 1 - Acquisition.
+Reference: https://github.com/celebv-text/CelebV-Text/blob/main/download_and_process.py
 
-Pipeline position: this is the *acquisition* stage, BEFORE data/celebv/pipeline/main.py.
-It produces the raw_root layout described in data/celebv/info.txt:
-
+It produces the raw_root layout:
     {raw_root}/
         downloaded.json          # {clip_id: {...}} of successfully extracted clips (resume ledger)
         failed.json              # {clip_id: {...}} clips whose YouTube source was unavailable
@@ -12,7 +12,7 @@ It produces the raw_root layout described in data/celebv/info.txt:
         _raw_tmp/
             {ytb_id}.mp4         # full YouTube download, deleted once all its clips are extracted
 
-Identity model (IMPORTANT):
+Identity model:
     CelebV-HQ's celebvhq_info.json `clips` keys look like "M2Ohb0FAaJU_1", i.e.
     "{ytb_id}_{n}". ONE youtube video (ytb_id) can yield MULTIPLE clips (different
     time windows / bboxes). So:
@@ -299,7 +299,7 @@ def pending_per_ytb(selected: List[Clip]) -> Dict[str, int]:
 # ============================================================
 def main():
     p = argparse.ArgumentParser("CelebV-HQ downloader + raw clip extractor")
-    p.add_argument("--info", default="data/celebv/celebvhq_info.json")
+    p.add_argument("--info", default="data/celebv/pipeline/celebvhq_info.json")
     p.add_argument("--raw-root", default="/mnt/highspeed/users/Arcus/CELEBV")
     p.add_argument("--limit", type=int, default=200,
                    help="clips to acquire this run (-1 = all remaining)")
