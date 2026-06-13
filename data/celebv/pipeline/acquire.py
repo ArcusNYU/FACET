@@ -20,13 +20,6 @@ Identity model:
       - ytb_id   = the youtube id (shared)            -> names _raw_tmp/{ytb_id}.mp4
     We download each ytb_id ONCE and extract all of its clips from that single file.
 
-bbox crop strategy (deliberate choice, see download.py PR discussion):
-    We do NOT resize to the 832x480 training canvas here. We crop a single-person-safe
-    region (face bbox expanded with extra headroom for hair) at native resolution and
-    leave the aspect-ratio-preserving resize+pad to data/celebv/pipeline/main.py
-    (same `fit_pad` path as openvid). This keeps every dataset on one geometric code
-    path and avoids baking in an irreversible distortion at acquisition time.
-
 Concurrency:
     yt-dlp (network) and ffmpeg (cpu) both run as external subprocesses, so a
     ThreadPoolExecutor gives real parallelism (GIL is released while waiting on the
@@ -34,8 +27,8 @@ Concurrency:
     worth of raw videos, extract them, persist the ledger, free the raw files, repeat.
 
 Example:
-    python data/celebv/download.py \
-        --info data/celebv/celebvhq_info.json \
+    python data/celebv/pipeline/acquire.py \
+        --info data/celebv/pipeline/celebvhq_info.json \
         --raw-root /mnt/highspeed/users/Arcus/CELEBV \
         --limit 500 --pool 100 --workers 6 --proc-workers 12
 """
@@ -54,6 +47,11 @@ import cv2
 from tqdm import tqdm
 
 
+# Optional YouTube cookies file, expected next to this script
+# (data/celebv/pipeline/cookies.txt). Used to authenticate yt-dlp requests.
+_COOKIES_PATH = Path(__file__).resolve().parent / "cookies.txt"
+
+
 # ============================================================
 #                     info.json parsing
 # ============================================================
@@ -62,7 +60,9 @@ Clip = Tuple[str, str, Tuple[float, float], Tuple[float, float, float, float]]
 
 
 def load_clips(info_path: Path) -> List[Clip]:
-    """Flatten celebvhq_info.json['clips'] into an ordered list of Clip tuples.
+    """
+    celebvhq_info.json -> clip tuples
+    Flatten celebvhq_info.json['clips'] into an ordered list of Clip tuples.
     Order follows json insertion order, so clips sharing a ytb_id stay adjacent.
     """
     with open(info_path, "r", encoding="utf-8") as f:
@@ -78,9 +78,9 @@ def load_clips(info_path: Path) -> List[Clip]:
 
 
 # ============================================================
-#                     resume ledger (json)
+#                     resume record (json)
 # ============================================================
-def load_ledger(path: Path) -> Dict[str, dict]:
+def load_record(path: Path) -> Dict[str, dict]:
     if not path.exists():
         return {}
     try:
@@ -90,8 +90,8 @@ def load_ledger(path: Path) -> Dict[str, dict]:
         return {}
 
 
-def save_ledger(path: Path, data: Dict[str, dict]) -> None:
-    """Atomic json dump (tmp -> replace) so a kill never corrupts the ledger."""
+def save_record(path: Path, data: Dict[str, dict]) -> None:
+    """Atomic json dump (tmp -> replace)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -102,33 +102,70 @@ def save_ledger(path: Path, data: Dict[str, dict]) -> None:
 # ============================================================
 #                     download (yt-dlp)
 # ============================================================
-def download_raw(
+def _clean_partials(raw_path: Path) -> None:
+    """Remove leftover fragments/.part/.ytdl for this ytb_id before a retry.
+
+    aria2c and the native downloader use incompatible partial-file layouts, so a
+    half-finished aria2c download must be wiped before falling back, otherwise
+    yt-dlp may try to resume a corrupt file. Only touches files for THIS ytb_id
+    (named `{stem}.*` in the tmp dir), leaving sibling downloads untouched.
+    """
+    try:
+        for p in raw_path.parent.glob(raw_path.stem + ".*"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _run_ytdlp(
     ytb_id: str,
     raw_path: Path,
     proxy: Optional[str],
-    use_aria2c: bool,
     timeout: int,
+    downloader: str,
+    retries: int,
+    fragment_retries: int,
+    player_client: str,
+    aria2c_x: int,
 ) -> Tuple[bool, str]:
-    """Download a full youtube video to raw_path. Returns (ok, reason).
-    Skips the network call if raw_path already exists (cross-pool reuse).
-    """
-    if raw_path.exists() and raw_path.stat().st_size > 0:
-        return True, "cached"
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    """Run a single yt-dlp invocation with the chosen `downloader`.
 
+    downloader: "aria2c" (external multi-conn) or "native" (yt-dlp builtin HTTP).
+    Returns (ok, reason). On failure reason carries a short tag / stderr tail.
+    """
     cmd: List[str] = ["yt-dlp"]
     if proxy:
         cmd += ["--proxy", proxy]
+    # cookies.txt lives next to this script; pass it so requests are authenticated
+    # (avoids YouTube rate-limiting / "Sign in to confirm" throttling).
+    if _COOKIES_PATH.exists():
+        cmd += ["--cookies", str(_COOKIES_PATH)]
     cmd += [
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
         "--skip-unavailable-fragments",
+        "--concurrent-fragments", "8",     # parallel DASH/HLS fragment download
         "--merge-output-format", "mp4",
+        # --- native retry / 403 robustness ---------------------------------
+        "--retries", str(retries),
+        "--fragment-retries", str(fragment_retries),
+        # exponential backoff on HTTP errors (incl. 403) and fragment failures
+        "--retry-sleep", "http:exp=1:60",
+        "--retry-sleep", "fragment:exp=1:30",
+        # try multiple player clients so a signature/403 from one path can be
+        # retried via another (android/web_safari avoid many sig+throttle issues)
+        "--extractor-args", f"youtube:player_client={player_client}",
         "-o", str(raw_path),
     ]
-    if use_aria2c:
+    if downloader == "aria2c":
+        # -m 5 (max-tries) + --retry-wait so aria2c itself retries a 403 a few
+        # times before yt-dlp gives up and we fall back to the native downloader.
         cmd += [
             "--external-downloader", "aria2c",
-            "--external-downloader-args", "aria2c:-x 16 -k 1M",
+            "--external-downloader-args",
+            f"aria2c:-x {aria2c_x} -k 1M -m 5 --retry-wait 3",
         ]
     cmd += [f"https://www.youtube.com/watch?v={ytb_id}"]
 
@@ -141,8 +178,59 @@ def download_raw(
 
     if proc.returncode != 0 or not raw_path.exists():
         tail = proc.stderr.decode(errors="ignore")[-200:] if proc.stderr else ""
-        return False, f"yt-dlp-fail:{tail}"
+        return False, tail.strip() or "unknown-error"
     return True, "ok"
+
+
+def download_raw(
+    ytb_id: str,
+    raw_path: Path,
+    proxy: Optional[str],
+    use_aria2c: bool,
+    timeout: int,
+    retries: int = 10,
+    fragment_retries: int = 10,
+    player_client: str = "default,android",
+    aria2c_x: int = 4,
+) -> Tuple[bool, str]:
+    """Download a full youtube video to raw_path. Returns (ok, reason).
+
+    Strategy:
+      1. If enabled, try aria2c (fast multi-connection). YouTube's googlevideo
+         CDN frequently 403s aria2c (header/rate/range mismatch on the signed
+         URL), and aria2c fails the whole file instead of degrading gracefully.
+      2. On ANY aria2c failure, wipe partials and fall back to yt-dlp's native
+         HTTP downloader, which is far more CDN-friendly (consistent headers,
+         honours the signed URL pacing) and retries 403s with backoff.
+
+    Skips the network call entirely if raw_path already exists (cross-pool reuse).
+    """
+    if raw_path.exists() and raw_path.stat().st_size > 0:
+        return True, "cached"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ---- attempt 1: aria2c (optional, fast) ----
+    if use_aria2c:
+        ok, info = _run_ytdlp(
+            ytb_id, raw_path, proxy, timeout, "aria2c",
+            retries, fragment_retries, player_client, aria2c_x,
+        )
+        if ok:
+            return True, "ok:aria2c"
+        if info in ("yt-dlp-not-installed", "timeout"):
+            return False, info
+        _clean_partials(raw_path)   # discard aria2c partial before fallback
+
+    # ---- attempt 2: native yt-dlp HTTP downloader (CDN-friendly fallback) ----
+    ok, info = _run_ytdlp(
+        ytb_id, raw_path, proxy, timeout, "native",
+        retries, fragment_retries, player_client, aria2c_x,
+    )
+    if ok:
+        return True, "ok:native"
+    if info in ("yt-dlp-not-installed", "timeout"):
+        return False, info
+    return False, f"yt-dlp-fail:{info[-200:]}"
 
 
 # ============================================================
@@ -190,6 +278,7 @@ def compute_crop_px(
     x0 = int(round(l * W))
     x1 = int(round(r * W))
 
+    # NOTE： ffmpeg requires even dims and minimum width/height of 2
     w = max(x1 - x0, 2)
     h = max(y1 - y0, 2)
     # even dims, and keep within frame
@@ -300,17 +389,27 @@ def pending_per_ytb(selected: List[Clip]) -> Dict[str, int]:
 def main():
     p = argparse.ArgumentParser("CelebV-HQ downloader + raw clip extractor")
     p.add_argument("--info", default="data/celebv/pipeline/celebvhq_info.json")
-    p.add_argument("--raw-root", default="/mnt/highspeed/users/Arcus/CELEBV")
+    p.add_argument("--raw-root", default="/mnt/highspeed/users/Arcus/CELEBV_DATA")
     p.add_argument("--limit", type=int, default=200,
                    help="clips to acquire this run (-1 = all remaining)")
+    # NOTE: preprocess until 200 clips are acquired
     p.add_argument("--pool", type=int, default=100,
                    help="download this many clips' raw videos, then extract, then repeat")
-    p.add_argument("--workers", type=int, default=6, help="concurrent yt-dlp downloads")
+    p.add_argument("--workers", type=int, default=3, help="concurrent yt-dlp downloads")
     p.add_argument("--proc-workers", type=int, default=12, help="concurrent ffmpeg crops")
     p.add_argument("--proxy", default=None)
-    p.add_argument("--no-aria2c", action="store_true", help="disable aria2c external downloader")
+    p.add_argument("--no-aria2c", action="store_true",
+                   help="disable aria2c entirely; use only yt-dlp native HTTP downloader")
+    p.add_argument("--aria2c-x", type=int, default=4,
+                   help="aria2c connections per server (-x); keep small (<=4) to avoid 403")
+    p.add_argument("--retries", type=int, default=10,
+                   help="yt-dlp --retries (whole-download retries with backoff)")
+    p.add_argument("--fragment-retries", type=int, default=10,
+                   help="yt-dlp --fragment-retries (per-fragment retries with backoff)")
+    p.add_argument("--player-client", default="tv,web_safari,mweb",
+                   help="yt-dlp youtube:player_client list to bypass signature/403 issues")
     p.add_argument("--dl-timeout", type=int, default=900, help="per-video yt-dlp timeout (s)")
-    p.add_argument("--crop-pad", type=float, default=0.10,
+    p.add_argument("--crop-pad", type=float, default=0.20,
                    help="symmetric bbox outer padding (fraction of bbox side)")
     p.add_argument("--crop-top-extra", type=float, default=0.15,
                    help="extra upward padding for hair (fraction of bbox height)")
@@ -329,8 +428,8 @@ def main():
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     clips = load_clips(Path(args.info))
-    downloaded = load_ledger(downloaded_path)
-    failed = load_ledger(failed_path)
+    downloaded = load_record(downloaded_path)
+    failed = load_record(failed_path)
     print(f"[celebv] total clips in info.json : {len(clips)}")
     print(f"[celebv] already downloaded       : {len(downloaded)}")
     print(f"[celebv] previously failed        : {len(failed)}")
@@ -357,7 +456,9 @@ def main():
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             fut = {
                 ex.submit(download_raw, ytb, tmp_dir / f"{ytb}.mp4",
-                          args.proxy, not args.no_aria2c, args.dl_timeout): ytb
+                          args.proxy, not args.no_aria2c, args.dl_timeout,
+                          args.retries, args.fragment_retries,
+                          args.player_client, args.aria2c_x): ytb
                 for ytb in batch_ytbs
             }
             for f in as_completed(fut):
@@ -401,8 +502,8 @@ def main():
                 pbar.update(1)
 
         # ---- phase 3: persist ledgers + free raw videos no longer owed ----
-        save_ledger(downloaded_path, downloaded)
-        save_ledger(failed_path, failed)
+        save_record(downloaded_path, downloaded)
+        save_record(failed_path, failed)
         if not args.keep_raw:
             for ytb in batch_ytbs:
                 if owe.get(ytb, 0) <= 0:

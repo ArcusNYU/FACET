@@ -200,6 +200,29 @@ def _frechet_distance(feat_real: torch.Tensor, feat_fake: torch.Tensor, eps: flo
 _FID_INCEPTION_CACHE: Dict[Tuple[str, str], Optional["torch.nn.Module"]] = {}
 
 
+class _FidInception(torch.nn.Module):
+    """
+    Adapter so a LOCAL torch_fidelity InceptionV3 survives torchmetrics' FID init.
+
+    torch_fidelity's net strictly requires a *uint8* tensor on its own device and
+    raises otherwise. This wrapper coerces device+dtype, so the probe succeeds.
+    During the real FID.update() the input is already uint8 on-device, so this is
+    a no-op there.
+    """
+
+    def __init__(self, inner: torch.nn.Module):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dev = next(self.inner.parameters()).device
+        if x.device != dev:
+            x = x.to(dev)
+        if x.dtype != torch.uint8:
+            x = x.clamp(0, 255).to(torch.uint8)
+        return self.inner(x)
+
+
 def _build_fid_inception(fid_dir: str | Path, device: str) -> Optional["torch.nn.Module"]:
     """
     Build (and cache) a NoTrainInceptionV3 feature extractor from local weights.
@@ -232,11 +255,12 @@ def _build_fid_inception(fid_dir: str | Path, device: str) -> Optional["torch.nn
     try:
         from torchmetrics.image.fid import NoTrainInceptionV3
 
-        inception = NoTrainInceptionV3(
+        inner = NoTrainInceptionV3(
             name="inception-v3-compat",
             features_list=["2048"],
             feature_extractor_weights_path=str(ckpt),
         ).to(device).eval()
+        inception = _FidInception(inner).to(device).eval()
     except Exception as e:  # noqa: BLE001 - a bad file must not crash the run
         logger.warning("[metrics] failed to load InceptionV3 '%s' (%s); using default.", ckpt, e)
         _FID_INCEPTION_CACHE[key] = None

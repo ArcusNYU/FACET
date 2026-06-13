@@ -75,7 +75,7 @@ run_root/data/celebv 的文件结构如下:
 接下来是最重要的文件结构说明
 首先下载下来后数据集的原始结构为:
 
-\raw_root /mnt/highspeed/users/Arcus/CELEBV
+\raw_root /mnt/highspeed/users/Arcus/CELEBV_DATA
     |-- downloaded.json # 记录已经下载过后的clip_id/ytb_id download.py会跳过该文档中的视频 因为其已经被下好
     |
     |-- clip        # 存储clip原始数据文件夹

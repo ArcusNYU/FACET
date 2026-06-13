@@ -1,6 +1,5 @@
 # model libraries
-# CLIP-IQA/
-# DiffSynth/
+DiffSynth/
 OminiControl/
 VACE/
 weights/
@@ -11,6 +10,8 @@ WAN2.2/
 
 schp_results/
 facet/facet_vace/
+
+cookies.txt
 
 # python caches
 __pycache__/

@@ -27,7 +27,7 @@ latent_cache_dir: /mnt/highspeed/users/Arcus/celebv/latents
 # for main.py
 prepare:
   weight_dir: weights
-  raw_video_root: /mnt/highspeed/users/Arcus/CELEBV  
+  raw_video_root: /mnt/highspeed/users/Arcus/CELEBV_DATA  
   out_root: /mnt/highspeed/users/Arcus/celebv             # = data_root
   index_file: index.jsonl
   category: hair       # TODO: multi-category in later iterations

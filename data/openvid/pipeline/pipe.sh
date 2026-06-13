@@ -34,8 +34,8 @@ wait
 python -m data.openvid.pipeline.cache --config "$CFG"
 # T5+VAE ~35GB each
 # Single A100 80GB with two co-resident workers:
-# CUDA_VISIBLE_DEVICES=0 python -m data.openvid.pipeline.cache --shard 0/2 &
-# CUDA_VISIBLE_DEVICES=0 python -m data.openvid.pipeline.cache --shard 1/2 &
+# python -m data.openvid.pipeline.cache --shard 0/2 &
+# python -m data.openvid.pipeline.cache --shard 1/2 &
 # wait
 # 
 # Multi GPU (one shard per card):

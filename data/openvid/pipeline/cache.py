@@ -32,7 +32,7 @@ import argparse
 import hashlib
 import json
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "3")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "8")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")  # A100
 
 import warnings
@@ -54,8 +54,8 @@ _WAN_PATH = Path(__file__).resolve().parents[3] / "WAN"
 if str(_WAN_PATH) not in sys.path:
     sys.path.insert(0, str(_WAN_PATH))
 
-from wan.modules.t5 import T5EncoderModel       # noqa: E402
-from wan.modules.vae2_2 import Wan2_2_VAE       # noqa: E402
+from WAN.wan.modules.t5 import T5EncoderModel       # noqa: E402
+from WAN.wan.modules.vae2_2 import Wan2_2_VAE       # noqa: E402
 
 from data.utils import load_cfg                 # noqa: E402
 
@@ -238,7 +238,7 @@ def main():
     device = torch.device(args.device)
 
     # ---- load Wan models ----
-    wan_root = weight_dir / "WAN"
+    wan_root = weight_dir / "WAN2.2"
     t5_ckpt = wan_root / "models_t5_umt5-xxl-enc-bf16.pth"
     t5_tok = wan_root / "google" / "umt5-xxl"
     vae_ckpt = wan_root / "Wan2.2_VAE.pth"
