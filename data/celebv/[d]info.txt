@@ -1,0 +1,100 @@
+https://github.com/CelebV-HQ/CelebV-HQ
+
+给出的数据集下载json索引结构样例如下:
+
+{
+"meta_info": 
+    {
+        "appearance_mapping": ["Blurry", "Male", "Young", ...],  // appearance attributes
+        "action_mapping": ["blow", "chew", "close_eyes", ...]    // action attributes
+    },  
+
+"clips": 
+{
+    "M2Ohb0FAaJU_1":  // clip 1 
+    {
+        "ytb_id": "M2Ohb0FAaJU",                                   // youtube id
+        "duration": {"start_sec": 81.62, "end_sec": 86.17},        // start and end times in the original video
+        "bbox": {"top": 0.0, "bottom": 0.8815, "left": 0.1964, "right": 0.6922},  // bounding box
+        "attributes":                                              // attributes information 
+        {
+            "appearance": [0, 0, 1, ...],                          // same order as the "appearance_mapping"
+            "action": [0, 0, 0, ...],                              // same order as the "action_mapping"
+            "emotion": {"sep_flag": false, "labels": "neutral"}    // only one emotion in the clip 
+         }, 
+         "version": "v0.1"
+           
+    },
+    "_0tf2n3rlJU_0":  // clip 2 
+    {
+        "ytb_id": "_0tf2n3rlJU", 
+        "duration": {"start_sec": 52.72, "end_sec": 56.1}, 
+        "bbox": {"top": 0.0, "bottom": 0.8407, "left": 0.5271, "right": 1.0}, 
+        "attributes":                                              // attributes information (TBD)
+        {
+            "appearance": [0, 0, 1, ...], 
+            "action": [0, 0, 0, ...], 
+            "emotion": 
+            {
+                "sep_flag": true, "labels": [                      // multi-emotion in the clip
+                    {"emotion": "neutral", "start_sec": 0, "end_sec": 0.28}, 
+                    {"emotion": "happy", "start_sec": 1.28, "end_sec": 3.28}]
+            }
+        }, 
+        "version": "v0.1" 
+    }
+    "..."
+    "..."
+
+}
+
+
+# ==== contruct step 2
+其中对于FACET任务有用的信息仅为 ytb_id 也就是 openhumanvid体系中的 clip_id
+由于celebv基本都是单人视频 所以不需要执行 NLI 对于视频标题的判别筛选出单人视频
+也就是 data/openvid/pipeline中的 filters.py不再需要 在main.py 即data pipeline中的stage1不再需要
+
+run_root/data/celebv 的文件结构如下:
+- pipeline 用于将数据集转化为预备训练格式的数据管道
+  - __init__ 依然是空文件 但是先保留
+  - cache.py 可以参照于openvid的cache.py 也就是从处理后的数据集中进行cache embedding 详见下面的文件结构预计说明
+  - main.py 如同openvid的main.py 是进行data pipeline的核心代码 将原始的数据集处理 使用SCHP进行parse 并且对抽取出来的ref进行打分
+            不会再有NLI对视频标题筛选提取为csv的环节
+  - parse.py 几乎参照于openvid的parse.py
+  - pipe.sh 也几乎参照于openvid的pipe.sh
+  - prompt.txt 几乎参照于openvid的prompt.txt
+  - score.py 几乎参照于openvid的score.py
+- splits 先不用管这个文件夹
+- config.yaml 针对celebv的config 结构相同 但是值会有很多不同 例如不会有csv 目前我在其中已经拟好了草稿
+- celebv.py 针对celev数据集的类 class CelebV 用于在 datasets.py中注册 并且参与联合数据集训练 代码内容类似于 openvid.py 
+            但是celebv存储的文件结构会与openvid会有所不同
+- split.py 可以几乎参照于openvid的split.py 
+
+目前其实这些函数有很多是重复的内容 完全可以公共化 但是这个打算等后期再做项目重构
+
+接下来是最重要的文件结构说明
+首先下载下来后数据集的原始结构为:
+
+\raw_root /mnt/highspeed/users/Arcus/CELEBV
+    |-- downloaded.json # 记录已经下载过后的clip_id/ytb_id download.py会跳过该文档中的视频 因为其已经被下好
+    |
+    |-- clip        # 存储clip原始数据文件夹
+        |-- clip_id.mp4   #  下载后经过长度处理 bbox裁切后的原始视频 clip_id即为celebvhq_info.json中的ytb_id
+    |-- raw_clip_id.mp4*  # Youtube下载下来的临时纯素原视频 后面会进行删除
+
+# 在使用data/celebv/main.py处理后得到的数据集文件结构
+\dataset_root /mnt/highspeed/users/Arcus/celebv
+    |-- index.jsonl  # 所有经过筛选过的可用 clip 的清单 (预处理脚本写 训练侧只读其衍生文件 train.jsonl & val.jsonl)
+    |
+    |-- clip        # 存储clip原始数据文件夹
+        |-- clip_id (即celebvhq_info.json中的ytb_id)
+            |-- clip_id.mp4   #  原始tgt视频 (resize 到训练分辨率附近而后segmented & masked, 24fps, 81+帧)
+            |-- masks.npz          # uint8 [T,H,W] 二值 mask 序列 (压缩存)
+            |-- meta.json          # 所有元数据
+            |-- ref_imgs
+                |-- x.jpg
+                |-- y.jpg
+    |-- latents [在使用过main.py之后第二阶段使用cache.py进行合成]
+        |-- clip_id.pt             # {clean_latent: [C,T',H',W'], t5_emb: [L,D], drop_mask}
+        |-- xxx
+

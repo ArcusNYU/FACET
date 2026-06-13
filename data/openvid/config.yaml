@@ -55,20 +55,20 @@ prepare:
   cv_min_size:
     face:          48
     upper_clothes: 100
-    pants:         72
-    dress:         96
+    # pants:         72
+    # dress:         96
     hat:           32
     hair:          120
-    person:        120
+    # person:        120
   # cv_mask_ratio: [low, high] for (mask_pixels / bbox_area).
   cv_mask_ratio:
     face:          [0.30, 0.90]
     upper_clothes: [0.35, 0.85]
-    pants:         [0.20, 0.85]
-    dress:         [0.25, 0.90]
+    #pants:         [0.20, 0.85]
+    #dress:         [0.25, 0.90]
     hat:           [0.15, 0.80]
     hair:          [0.30, 0.75]
-    person:        [0.30, 0.90]
+    # person:        [0.30, 0.90]
   # 2) quality evaluation model (pyiqa + MANIQA):
   iqa_metric: maniqa
   iqa_model: MANIQA/maniqa.pt

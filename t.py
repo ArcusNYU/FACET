@@ -314,8 +314,11 @@ def main() -> None:
         if best is not None:
             best_step = int(best["step"])
             step_dir = ctx.samples_dir / f"step_{best_step:07d}"
-            fvd_ext = metrics.build_fvd_extractor(cfg.paths.fvd_dir, device=ctx.device)
-            heavy_metrics = trainer.valid.heavy_eval(step_dir, fvd_feature_extractor=fvd_ext)
+            heavy_metrics = trainer.valid.heavy_eval(
+                step_dir,
+                fvd_dir=cfg.paths.fvd_dir,
+                fid_dir=cfg.paths.inception_dir,
+            )
             if heavy_metrics:
                 trainer.logger.log_metrics(
                     {f"heavy_{k}": v for k, v in heavy_metrics.items()}, best_step,

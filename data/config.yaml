@@ -19,6 +19,7 @@ datasets:
     train_per_epoch: 1.0   # 100% of openvid train split every epoch
     valid_per_epoch: 0.4   # 40% of openvid val split every epoch
 
+# TODO: 添加celebv数据集
   # Placeholder for the next dataset. Uncomment + register when prepared:
   # - name: ubcfashion
   #   train_per_epoch: 500   # int: 500 clips per epoch (absolute)

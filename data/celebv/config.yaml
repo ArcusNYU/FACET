@@ -1,0 +1,72 @@
+# OpenVid (Qwen/Qwen3-VL-8B-Instruct) Specific Hyper-params.
+# top-level config.yaml references this file via datasets[].config field.
+
+source: celebv
+
+# actual data path on the server
+data_root: /mnt/highspeed/users/Arcus/celebv
+
+# BaseVideoDataset picks {split_dir}/{split}.json based on the split argument.
+split_dir: data/celebv/splits
+
+# video parameters (consistent with main.py)
+height: 480
+width: 832
+num_frames: 81
+fps: 24
+
+# ref parameters (consistent with main.py)
+ref_size: 480
+ref_per_clip: 3       # candidate ref number (main.py max limit)
+ref_format: png       # RGBA png; alpha=0 on padding, alpha=255 on bbox fg
+
+# latent cache 
+latent_cache: True
+latent_cache_dir: /mnt/highspeed/users/Arcus/celebv/latents
+
+# for main.py
+prepare:
+  weight_dir: weights
+  raw_video_root: /mnt/highspeed/users/Arcus/CELEBV  
+  out_root: /mnt/highspeed/users/Arcus/celebv             # = data_root
+  index_file: index.jsonl
+  category: hair       # TODO: multi-category in later iterations
+  
+  # ==== a. Parsing ====
+  schp_model: SCHP/schp.pth
+  schp_batch: 32                 # frames per SCHP forward; A100 80GB can take 81 if memory permits
+  lip_label_ids: [2]             # hair(category number - 2)
+  temporal_smooth_k: 3           # mask temporal median filter window
+
+  # ==== b. Reference Image ====
+  ref_candidates_k: 3            # stored ref png number
+  ref_max_tries: 15              # cap rejection sampling tries (L1+L2+L3 per try)
+  ref_pad_ratio: 0.20            # bbox outer padding ratio; square pad then resize
+  # 1) computer vision Metrics:
+  # cv_min_size: minimum bbox short-edge in TARGET resolution (480x832).
+  # main.py rescales when SCHP runs on raw frames, so the semantic stays "min
+  # bbox in target space" regardless of source aspect / resolution.
+  cv_min_size:
+    face:          48
+    upper_clothes: 100
+    # pants:         72
+    # dress:         96
+    hat:           32
+    hair:          120
+    # person:        120
+  # cv_mask_ratio: [low, high] for (mask_pixels / bbox_area).
+  cv_mask_ratio:
+    face:          [0.30, 0.90]
+    upper_clothes: [0.35, 0.85]
+    #pants:         [0.20, 0.85]
+    #dress:         [0.25, 0.90]
+    hat:           [0.15, 0.80]
+    hair:          [0.30, 0.75]
+    # person:        [0.30, 0.90]
+  # 2) quality evaluation model (pyiqa + MANIQA):
+  iqa_metric: maniqa
+  iqa_model: MANIQA/maniqa.pt
+  iqa_thresh: 0.25               # MANIQA score threshold; empirically ~0.3 is a safe floor
+  # 3) semantic analysis model:
+  vlm_dir: Qwen8B
+  vlm_prompt: data/celebv/pipeline/prompt.txt
