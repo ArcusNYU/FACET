@@ -89,6 +89,7 @@ class FACETSourceConfig:
     safe_epsilon: float = 1e-3
     mask_dilation: int = 0                  # 0 = no dilation
     mask_pool: str = "avg"                  # "avg" | "nearest"
+    q_chunk: int = 2048                     # base-branch attn query-chunk size; caps O(L^2) VRAM. <=0 disables
 
     # runtime
     detach_latent: bool = True

@@ -44,6 +44,7 @@ model:
     safe_epsilon: 1.0e-3                  # 防 log(0) 数值下溢
     mask_dilation: 0                      # mask 在 pool 之前的像素级 dilation 边界泄露时调高
     mask_pool: "avg"                      # "avg" | "nearest"
+    q_chunk: 2048                    # base-branch attn query-chunk size; caps O(L^2) VRAM. <=0 disables chunking (full-length attention).
     detach_latent: true
 
   reference:

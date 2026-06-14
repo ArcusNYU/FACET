@@ -76,17 +76,17 @@ def prepare_batch(raw_model, batch, cfg, device, dtype):
 
     Returns forward kwargs + the target latents (for the FlowMatch target):
         prompt_embeds : List[[L_i, 4096]]
-        ref_latents   : [B, 16, 1, h_ref, w_ref]
-        src_latents   : [B, 16, F_lat, h, w]
+        ref_latents   : [B, 48, 1, h_ref, w_ref]
+        src_latents   : [B, 48, F_lat, h, w]
         src_mask      : [B, 1, T, H, W]
-        tgt_latents   : [B, 16, F_lat, h, w]
+        tgt_latents   : [B, 48, F_lat, h, w]
     """
     # a. src branch: [B,T,3,H,W] -> [B,3,T,H,W], VAE-encode (encode moves to device).
     src_video = batch["src_video"].permute(0, 2, 1, 3, 4)            # [B,3,T,H,W]
-    src_latents = raw_model.encode_src_video(src_video)             # [B,16,F_lat,h,w]
+    src_latents = raw_model.encode_src_video(src_video)             # [B,48,F_lat,h,w]
 
     # b. ref branch: [B,3,H,W] VAE-encode to single-frame latents.
-    ref_latents = raw_model.encode_reference_image(batch["ref_img"])  # [B,16,1,hr,wr]
+    ref_latents = raw_model.encode_reference_image(batch["ref_img"])  # [B,48,1,hr,wr]
 
     # c. src_mask: [B,T,1,H,W] -> [B,1,T,H,W] (channel-first pixel space).
     src_mask = batch["src_mask"].permute(0, 2, 1, 3, 4).to(device)    # [B,1,T,H,W]
@@ -121,10 +121,10 @@ def prepare_batch(raw_model, batch, cfg, device, dtype):
 
     return {
         "prompt_embeds": prompt_embeds,   # List[[L_i, 4096]]
-        "ref_latents":   ref_latents,     # [B, 16, 1, h_ref, w_ref]
-        "src_latents":   src_latents,     # [B, 16, F_lat, h, w]
+        "ref_latents":   ref_latents,     # [B, 48, 1, h_ref, w_ref]
+        "src_latents":   src_latents,     # [B, 48, F_lat, h, w]
         "src_mask":      src_mask,        # [B, 1, T, H, W]
-        "tgt_latents":   tgt_latents,     # [B, 16, F_lat, h, w]
+        "tgt_latents":   tgt_latents,     # [B, 48, F_lat, h, w]
     }
 
 
@@ -182,6 +182,15 @@ def main() -> None:
 
     # -------- 8. Objective + checkpoint manager + grad-clip view -----------
     raw_model = accelerator.unwrap_model(model)             # for VAE/T5 encode calls
+
+    # Offload T5 when captions are pre-cached.
+    if cfg.training.cached_t5 and raw_model.text_encoder is not None:
+        raw_model.text_encoder.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if accelerator.is_main_process:
+            logger.info("[train] cached_t5=True -> T5 text_encoder offloaded to CPU (freed ~11GB).")
+
     flow = trainer.loss.FlowMatch(cfg.training)             # builds BSMNT table once
     ckpt_mgr = trainer.ckpt.CheckpointManager(
         accelerator=accelerator,
@@ -249,6 +258,25 @@ def main() -> None:
                     device=tgt_latents.device, dtype=tgt_latents.dtype,
                 )
                 noisy, target = flow.add_noise(tgt_latents, noise, t)
+
+                # b'. [TEMP/DEBUG] one-shot probe of everything entering the model
+                #     (prep kwargs) + the FlowMatch tensors (t / noisy / target).
+                #     Non-essential: delete once shapes/dtypes/ranges are verified.
+                if debug and accelerator.is_main_process:
+                    tools.inspect(
+                        f"prep + flowmatch @ step {global_step}",
+                        {
+                            "prompt_embeds": prep["prompt_embeds"],
+                            "ref_latents":   prep["ref_latents"],
+                            "src_latents":   prep["src_latents"],
+                            "src_mask":      prep["src_mask"],
+                            "tgt_latents":   prep["tgt_latents"],
+                            "t":             t,
+                            "noisy":         noisy,
+                            "target":        target,
+                        },
+                    )
+                    # debug = True
 
                 # c. forward -> velocity pred
                 out = model(

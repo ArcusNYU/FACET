@@ -3,14 +3,14 @@ FACET / WAN2.2-TI2V-5B + OminiControl LoRA fine-tuning model.
 
 Reference layout (WAN2.2-TI2V-5B, 480x832x81):
 
-  base (target) branch (x):  [B, 16, F_lat=21, 30, 52]  -- WAN2.2 VAE z_dim=16, vae_stride=16
+  base (target) branch (x):  [B, 48, F_lat=21, 30, 52]  -- WAN2.2 VAE z_dim=48, vae_stride=16
                              -- patchify (k=s=(1,2,2)) -> token grid [B, 21, 15, 26], L_base = 8190
 
-  src branch           (s):  [B, 16, F_lat=21, 30, 52]  -- masked source video latent
+  src branch           (s):  [B, 48, F_lat=21, 30, 52]  -- masked source video latent
                              -- shares dit.patch_embedding -> same token grid as base, L_src = 8190
                              -- RoPE: shared with base (f=0..20, h=0..14, w=0..25)
 
-  reference branch     (r):  [B, 16, F_lat=1, 30, 30]   -- single image VAE latent (480x480)
+  reference branch     (r):  [B, 48, F_lat=1, 30, 30]   -- single image VAE latent (480x480)
                              -- shares dit.patch_embedding -> [B, 1, 15, 15], L_ref = 225
                              -- RoPE: f-axis DISABLED (delta_f=0 with base);
                                       h=0..14  (no h-axis offset),
@@ -103,6 +103,7 @@ def facet_block_forward(
     safe_epsilon: float = 1e-3,
     bias_floor: float = -1e4,
     attention_mode: str = "asymmetric",
+    q_chunk: int = 1024,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward Logic for FACET-WAN DiT block: OminiControl-style 3-branch attention.
@@ -223,33 +224,41 @@ def facet_block_forward(
 
     scale = 1.0 / math.sqrt(head_dim)
 
-    # Scores: [B, n_heads, L_base, L_*]
-    score_to_base = (q_b_h @ k_b_h.transpose(-2, -1)) * scale
-    score_to_src  = (q_b_h @ k_s_h.transpose(-2, -1)) * scale
-    score_to_ref  = (q_b_f0_h @ k_r_h.transpose(-2, -1)) * scale   # delta_f = 0 here
-
     # Mask-aware bias: per-Q-base routing.
     # m_q = m[:, None, :, None]  -> [B, 1, L_base, 1]; broadcasts over heads and K dim.
-    m_q = mask_coverage.to(score_to_src.dtype)[:, None, :, None]  
+    m_q = mask_coverage.to(v_b_h.dtype)[:, None, :, None]
 
     m_q_reverse = (1.0 - m_q).clamp_min(safe_epsilon)
     m_q = m_q.clamp_min(safe_epsilon)
-    
-    bias_src = (gamma * torch.log(m_q_reverse)).clamp_min(bias_floor)
-    bias_ref = (gamma * torch.log(m_q)        ).clamp_min(bias_floor)
 
-    score_to_src = score_to_src + bias_src
-    score_to_ref = score_to_ref + bias_ref
+    bias_src = (gamma * torch.log(m_q_reverse)).clamp_min(bias_floor)   # [B, 1, L_base, 1]
+    bias_ref = (gamma * torch.log(m_q)        ).clamp_min(bias_floor)   # [B, 1, L_base, 1]
 
-    # Global softmax over [K_base | K_src | K_ref].
-    # Cast to fp32 for numerical stability in softmax (matches DiffSynth's pattern
-    # of doing time/modulation math in fp32).
-    score = torch.cat([score_to_base, score_to_src, score_to_ref], dim=-1)
-    attn_weights = torch.softmax(score.float(), dim=-1).to(v_b_h.dtype)
-
-    # Weighted sum: concat V's along the K axis.
     v_all = torch.cat([v_b_h, v_s_h, v_r_h], dim=2)   # [B, n_heads, L_all, head_dim]
-    y_b = attn_weights @ v_all                         # [B, n_heads, L_base, head_dim]
+
+    # Memory: a full score [B, n_heads, L_base, 2*L_base + L_ref] plus its fp32 softmax
+    # copy is O(L_base^2) and dominates VRAM (e.g. L_base=8190 -> ~12 GiB for the fp32
+    # score alone). Chunk the QUERY axis so peak memory scales with q_chunk instead of
+    # L_base; the math is identical (each query row still does a global softmax over the
+    # full [K_base | K_src | K_ref] axis). q_chunk <= 0 disables chunking.
+    step = L_base if q_chunk is None or q_chunk <= 0 else int(q_chunk)
+    y_parts: List[torch.Tensor] = []
+    for i in range(0, L_base, step):
+        j = min(i + step, L_base)
+        qb_c = q_b_h[:, :, i:j]                                          # [B, n, c, d]
+        qf0_c = q_b_f0_h[:, :, i:j]
+
+        # Scores for this query chunk: [B, n_heads, c, L_*]
+        s_base = (qb_c  @ k_b_h.transpose(-2, -1)) * scale
+        s_src  = (qb_c  @ k_s_h.transpose(-2, -1)) * scale + bias_src[:, :, i:j]
+        s_ref  = (qf0_c @ k_r_h.transpose(-2, -1)) * scale + bias_ref[:, :, i:j]  # delta_f = 0
+
+        # Global softmax over [K_base | K_src | K_ref] in fp32 for stability.
+        s = torch.cat([s_base, s_src, s_ref], dim=-1)
+        a = torch.softmax(s.float(), dim=-1).to(v_b_h.dtype)
+        y_parts.append(a @ v_all)                                        # [B, n_heads, c, head_dim]
+
+    y_b = torch.cat(y_parts, dim=2)                                      # [B, n_heads, L_base, head_dim]
 
     # Back to [B, L_base, n_heads*head_dim]
     y_b = y_b.transpose(1, 2).reshape(B, L_base, n_heads * head_dim)
@@ -385,6 +394,10 @@ class FACETWanModel(nn.Module):
         self.vae = self.pipe.vae
         self.text_encoder = self.pipe.text_encoder
         self.tokenizer = self.pipe.tokenizer
+
+        # (the VAE is frozen, so DDP/AMP never recast it back).
+        if self.vae is not None:
+            self.vae.to(torch.float32)
         # DiffSynth's WanVideoPipeline pre-instantiates a FlowMatchScheduler.
         self.scheduler = getattr(self.pipe, "scheduler", None) or FlowMatchScheduler("Wan")
 
@@ -520,16 +533,16 @@ class FACETWanModel(nn.Module):
         One denoising step (shared by training & generation).
 
         Args:
-            noisy_latents:  [B, 16, F_lat, h, w]                       (REQUIRED)
+            noisy_latents:  [B, 48, F_lat, h, w]                       (REQUIRED)
             timesteps:      [B]  fp32                                  (REQUIRED)
             prompt_embeds:  List length B, each [L_i, 4096]            (REQUIRED)
-            ref_latents:    [B, 16, 1, h_ref, w_ref]                   (REQUIRED)
-            src_latents:    [B, 16, F_lat, h, w]                       (REQUIRED)
+            ref_latents:    [B, 48, 1, h_ref, w_ref]                   (REQUIRED)
+            src_latents:    [B, 48, F_lat, h, w]                       (REQUIRED)
             src_mask:       [B, 1, F, H, W] in [0, 1]                  (REQUIRED)
             return_dict:    if True returns {"pred": ...}, else returns tensor
 
         Returns:
-            pred: [B, 16, F_lat, h, w]  velocity-target prediction.
+            pred: [B, 48, F_lat, h, w]  velocity-target prediction.
 
         NOTE: All tensor inputs (noisy_latents, ref_latents, src_latents,
         src_mask, prompt_embeds elements) MUST already live on `self.device`
@@ -539,7 +552,7 @@ class FACETWanModel(nn.Module):
         B = noisy_latents.shape[0]
 
         # ---- 1. Patchify base branch ----
-        # patch_embedding: Conv3d (k=s=(1,2,2)): [B, 16, F_lat, H/16, W/16]
+        # patch_embedding: Conv3d (k=s=(1,2,2)): [B, 48, F_lat, H/16, W/16]
         #   -> [B, dim, F_lat, H/32, W/32]
         x_base = self.dit.patch_embedding(noisy_latents)
         f_base, h_base, w_base = x_base.shape[2:]
@@ -604,6 +617,9 @@ class FACETWanModel(nn.Module):
         gamma = float(self.cfg.source.gamma)
         safe_epsilon = float(self.cfg.source.safe_epsilon)
         attention_mode = self.cfg.source.attention_mode
+        # Query-chunk size for the base-branch attention (caps O(L^2) VRAM). Tunable
+        # via cfg.source.q_chunk; <=0 disables chunking (full-length attention).
+        q_chunk = int(getattr(self.cfg.source, "q_chunk", 2048)) # for A100-80GB
 
         # ---- 8. Iterate DiT blocks with custom branch attention ----
         gc_enabled = bool(self.cfg.gradient_checkpointing) and self.training
@@ -619,6 +635,7 @@ class FACETWanModel(nn.Module):
                     gamma=gamma,
                     safe_epsilon=safe_epsilon,
                     attention_mode=attention_mode,
+                    q_chunk=q_chunk,
                     use_reentrant=False,
                 )
             else:
@@ -630,6 +647,7 @@ class FACETWanModel(nn.Module):
                     gamma=gamma,
                     safe_epsilon=safe_epsilon,
                     attention_mode=attention_mode,
+                    q_chunk=q_chunk,
                 )
 
         # ---- 9. Head (base branch only) + unpatchify ----
@@ -715,7 +733,7 @@ class FACETWanModel(nn.Module):
         )
         h_lat = height // self.cfg.wan.vae_spatial_stride
         w_lat = width // self.cfg.wan.vae_spatial_stride
-        z_dim = getattr(self.dit, "in_dim", 16)
+        z_dim = getattr(self.dit, "in_dim", 48)
 
         if src_latents is not None:
             if src_video is not None:
@@ -977,10 +995,10 @@ class FACETWanModel(nn.Module):
           Tensor [3, H, W]            -> batch 1
           Tensor [B, 3, H, W]         -> batch B
           Tensor [B, 3, 1, H, W]      -> already video-shaped, batch B
-          Tensor [16, 1, h, w]        -> already latent (pre-cached), batch 1
-          Tensor [B, 16, 1, h, w]     -> already latent (pre-cached), batch B
+          Tensor [48, 1, h, w]        -> already latent (pre-cached), batch 1
+          Tensor [B, 48, 1, h, w]     -> already latent (pre-cached), batch B
 
-        Returns: stacked tensor [B, 16, 1, H/16, W/16].
+        Returns: stacked tensor [B, 48, 1, H/16, W/16].
 
         Resize / normalize are skipped when input is already a Tensor; the data
         pipeline (data/transform.py:RefTfm) is assumed to have done it. For raw
@@ -1009,10 +1027,10 @@ class FACETWanModel(nn.Module):
 
         x = reference_images
 
-        # Pre-cached latent [B, 16, 1, h, w] or [16, 1, h, w].
-        if x.ndim == 4 and x.shape[0] == 16 and x.shape[1] == 1:
+        # Pre-cached latent [B, 48, 1, h, w] or [48, 1, h, w].
+        if x.ndim == 4 and x.shape[0] == 48 and x.shape[1] == 1:
             x = x.unsqueeze(0)
-        if x.ndim == 5 and x.shape[1] == 16 and x.shape[2] == 1:
+        if x.ndim == 5 and x.shape[1] == 48 and x.shape[2] == 1:
             out = x.to(device=self.device, dtype=self.dtype)
             return out.detach() if self.cfg.reference.detach_latent else out
 
@@ -1032,7 +1050,7 @@ class FACETWanModel(nn.Module):
         x = x.to(device=self.device, dtype=torch.float32)
         ref_latents = self.vae.encode(x, device=self.device).to(
             dtype=self.dtype, device=self.device
-        )  # [B, 16, 1, H/16, W/16]
+        )  # [B, 48, 1, H/16, W/16]
 
         if self.cfg.reference.detach_latent:
             ref_latents = ref_latents.detach()
@@ -1047,7 +1065,7 @@ class FACETWanModel(nn.Module):
         PIL fast path: route through pipe.preprocess_video (handles resize +
         (x-0.5)/0.5 + permute) for one-frame "videos".
 
-        Returns: [B, 16, 1, H/16, W/16].
+        Returns: [B, 48, 1, H/16, W/16].
         """
         resized = [im.convert("RGB").resize((ref_size, ref_size)) for im in pil_list]
         # Stack into one [B, 3, 1, H, W] batch and VAE-encode in one shot.
@@ -1055,7 +1073,7 @@ class FACETWanModel(nn.Module):
         v = torch.cat(clips, dim=0).to(device=self.device, dtype=torch.float32)
         z = self.vae.encode(v, device=self.device).to(
             dtype=self.dtype, device=self.device
-        )  # [B, 16, 1, H/8, W/8]
+        )  # [B, 48, 1, H/8, W/8]
         if self.cfg.reference.detach_latent:
             z = z.detach()
         return z
@@ -1071,11 +1089,11 @@ class FACETWanModel(nn.Module):
         Accepted:
           Tensor [3, F, H, W]            -> batch 1
           Tensor [B, 3, F, H, W]         -> batch B
-          Tensor [16, F_lat, h, w]       -> already-latent, batch 1
-          Tensor [B, 16, F_lat, h, w]    -> already-latent, batch B
+          Tensor [48, F_lat, h, w]       -> already-latent, batch 1
+          Tensor [B, 48, F_lat, h, w]    -> already-latent, batch B
           List[Tensor]                   -> stacked along batch dim
 
-        Returns: stacked tensor [B, 16, F_lat, H/16, W/16].
+        Returns: stacked tensor [B, 48, F_lat, H/16, W/16].
 
         NOTE: VAE runs in fp32; inputs are cast just before encode and outputs
         cast back to self.dtype.
@@ -1096,7 +1114,7 @@ class FACETWanModel(nn.Module):
             )
 
         c = src_video.shape[1]
-        z_dim = getattr(self.dit, "in_dim", 16)
+        z_dim = getattr(self.dit, "in_dim", 48)
 
         if c == z_dim:  # already-latent fast path
             out = src_video.to(device=self.device, dtype=self.dtype)
@@ -1111,7 +1129,7 @@ class FACETWanModel(nn.Module):
         src_video = src_video.to(self.device, dtype=torch.float32)
         src_lat = self.vae.encode(src_video, device=self.device).to(
             dtype=self.dtype, device=self.device
-        )  # [B, 16, F_lat, H/16, W/16]
+        )  # [B, 48, F_lat, H/16, W/16]
 
         if self.cfg.source.detach_latent:
             src_lat = src_lat.detach()
@@ -1208,7 +1226,7 @@ class FACETWanModel(nn.Module):
         """
         Decode target video latents -> pixel-space tensor.
 
-        Input:  [B, 16, F_lat, H/16, W/16] (or list form)
+        Input:  [B, 48, F_lat, H/16, W/16] (or list form)
         Output: [B, 3, F, H, W] in [-1, 1]
 
         Format conversion (uint8 / PIL frames / mp4) is handled by FACETPipeline.
@@ -1231,7 +1249,7 @@ class FACETWanModel(nn.Module):
         """
         Sample initial Gaussian latents for the base (target) branch.
 
-        Returns: [B, z_dim=16, F_lat, H/16, W/16].
+        Returns: [B, z_dim=48, F_lat, H/16, W/16].
         """
         validate_video_size(
             height=height,
@@ -1248,7 +1266,7 @@ class FACETWanModel(nn.Module):
         h_lat = height // self.cfg.wan.vae_spatial_stride
         w_lat = width // self.cfg.wan.vae_spatial_stride
 
-        c = getattr(self.dit, "in_dim", 16)
+        c = getattr(self.dit, "in_dim", 48)
 
         return torch.randn(
             batch_size, c, f_lat, h_lat, w_lat,

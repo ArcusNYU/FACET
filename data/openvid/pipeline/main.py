@@ -40,7 +40,6 @@ Within-part parallelism: `--shard i/N` splits a single part across N workers
 # 因为目前 即使是VLM 也无法排除这种情况 
 # TODO: 可能涉及fps重采样
 # TODO: 运行后书写脚本进行数据集特征统计 因为数据分布可能直接训练模型性能
-# TODO: 其他数据集在构建pipeline的时候可能也需要下面某些通用性强的helper函数 到时候需要将它们移动至 /data/utils.py
 
 
 from __future__ import annotations
