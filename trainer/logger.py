@@ -61,7 +61,15 @@ def setup(accelerator, cfg, output_root: Path, track_root: Path) -> None:
         #    SSH->local mlflow UI mapping never has to change between runs.
         if _STATE["backend"] == "mlflow":
             track_root.mkdir(parents=True, exist_ok=True)
-            os.environ["MLFLOW_TRACKING_URI"] = track_root.resolve().as_uri()
+            store_uri = track_root.resolve().as_uri()
+            os.environ["MLFLOW_TRACKING_URI"] = store_uri
+            # Print the EXACT ui command so the backend-store-uri always matches
+            # this run's store (case-sensitive paths cause "only Default shows up").
+            logger.info("[trainer.logger] mlflow experiment=%r  store=%s",
+                        cfg.log.project_name, track_root.resolve())
+            logger.info("[trainer.logger] view it with:\n"
+                        "    mlflow ui --backend-store-uri %s --host 0.0.0.0 --port 45000",
+                        store_uri)
 
     # 4. init cloud trackers (no-op if accelerator built with log_with=None)
     if _STATE["backend"] in ("mlflow", "tensorboard", "wandb"):

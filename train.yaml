@@ -58,6 +58,7 @@ accel:
   find_unused_parameters:    false      # (default) 3-branch attn uses every LoRA param every step
   launcher:                  "auto"     # "auto" | "python" | "accelerate"  (read by launch_train.py)
   gpu_ids:                   [0]        # which GPU ids this run may use; num_gpus inferred from len()
+  main_process_port:         29555      # accelerate DDP rendezvous port; change if the default 29500 is taken
 
 # -----------------------------------------------------------------------------
 # 3. train:
@@ -83,10 +84,10 @@ train:
     name:          "constant_with_warmup"     # "constant" | "constant_with_warmup"
     warmup_steps:  1000                        # TODO: 涉及更改
 
-  log_every_steps:  50
+  log_every_steps:  20
   val_every_steps:  1000
   save_every_steps: 1000                      # ckpt snapshot cadence (top-K bookkeeping)
-  start_eval_steps: 10000
+  start_eval_steps: 5000
 
 # -----------------------------------------------------------------------------
 # 4. run:

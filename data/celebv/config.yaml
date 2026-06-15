@@ -47,7 +47,7 @@ prepare:
   # cv_min_size: minimum bbox short-edge in TARGET resolution (480x832).
   # main.py rescales when SCHP runs on raw frames, so the semantic stays "min
   # bbox in target space" regardless of source aspect / resolution.
-  cv_min_size: # FIXME: 需要升高阈值
+  cv_min_size: # FIXME: 需要调整阈值 进行smoke_test
     # face:          48
     # upper_clothes: 100
     # pants:         72

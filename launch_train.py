@@ -86,7 +86,7 @@ def _accelerate_argv() -> List[str]:
 
 
 def build_command(launcher: str, gpu_ids: List[int], precision: str,
-                  train_yaml: Path) -> List[str]:
+                  train_yaml: Path, main_process_port: int) -> List[str]:
     n = len(gpu_ids)
     train_py = str(_PROJECT_ROOT / "train.py")
     tail = ["--train_yaml", str(train_yaml)]
@@ -99,6 +99,7 @@ def build_command(launcher: str, gpu_ids: List[int], precision: str,
         *_accelerate_argv(),
         "--num_machines", "1",
         "--num_processes", str(max(n, 1)),
+        "--main_process_port", str(main_process_port),
         "--mixed_precision", precision,
         "--dynamo_backend", "no",
     ]
@@ -115,10 +116,11 @@ def main() -> None:
     accel = _read_accel(train_yaml)
     gpu_ids = _normalise_gpu_ids(accel.get("gpu_ids"))
     precision = str(accel.get("precision", "bf16"))
+    main_process_port = int(accel.get("main_process_port", 29500))
     launcher_cfg = args.launcher or str(accel.get("launcher", "auto"))
     launcher = _resolve_launcher(launcher_cfg, len(gpu_ids))
 
-    cmd = build_command(launcher, gpu_ids, precision, train_yaml)
+    cmd = build_command(launcher, gpu_ids, precision, train_yaml, main_process_port)
 
     # Pin device visibility; child sees the requested GPUs remapped to 0..N-1.
     env = os.environ.copy()
@@ -128,6 +130,8 @@ def main() -> None:
     print(f"[launch] accel.launcher     = {launcher_cfg} -> {launcher}")
     print(f"[launch] accel.gpu_ids      = {gpu_ids}  (CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
     print(f"[launch] accel.precision    = {precision}")
+    if launcher == "accelerate":
+        print(f"[launch] main_process_port  = {main_process_port}")
     print(f"[launch] command            = {' '.join(cmd)}")
 
     if args.dry_run:

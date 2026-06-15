@@ -1,29 +1,27 @@
 """
-Smoke-test variant of openvid main.py with verbose ref-frame diagnostics.
+Smoke-test variant of data/celebv/pipeline/main.py with verbose ref-frame diagnostics.
 
-Differences vs main.py:
+Differences vs celebv main.py:
   - Replaces _pick_refs with _pick_refs_verbose: prints each candidate's
     bbox / mask ratio / IQA score / VLM judgement, AND saves an annotated
     overlay PNG so you can see exactly which stage rejected a candidate.
   - Annotated images go to {out_root}/_debug/{cid}/{stage}_{idx:04d}.png
     e.g. cv_fail_0123.png / iqa_fail_0123.png / vlm_fail_0123.png / accept_0123.png
-  - VLM accept criterion: match=True AND occlusion=False AND multiple=False (same as main.py).
-  - If $DISPLAY is set (e.g. ssh -X / X11 forwarding from Windows VcXsrv),
-    each annotated frame is also shown via cv2.imshow with a wait of ~600ms.
-    Otherwise it just saves to disk; preview the folder in VSCode Remote.
-  - prepare_clip_test does NOT write final outputs (mp4/masks/refs); it only
-    runs the diagnostic. So even no_ref clips leave behind a debug folder.
+  - If $DISPLAY is set (ssh -X / X11 forwarding), each annotated frame is also
+    shown via cv2.imshow (~600ms). Otherwise it just saves to disk.
+  - prepare_clip_test does NOT write final outputs (mp4/masks/refs/index/failed);
+    it only runs the diagnostic, so even no_ref clips leave a debug folder.
 
 Usage:
-    python -m data.openvid.pipeline.main_test --config data/openvid/config.yaml --limit 10
+    python -m data.celebv.pipeline.main_test --config data/celebv/config.yaml --limit 10
 
-All other helpers (read_video, fit_pad, SCHP/IQA/VLM loading, etc.) are
+All other helpers (read_video, fit_pad, ref crop, downloaded.json reader) are
 imported from main.py to avoid drift.
 """
 from __future__ import annotations
 import argparse
 import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "8") 
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "8")
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.0")
 import warnings
 warnings.filterwarnings(
@@ -33,28 +31,23 @@ warnings.filterwarnings(
 )
 
 import random
-import sys
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
 
 from data.utils import load_cfg
-from data.openvid.pipeline.parse import SchpParser
-from data.openvid.pipeline.score import IqaScorer, VlmFilter, cv_check
-from data.openvid.pipeline.main import (
+from data.celebv.pipeline.parse import SchpParser
+from data.celebv.pipeline.score import IqaScorer, VlmFilter, cv_check
+from data.celebv.pipeline.main import (
     read_video,
-    fit_pad_video,
     fit_pad_mask,
     mask_bbox,
     build_ref_rgba,
-    resolve_raw_mp4,
-    part_of_csv_path,
-    _resolve_single_csv,
+    raw_clip_path,
+    read_downloaded,
 )
 
 
@@ -196,15 +189,15 @@ def _pick_refs_verbose(
             continue
 
         # --- L3: VLM ---
-        # Accept criterion: match=True AND occlusion=False AND multiple=False
-        # (mirrors main.py: `multiple` rejects mirror reflections / 2nd person).
+        # Accept criterion: match=True AND occlusion=False
+        # (no "multiple" check; CelebV bbox crops are reliably single-person).
         try:
             v = vlm.judge(rgb_only, category=cat)
         except Exception as e:
-            v = {"match": False, "occlusion": True, "multiple": True}
+            v = {"match": False, "occlusion": True}
             print(f"  [try {tries:02d}] frame={idx:04d} VLM exception: {type(e).__name__}: {e}")
-        vlm_msg = f"VLM: match={v['match']} occlusion={v['occlusion']} multiple={v['multiple']}"
-        vlm_pass = v["match"] and not v["occlusion"] and not v["multiple"]
+        vlm_msg = f"VLM: match={v['match']} occlusion={v['occlusion']}"
+        vlm_pass = v["match"] and not v["occlusion"]
 
         if not vlm_pass:
             print(f"  [try {tries:02d}] frame={idx:04d} REJECT@VLM {cv_msg[0]} | {iqa_msg} | {vlm_msg}")
@@ -217,11 +210,9 @@ def _pick_refs_verbose(
 
         # accepted
         print(f"  [try {tries:02d}] frame={idx:04d} ACCEPT  {cv_msg[0]} | {iqa_msg} | {vlm_msg}")
-        accept_label = f"frame={idx} ACCEPT"
-        accept_color = (0, 255, 0)
         _show_or_save(
             _annotate(video_raw[idx], m, bb,
-                      [accept_label, *cv_msg, iqa_msg, vlm_msg], accept_color),
+                      [f"frame={idx} ACCEPT", *cv_msg, iqa_msg, vlm_msg], (0, 255, 0)),
             debug_dir / f"accept_{idx:04d}.png",
         )
         accepted.append({
@@ -238,7 +229,8 @@ def _pick_refs_verbose(
 #                  Per-clip pipeline (verbose)
 # ============================================================
 def prepare_clip_test(
-    row: pd.Series,
+    cid: str,
+    ytb_id: str,
     cfg,
     cfg_prepare,
     schp: SchpParser,
@@ -247,22 +239,19 @@ def prepare_clip_test(
     raw_root: Path,
     out_root: Path,
 ) -> dict:
-    cid = str(row["clip_id"])
-    csv_path_field = str(row["path"])
-    part = part_of_csv_path(csv_path_field)
     debug_dir = out_root / "_debug" / cid
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    src = resolve_raw_mp4(raw_root, csv_path_field)
+    src = raw_clip_path(raw_root, cid)
     if not src.exists():
         print(f"\n[clip {cid}] missing src: {src}")
         return {"_status": "missing_src", "clip_id": cid}
 
     H, W = int(cfg.height), int(cfg.width)
-    NF, FPS = int(cfg.num_frames), int(cfg.fps)
+    NF = int(cfg.num_frames)
     max_tries = int(cfg_prepare.get("ref_max_tries", 15))
 
-    print(f"\n[clip {cid}] reading {src}")
+    print(f"\n[clip {cid}] (ytb={ytb_id}) reading {src}")
     video_raw, reason = read_video(src, min_frames=NF, max_frames=NF * 2)
     if video_raw is None:
         kind = "short" if reason.startswith("short:") else "unreadable"
@@ -306,13 +295,10 @@ def prepare_clip_test(
 #                            CLI
 # ============================================================
 def main():
-    p = argparse.ArgumentParser("OpenVid pipeline smoke test (verbose)")
+    p = argparse.ArgumentParser("CelebV pipeline smoke test (verbose)")
     p.add_argument("--config", default=str(Path(__file__).parent.parent / "config.yaml"))
-    p.add_argument("--part", type=int, required=True,
-                   help="which OpenHumanVid part csv to inspect (e.g. 1, 2). "
-                        "Substituted into cfg.prepare.csv_glob's '*', mirrors main.py.")
     p.add_argument("--limit", type=int, default=10,
-                   help="cap on total clips to inspect")
+                   help="cap on total clips to inspect (from downloaded.json order)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--schp-batch", type=int, default=None)
     args = p.parse_args()
@@ -323,13 +309,10 @@ def main():
     out_root = Path(cfg.out_root)
     weight_dir = Path(cfg.weight_dir)
 
-    # Resolve the single .single.csv for this part (same logic as main.py).
-    csv_path = _resolve_single_csv(cfg.csv_glob, out_root, args.part)
-    if not csv_path.exists():
-        print(f"[test] .single.csv not found: {csv_path}; run filters.py first.",
-              file=sys.stderr)
-        sys.exit(1)
-    print(f"[test] part={args.part} csv={csv_path}")
+    clips = read_downloaded(raw_root / "downloaded.json")
+    if args.limit > 0:
+        clips = clips[:args.limit]
+    print(f"[test] inspecting {len(clips)} clips from {raw_root / 'downloaded.json'}")
 
     schp_path = str(weight_dir / cfg.schp_model)
     iqa_path = str(weight_dir / cfg.iqa_model)
@@ -349,16 +332,11 @@ def main():
     vlm = VlmFilter(model_dir=vlm_path, prompt_file=cfg.vlm_prompt)
 
     counters: Dict[str, int] = {}
-    df = pd.read_csv(csv_path, low_memory=False)
-    df = df[df["single"].astype(str).str.lower() == "true"]
-    if args.limit > 0:
-        df = df.head(args.limit)
-
-    for _, row in df.iterrows():
+    for cid, ytb in clips:
         try:
-            res = prepare_clip_test(row, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
+            res = prepare_clip_test(cid, ytb, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
         except Exception as e:
-            res = {"_status": "error", "clip_id": str(row.get("clip_id", "")),
+            res = {"_status": "error", "clip_id": cid,
                    "error": f"{type(e).__name__}: {e}",
                    "trace": traceback.format_exc(limit=4)}
             print(f"[error] {res['error']}\n{res['trace']}", flush=True)
@@ -370,7 +348,7 @@ def main():
 
     if _HAS_DISPLAY:
         cv2.destroyAllWindows()
-    print(f"\n[test] done. part={args.part} counters: {counters}")
+    print(f"\n[test] done. counters: {counters}")
 
 
 if __name__ == "__main__":

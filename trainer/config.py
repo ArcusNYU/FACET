@@ -85,6 +85,7 @@ class AccelConfig:
     launcher: str = "auto"                       # "auto" | "python" | "accelerate"
     # (sets CUDA_VISIBLE_DEVICES in launch_train.py). Single id -> python launcher; multiple -> accelerate.
     gpu_ids: List[int] = field(default_factory=lambda: [0])
+    main_process_port: int = 29500               # accelerate DDP rendezvous port; bump if 29500 is taken
 
     @property
     def num_gpus(self) -> int:

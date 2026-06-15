@@ -34,6 +34,9 @@ Example:
 """
 # TODO: a detailed explanation for FINAL configuration of yt-dlp and ffmpeg
 
+# local command:
+# python data/celebv/pipeline/acquire.py --limit 500 --pool 100 --raw-root C:\Users\15246\Desktop\CELEBV_DATA --proxy http://127.0.0.1:7897
+
 
 from __future__ import annotations
 
