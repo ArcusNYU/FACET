@@ -1,5 +1,5 @@
 """
-Dataset Pipeline Stage 2 - main entry-point.
+Openvid Dataset Pipeline Stage 2 - main entry-point.
 
 Reads `<stem>.single.csv` produced by filters.py from cfg.out_root,
 keeps rows with `single == True`. For each clip:
@@ -25,12 +25,14 @@ keeps rows with `single == True`. For each clip:
   7. Write minimal meta.json.
   8. Atomic append to index.jsonl (resume-friendly).
 
-Resume: clip_ids already in index.jsonl are skipped on restart. index.jsonl is
-        guarded by fcntl.flock so multiple `--part` (or `--shard`) workers can
-        append concurrently without line-interleaving even on NFS.
-Failure classes (missing_src / short / empty_mask / no_ref / error) are
-counted on stdout but not recorded; they will be re-attempted on restart.
-Model loading cost is amortized over the whole run, so retrying is cheap.
+Resume: clip_ids already in index.jsonl (ok) OR failed.jsonl (rejected) are
+        skipped on restart, so previously rejected clips are NOT re-analyzed.
+        Use --retry-failed to re-attempt the failed set. Both ledgers are guarded
+        by fcntl.flock so multiple `--part` (or `--shard`) workers can append
+        concurrently without line-interleaving even on NFS.
+Failure classes (missing_src / short / empty_mask / no_ref / error) are counted
+on stdout AND recorded to failed.jsonl. Model loading cost is amortized over the
+whole run, so retrying is cheap.
 Within-part parallelism: `--shard i/N` splits a single part across N workers
         by md5(clip_id) % N, mirroring cache.py. Useful when one part is the
         bottleneck and the GPU still has free VRAM.
@@ -244,7 +246,9 @@ def out_clip_dir(out_root: Path, part: str, cid: str) -> Path:
 #                       index.jsonl helpers
 # ============================================================
 def read_done_clips(index_path: Path) -> set:
-    """For breakpoint resume support."""
+    """Collect clip_ids from a jsonl ledger (index.jsonl or failed.jsonl).
+    Used for breakpoint resume support.
+    """
     if not index_path.exists():
         return set()
     done = set()
@@ -338,9 +342,9 @@ def _pick_refs(
         rgba = build_ref_rgba(video_raw[idx], m, pad_ratio, ref_size)
         if rgba is None:
             continue
-        # L2 IQA on RGB only
         rgb_only = rgba[..., :3]
 
+        # L2 IQA on RGB only
         try:
             iqa_score = iqa.score(rgb_only)  # NOTE: iqa依然能够看到背景区域 因为原始背景区域的rgb像素并未被置0
         except Exception:
@@ -348,7 +352,7 @@ def _pick_refs(
         if iqa_score < iqa_thresh:
             continue
 
-        # L3 VLM judge on RGB only
+        # L3 VLM judges on RGB only
         try:
             v = vlm.judge(rgb_only, category=cat)
         except Exception:
@@ -514,6 +518,8 @@ def main():
                    help="i/N: within this part, handle only clips whose "
                         "md5(cid)%%N == i. Lets you co-locate multiple workers "
                         "on the same GPU/part when VRAM allows.")
+    p.add_argument("--retry-failed", action="store_true",
+                   help="re-attempt clips previously recorded in failed.jsonl")
     args = p.parse_args()
 
     shard_i, shard_n = (int(x) for x in args.shard.split("/"))
@@ -525,6 +531,7 @@ def main():
     out_root = Path(cfg.out_root)
     weight_dir = Path(cfg.weight_dir)
     index_path = out_root / cfg.index_file
+    failed_path = out_root / cfg.get("failed_file", "failed.jsonl")
 
     # Resolve the single .single.csv for this part.
     csv_path = _resolve_single_csv(cfg.csv_glob, out_root, args.part)
@@ -552,15 +559,18 @@ def main():
     print(f"[prepare] loading VLM from {vlm_path}")
     vlm = VlmFilter(model_dir=vlm_path, prompt_file=cfg.vlm_prompt)
 
-    # ---- resume ----
+    # ---- resume: skip clips already in index.jsonl OR failed.jsonl ----
     done = read_done_clips(index_path)
-    print(f"[prepare] resume: {len(done)} clips already in {index_path}")
+    failed_done = set() if args.retry_failed else read_done_clips(failed_path)
+    print(f"[prepare] resume: {len(done)} ok in {index_path.name}, "
+          f"{len(failed_done)} failed in {failed_path.name} "
+          f"(retry_failed={args.retry_failed})")
 
     counters: Dict[str, int] = {}
 
     df = pd.read_csv(csv_path, low_memory=False)
     df = df[df["single"].astype(str).str.lower() == "true"]
-    df = df[~df["clip_id"].astype(str).isin(done)]
+    df = df[~df["clip_id"].astype(str).isin(done | failed_done)]
     if shard_n > 1:
         # Stable cross-process hash; mirrors cache.py:scan_cached_cids logic.
         def _in_shard(cid: str) -> bool:
@@ -591,10 +601,21 @@ def main():
                 reason = res.get("reason", res.get("path", ""))
                 print(f"\n[{status}] clip={cid_log} {reason}", flush=True)
         if status == "ok":
-            # only success entries land in index.jsonl
+            # success entries land in index.jsonl
             entry = {k: v for k, v in res.items() if not k.startswith("_")}
             append_jsonl(index_path, entry)
             done.add(entry["clip_id"])
+        else:
+            # record rejection so resume does not re-analyze it
+            cid_log = res.get("clip_id", "")
+            fail_entry = {
+                "clip_id": cid_log,
+                "part":    args.part,
+                "status":  status,
+                "reason":  res.get("reason") or res.get("error") or "",
+            }
+            append_jsonl(failed_path, fail_entry)
+            failed_done.add(cid_log)
 
     print(f"\n[prepare] done. part={args.part} counters: {counters}")
 

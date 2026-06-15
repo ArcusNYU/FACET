@@ -57,14 +57,15 @@ https://github.com/CelebV-HQ/CelebV-HQ
 run_root/data/celebv 的文件结构如下:
 - pipeline 用于将数据集转化为预备训练格式的数据管道
   - __init__ 依然是空文件 但是先保留
-  - cache.py 可以参照于openvid的cache.py 也就是从处理后的数据集中进行cache embedding 详见下面的文件结构预计说明
+  - cache.py 可以参照于openvid的cache.py 也就是从处理后的数据集中进行cache embedding 详见下面的文件结构预计说明 可以说内容逻辑与openvid几乎一摸一样 
   - main.py 如同openvid的main.py 是进行data pipeline的核心代码 将原始的数据集处理 使用SCHP进行parse 并且对抽取出来的ref进行打分
-            不会再有NLI对视频标题筛选提取为csv的环节
-  - parse.py 几乎参照于openvid的parse.py
-  - pipe.sh 也几乎参照于openvid的pipe.sh
-  - prompt.txt 几乎参照于openvid的prompt.txt
+            不会再有关于csv的逻辑 是直接从 celebv的config.prepare.raw_video_root中的downloaded.json读取 需要把过筛并且处理好的注册进cfg.prepare.out_root中的index.jsonl 
+            失败的未过检测的注册进cfg.prepare.out_root中的failed.jsonl 这样在main.py的断点续处理的时候 能够跳过这些已经被判别过的clip
+  - parse.py 几乎参照于openvid的parse.py 
+  - pipe.sh 也几乎参照于openvid的pipe.sh 因为main.py & cache.py的文件结构都接近 都支持 shard 分片处理 目前我已经在celebv的pipe.sh 添加了pipe stage1 aquire需要的内容
+  - prompt.txt 参照于openvid的prompt.txt 不需要其中的 “multiple”部分 因为CELEBV数据集的bbox锁定做的很好 不会出现多人的情况 所以这会需要微调main.py中的筛选逻辑
   - score.py 几乎参照于openvid的score.py
-- splits 先不用管这个文件夹
+- splits 先不用管这个文件夹 后期split.py运行之后会把index.jsonl拆分放进去
 - config.yaml 针对celebv的config 结构相同 但是值会有很多不同 例如不会有csv 目前我在其中已经拟好了草稿
 - celebv.py 针对celev数据集的类 class CelebV 用于在 datasets.py中注册 并且参与联合数据集训练 代码内容类似于 openvid.py 
             但是celebv存储的文件结构会与openvid会有所不同

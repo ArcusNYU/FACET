@@ -45,3 +45,6 @@ python -m data.openvid.pipeline.cache --config "$CFG"
 
 # Stage 3 smoke test:
 # python -m data.openvid.pipeline.cache --config "$CFG" --limit 50
+
+# Stage 4: train/val split -> data/openvid/splits/{train,val}.jsonl
+# python -m data.openvid.split --config "$CFG" --val-ratio 0.1

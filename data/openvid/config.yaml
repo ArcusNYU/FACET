@@ -31,7 +31,8 @@ prepare:
   raw_video_root: /mnt/highspeed/users/Arcus/OPENVID_DATA  
   out_root: /mnt/highspeed/users/Arcus/openvid             # = data_root
   index_file: index.jsonl
-  category: hair       # TODO: multi-category in later iterations
+  failed_file: failed.jsonl       # rejected clips; skipped on resume (see main.py --retry-failed)
+  category: hair
   
   # ==== a. Parsing ====
   schp_model: SCHP/schp.pth
@@ -53,20 +54,20 @@ prepare:
   # main.py rescales when SCHP runs on raw frames, so the semantic stays "min
   # bbox in target space" regardless of source aspect / resolution.
   cv_min_size:
-    face:          48
-    upper_clothes: 100
+    # face:          48
+    # upper_clothes: 100
     # pants:         72
     # dress:         96
-    hat:           32
+    # hat:           32
     hair:          120
     # person:        120
   # cv_mask_ratio: [low, high] for (mask_pixels / bbox_area).
   cv_mask_ratio:
-    face:          [0.30, 0.90]
-    upper_clothes: [0.35, 0.85]
+    # face:          [0.30, 0.90]
+    # upper_clothes: [0.35, 0.85]
     #pants:         [0.20, 0.85]
     #dress:         [0.25, 0.90]
-    hat:           [0.15, 0.80]
+    # hat:           [0.15, 0.80]
     hair:          [0.30, 0.75]
     # person:        [0.30, 0.90]
   # 2) quality evaluation model (pyiqa + MANIQA):

@@ -6,11 +6,11 @@ Your task is to judge the image using exactly three boolean fields:
 
 1. match:
    Whether the main visible content in the image matches the target category.
-   For example, if category is "hair", the image should clearly contain hair of the main character.
+   For example, if category is "hair", the image should clearly contain the hair of the main character.
 
 2. occlusion:
    Whether the target category is severely occluded.
-   Mark true only if the target object is heavily blocked by hands, arms, hair, bag, another person, animal, object, or foreground item, so that its appearance is not clearly visible.
+   Mark true only if the target object is heavily blocked by hands, arms, hat, bag, another object, or foreground item, so that its appearance is not clearly visible.
 
 3. multiple:
    Whether the image contains more than one clearly separate, prominent region of the target category.

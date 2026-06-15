@@ -21,6 +21,8 @@ Layout:
 
 from __future__ import annotations
 
+# TODO FIXME: 加入resume training的功能 因为目前训练周期过长
+
 # =============================================================================
 # 0. HF offline lock + env hygiene
 # =============================================================================
@@ -33,6 +35,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="deepspeed")
 warnings.filterwarnings("ignore", category=FutureWarning, module="mlflow")
+warnings.filterwarnings("ignore", message=".*Setting accelerator to CPU.*")
 
 # =============================================================================
 # 1. Imports

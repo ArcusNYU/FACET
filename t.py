@@ -14,6 +14,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "8")
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="deepspeed")
 warnings.filterwarnings("ignore", category=FutureWarning, module="mlflow")
+warnings.filterwarnings("ignore", message=".*Setting accelerator to CPU.*")
 
 # =============================================================================
 # 1. Imports

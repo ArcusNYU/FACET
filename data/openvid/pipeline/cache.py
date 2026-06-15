@@ -1,5 +1,5 @@
 """
-Dataset Pipeline Stage 3: Latent cache (T5 caption embedding + Wan VAE video latent).
+Openvid Dataset Pipeline Stage 3: Latent cache (T5 caption embedding + Wan VAE video latent).
 Reference: https://github.com/Wan-Video/Wan2.2
 
 Reads {out_root}/index.jsonl produced by main.py. For each qualified clip:

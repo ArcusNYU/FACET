@@ -32,6 +32,8 @@ Example:
         --raw-root /mnt/highspeed/users/Arcus/CELEBV \
         --limit 500 --pool 100 --workers 6 --proc-workers 12
 """
+# TODO: a detailed explanation for FINAL configuration of yt-dlp and ffmpeg
+
 
 from __future__ import annotations
 
@@ -144,10 +146,13 @@ def _run_ytdlp(
     if _COOKIES_PATH.exists():
         cmd += ["--cookies", str(_COOKIES_PATH)]
     cmd += [
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
         "--skip-unavailable-fragments",
         "--concurrent-fragments", "8",     # parallel DASH/HLS fragment download
         "--merge-output-format", "mp4",
+        # force any single-file ("/best") fallback to remux to .mp4, so the
+        # produced file always matches our `{ytb}.mp4` output path.
+        "--remux-video", "mp4",
         # --- native retry / 403 robustness ---------------------------------
         "--retries", str(retries),
         "--fragment-retries", str(fragment_retries),
@@ -177,8 +182,12 @@ def _run_ytdlp(
         return False, "yt-dlp-not-installed"
 
     if proc.returncode != 0 or not raw_path.exists():
-        tail = proc.stderr.decode(errors="ignore")[-200:] if proc.stderr else ""
-        return False, tail.strip() or "unknown-error"
+        # yt-dlp prints most errors to stderr but some (and aria2c's) land on
+        # stdout, so combine both to avoid opaque "unknown-error" reasons.
+        err = proc.stderr.decode(errors="ignore") if proc.stderr else ""
+        out = proc.stdout.decode(errors="ignore") if proc.stdout else ""
+        msg = (err.strip() or out.strip()).replace("\n", " ").strip()
+        return False, msg[-240:] or "unknown-error"
     return True, "ok"
 
 
@@ -323,14 +332,21 @@ def process_clip(
     W, H = size
     x, y, w, h = compute_crop_px(bbox, H, W, pad, top_extra)
     start, end = time
+    dur = end - start
+    if dur <= 0:
+        return False, f"bad-time:{start:.2f}->{end:.2f}"
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Input seek (-ss before -i) + explicit duration (-t) is unambiguous and
+    # avoids the -ss/-to output-timeline footgun that can silently emit an empty
+    # file (the prior "ffmpeg-fail:" with no message). Re-encoding keeps -ss
+    # frame-accurate.
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", _secs_to_timestr(start),
+        "-t", _secs_to_timestr(dur),
         "-i", str(raw_path),
         "-vf", f"crop={w}:{h}:{x}:{y}",
-        "-ss", _secs_to_timestr(start),
-        "-to", _secs_to_timestr(end),
         "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-an",
         str(out_path),
     ]
@@ -340,9 +356,17 @@ def process_clip(
         return False, "ffmpeg-timeout"
     except FileNotFoundError:
         return False, "ffmpeg-not-installed"
-    if proc.returncode != 0 or not out_path.exists():
-        tail = proc.stderr.decode(errors="ignore")[-200:] if proc.stderr else ""
-        return False, f"ffmpeg-fail:{tail}"
+
+    ok = proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0
+    if not ok:
+        err = proc.stderr.decode(errors="ignore") if proc.stderr else ""
+        out = proc.stdout.decode(errors="ignore") if proc.stdout else ""
+        msg = (err.strip() or out.strip()).replace("\n", " ").strip()
+        try:                       # remove empty/partial output so re-runs retry clean
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, f"ffmpeg-fail:{msg[-200:] or 'empty-output'}"
     return True, "ok"
 
 
@@ -406,12 +430,13 @@ def main():
                    help="yt-dlp --retries (whole-download retries with backoff)")
     p.add_argument("--fragment-retries", type=int, default=10,
                    help="yt-dlp --fragment-retries (per-fragment retries with backoff)")
-    p.add_argument("--player-client", default="tv,web_safari,mweb",
-                   help="yt-dlp youtube:player_client list to bypass signature/403 issues")
+    p.add_argument("--player-client", default="tv,ios,web_safari,mweb",
+                   help="yt-dlp youtube:player_client list to bypass signature/403/PO-token issues "
+                        "(more clients = more candidate formats; 'tv'/'ios' usually ungated)")
     p.add_argument("--dl-timeout", type=int, default=900, help="per-video yt-dlp timeout (s)")
     p.add_argument("--crop-pad", type=float, default=0.20,
                    help="symmetric bbox outer padding (fraction of bbox side)")
-    p.add_argument("--crop-top-extra", type=float, default=0.15,
+    p.add_argument("--crop-top-extra", type=float, default=0.20,
                    help="extra upward padding for hair (fraction of bbox height)")
     p.add_argument("--keep-raw", action="store_true",
                    help="keep _raw_tmp youtube downloads instead of deleting them")

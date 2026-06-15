@@ -8,6 +8,7 @@ Dataset Layout (dataset_root):
         meta.json        caption / category / ref_candidates / scores
         ref_imgs/
             *.png        RGBA: bbox fg alpha=255, padding region alpha=0; 480x480
+    latents/{part}/{ab}/{cd}/{clip_id}.pt {tgt_latent: [48,T',H',W'], t5_emb: [L,4096]}
 
 splits/train.jsonl, splits/val.jsonl schema:
     one JSON object per line, same shape as a row in index.jsonl, e.g.
