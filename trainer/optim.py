@@ -215,19 +215,26 @@ def _lr_lambda_constant(_step: int) -> float:
     return 1.0
 
 
-def _lr_lambda_constant_with_warmup(warmup_steps: int):
+def _lr_lambda_constant_with_warmup(warmup_steps: int, resume_step: int = 0):
     """
     Linear warmup from 0 -> 1 over `warmup_steps`, then constant.
+
+    `resume_step` offsets the effective step so a resumed run does NOT re-warm
+    up: with resume_step >= warmup_steps the multiplier is 1.0 from the first
+    resumed step (lr already at its post-warmup constant -- no optimizer state
+    needed to restore the schedule).
 
     Defensive: if warmup_steps <= 0, behave like 'constant'.
     """
     warmup_steps = max(0, int(warmup_steps))
+    resume_step = max(0, int(resume_step))
 
     def _lr_lambda(step: int) -> float:
+        eff = step + resume_step
         if warmup_steps == 0:
             return 1.0
-        if step < warmup_steps:
-            return float(step) / float(warmup_steps)
+        if eff < warmup_steps:
+            return float(eff) / float(warmup_steps)
         return 1.0
 
     return _lr_lambda
@@ -238,6 +245,7 @@ def build_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     cfg_train: TrainConfig,
     total_steps: int,
+    resume_step: int = 0,
 ) -> LambdaLR:
     """
     Build the LR scheduler. Counted in OPTIMIZER STEPS (post-accumulation).
@@ -245,6 +253,9 @@ def build_lr_scheduler(
     Supported (cfg_train.scheduler.name):
         - "constant"
         - "constant_with_warmup"
+
+    resume_step: optimizer step the run resumes from (0 for a fresh run). Used
+    to fast-forward past the warmup ramp without persisting optimizer state.
     """
     name = cfg_train.scheduler.name.lower()
     if name == "constant":
@@ -257,7 +268,7 @@ def build_lr_scheduler(
                 "scheduler will warm up across the entire run.",
                 warmup, total_steps,
             )
-        lr_lambda = _lr_lambda_constant_with_warmup(warmup)
+        lr_lambda = _lr_lambda_constant_with_warmup(warmup, resume_step=resume_step)
     else:
         raise ValueError(
             f"[trainer.optim] Unsupported scheduler.name={name!r}; "

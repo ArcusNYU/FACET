@@ -116,18 +116,23 @@ def _track(scalars: Dict[str, float], step: int) -> None:
         logger.warning("[trainer.logger] accelerator.log failed: %s", e)
 
 
-def log_step(loss: float, lr: float, grad_norm: Optional[float], global_step: int) -> None:
-    """Per-step training log: console + tracker + jsonl (main process)."""
+def log_step(loss: float, lr: float, grad_norm: Optional[float], global_step: int,
+             epoch: int) -> None:
+    """Per-step training log: console + tracker + jsonl (main process).
+    """
     if not _STATE.get("is_main"):
         return
     gn = "n/a" if grad_norm is None else f"{grad_norm:.4f}"
-    logger.info("[step %d] loss=%.5f lr=%.3e grad_norm=%s", global_step, loss, lr, gn)
+    ep = f" epoch={epoch}"
+    logger.info("[step %d%s] loss=%.5f lr=%.3e grad_norm=%s", global_step, ep, loss, lr, gn)
 
     scalars: Dict[str, float] = {"train/loss": float(loss), "train/lr": float(lr)}
     if grad_norm is not None:
         scalars["train/grad_norm"] = float(grad_norm)
     _track(scalars, global_step)  #NOTE: 后续要log新的内容 就在这下面直接添加
-    _append_jsonl({"step": global_step, "phase": "train", **scalars})
+    record = {"step": global_step, "phase": "train", **scalars}
+    record["epoch"] = int(epoch)
+    _append_jsonl(record)
 
 
 def log_metrics(metrics: Dict[str, Any], global_step: int) -> None:

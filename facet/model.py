@@ -104,6 +104,7 @@ def facet_block_forward(
     bias_floor: float = -1e4,
     attention_mode: str = "asymmetric",
     q_chunk: int = 1024,
+    mask_bias: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward Logic for FACET-WAN DiT block: OminiControl-style 3-branch attention.
@@ -225,18 +226,26 @@ def facet_block_forward(
     scale = 1.0 / math.sqrt(head_dim)
 
     # Mask-aware bias: per-Q-base routing.
+    
+    # NOTE: ABLATION: mask_bias=False -> bias_src/bias_ref stay None, so Q_base attends
+    # K_src/K_ref with NO routing prior (plain learned 3-branch attention). This
+    # is the ablation arm for the OminiControl mask bias (see facet/config.yaml).
+
+    bias_src = None
+    bias_ref = None
+    if mask_bias:
     # m_q = m[:, None, :, None]  -> [B, 1, L_base, 1]; broadcasts over heads and K dim.
-    m_q = mask_coverage.to(v_b_h.dtype)[:, None, :, None]
+        m_q = mask_coverage.to(v_b_h.dtype)[:, None, :, None]
 
-    m_q_reverse = (1.0 - m_q).clamp_min(safe_epsilon)
-    m_q = m_q.clamp_min(safe_epsilon)
+        m_q_reverse = (1.0 - m_q).clamp_min(safe_epsilon)
+        m_q = m_q.clamp_min(safe_epsilon)
 
-    bias_src = (gamma * torch.log(m_q_reverse)).clamp_min(bias_floor)   # [B, 1, L_base, 1]
-    bias_ref = (gamma * torch.log(m_q)        ).clamp_min(bias_floor)   # [B, 1, L_base, 1]
+        bias_src = (gamma * torch.log(m_q_reverse)).clamp_min(bias_floor)   # [B, 1, L_base, 1]
+        bias_ref = (gamma * torch.log(m_q)        ).clamp_min(bias_floor)   # [B, 1, L_base, 1]
 
     v_all = torch.cat([v_b_h, v_s_h, v_r_h], dim=2)   # [B, n_heads, L_all, head_dim]
 
-    # Memory: a full score [B, n_heads, L_base, 2*L_base + L_ref] plus its fp32 softmax
+    # NOTE: Memory: a full score [B, n_heads, L_base, 2*L_base + L_ref] plus its fp32 softmax
     # copy is O(L_base^2) and dominates VRAM (e.g. L_base=8190 -> ~12 GiB for the fp32
     # score alone). Chunk the QUERY axis so peak memory scales with q_chunk instead of
     # L_base; the math is identical (each query row still does a global softmax over the
@@ -250,8 +259,11 @@ def facet_block_forward(
 
         # Scores for this query chunk: [B, n_heads, c, L_*]
         s_base = (qb_c  @ k_b_h.transpose(-2, -1)) * scale
-        s_src  = (qb_c  @ k_s_h.transpose(-2, -1)) * scale + bias_src[:, :, i:j]
-        s_ref  = (qf0_c @ k_r_h.transpose(-2, -1)) * scale + bias_ref[:, :, i:j]  # delta_f = 0
+        s_src  = (qb_c  @ k_s_h.transpose(-2, -1)) * scale
+        s_ref  = (qf0_c @ k_r_h.transpose(-2, -1)) * scale            # delta_f = 0
+        if mask_bias:
+            s_src = s_src + bias_src[:, :, i:j]
+            s_ref = s_ref + bias_ref[:, :, i:j]
 
         # Global softmax over [K_base | K_src | K_ref] in fp32 for stability.
         s = torch.cat([s_base, s_src, s_ref], dim=-1)
@@ -617,6 +629,8 @@ class FACETWanModel(nn.Module):
         gamma = float(self.cfg.source.gamma)
         safe_epsilon = float(self.cfg.source.safe_epsilon)
         attention_mode = self.cfg.source.attention_mode
+        # Ablation switch: when False, skip the mask-aware routing bias entirely.
+        mask_bias = bool(getattr(self.cfg.source, "mask_bias", True))
         # Query-chunk size for the base-branch attention (caps O(L^2) VRAM). Tunable
         # via cfg.source.q_chunk; <=0 disables chunking (full-length attention).
         q_chunk = int(getattr(self.cfg.source, "q_chunk", 2048)) # for A100-80GB
@@ -624,6 +638,7 @@ class FACETWanModel(nn.Module):
         # ---- 8. Iterate DiT blocks with custom branch attention ----
         gc_enabled = bool(self.cfg.gradient_checkpointing) and self.training
 
+        # NOTE: q_chunk is always enabled in case of OOM.(at least needed on A100-80GB)
         for block in self.dit.blocks:
             if gc_enabled:
                 x_base, x_src, x_ref = torch.utils.checkpoint.checkpoint(
@@ -636,6 +651,7 @@ class FACETWanModel(nn.Module):
                     safe_epsilon=safe_epsilon,
                     attention_mode=attention_mode,
                     q_chunk=q_chunk,
+                    mask_bias=mask_bias,
                     use_reentrant=False,
                 )
             else:
@@ -648,6 +664,7 @@ class FACETWanModel(nn.Module):
                     safe_epsilon=safe_epsilon,
                     attention_mode=attention_mode,
                     q_chunk=q_chunk,
+                    mask_bias=mask_bias,
                 )
 
         # ---- 9. Head (base branch only) + unpatchify ----

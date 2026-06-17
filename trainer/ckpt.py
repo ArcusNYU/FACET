@@ -7,18 +7,20 @@ top-K bookkeeping in-instance (the "global variable" lives on the manager held
 by train.py), so when a (K+1)-th better checkpoint arrives the worst one is
 evicted from disk and only K survive.
 
-Two output locations:
-  runs/<run>/ckpts/                : per-run training snapshots (top-K kept here)
-  <ckpt_root>/<run_name>_best.safetensors  : the single best, exported for test.py
-  <ckpt_root>/<run_name>_last.safetensors  : always-overwritten latest (resume aid)
-  <ckpt_root>/manifest.json                : best/topk pointers + source run dir
+Output locations:
+  runs/<run>/ckpts/<run_name>_last.safetensors : always-overwritten latest +
+       last.json sidecar {global_step, epoch}  -> RESUME source (per-run only).
+  runs/<run>/ckpts/step_*.safetensors          : per-run top-K snapshots.
+  <ckpt_root>/<run_name>_best.safetensors      : the single best, exported for test.py.
+  <ckpt_root>/manifest.json                    : best/topk pointers + source run dir.
 
 Saving uses FACETWanModel.save_lora (facet/model.py), which filters lora_down /
 lora_up out of state_dict. DDP-safe: only the main process writes, and the model
 is unwrapped via accelerator.unwrap_model before save_lora.
 
-TODO: Resume is intentionally NOT implemented (no maybe_resume): train.py always
-starts from step 0 for now.
+Resume: find_resume(run_root, run_name) locates the _last weights + sidecar so
+train.py can reload LoRA + restore (global_step, epoch). Optimizer state is NOT
+persisted (lr is constant post-warmup; Adam moments re-warm quickly for LoRA).
 """
 
 from __future__ import annotations
@@ -48,6 +50,33 @@ def _direction(metric: str) -> str:
         return "min"
     logger.warning("[trainer.ckpt] unknown primary_metric=%r; assuming lower-is-better.", metric)
     return "min"
+
+
+def find_resume(run_root, run_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Locate a resumable checkpoint for `run_name`.
+
+    Searches runs/<run_name>/ckpts/ for <run_name>_last.safetensors and 
+    last.json sidecar. Returns {"path", "global_step", "epoch"} or
+    None when the weights are absent (-> caller starts fresh).
+    """
+    ckpt_dir = Path(run_root) / run_name / "ckpts"
+    weights = ckpt_dir / f"{run_name}_last.safetensors"
+    sidecar = ckpt_dir / f"last.json"
+    if not weights.exists():
+        logger.warning("[trainer.ckpt] resume: %s not found; starting fresh.", weights)
+        return None
+    step, epoch = 0, 0
+    if sidecar.exists():
+        try:
+            d = json.loads(sidecar.read_text(encoding="utf-8"))
+            step = int(d.get("global_step", 0))
+            epoch = int(d.get("epoch", 0))
+        except (OSError, json.JSONDecodeError, ValueError):
+            logger.warning("[trainer.ckpt] resume: cannot parse %s; step/epoch=0.", sidecar)
+    else:
+        logger.warning("[trainer.ckpt] resume: sidecar %s missing; step/epoch=0.", sidecar)
+    return {"path": str(weights), "global_step": step, "epoch": epoch}
 
 
 class CheckpointManager:
@@ -103,20 +132,33 @@ class CheckpointManager:
         return self.accelerator.unwrap_model(model)
 
     # ---- last (rolling) -----------------------------------------------------
-    def save_last(self, model, global_step: int) -> Optional[Path]:
+    def save_last(self, model, global_step: int, epoch: int = 0) -> Optional[Path]:
         """
-        Overwrite <ckpt_root>/<run_name>_last.safetensors with current LoRA.
+        Overwrite runs/<run>/ckpts/<run_name>_last.safetensors with current LoRA,
+        plus a last.json sidecar {global_step, epoch} for resume.
 
         Always called on the cadence; cheap rolling snapshot for inspection /
-        future resume. Main process only.
+        resume. Stays in the per-run ckpts/ dir (never exported to ckpt_root).
+        Main process only.
         """
         self.accelerator.wait_for_everyone()
         out_path: Optional[Path] = None
         if self.accelerator.is_main_process:
-            self.ckpt_root.mkdir(parents=True, exist_ok=True)
-            out_path = self.ckpt_root / f"{self.run_name}_last.safetensors"
+            self.run_ckpt_dir.mkdir(parents=True, exist_ok=True)
+            out_path = self.run_ckpt_dir / f"{self.run_name}_last.safetensors"
             self._unwrap(model).save_lora(str(out_path))
-            logger.info("[trainer.ckpt] last -> %s (step %d)", out_path, global_step)
+            # overwrite (not append)
+            sidecar = self.run_ckpt_dir / "last.json"
+            sidecar.write_text(
+                json.dumps(
+                    {"global_step": int(global_step), "epoch": int(epoch),
+                     "run_name": self.run_name,
+                     "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                    ensure_ascii=False, indent=2,
+                ),
+                encoding="utf-8",
+            )
+            logger.info("[trainer.ckpt] last -> %s (step %d, epoch %d)", out_path, global_step, epoch)
         self.accelerator.wait_for_everyone()
         return out_path
 
@@ -204,7 +246,7 @@ class CheckpointManager:
             "direction": self.direction,
             "source_run_dir": str(self.output_root.resolve()),
             "best_export": str((self.ckpt_root / f"{self.run_name}_best.safetensors").resolve()),
-            "last_export": str((self.ckpt_root / f"{self.run_name}_last.safetensors").resolve()),
+            "last_ckpt": str((self.run_ckpt_dir / f"{self.run_name}_last.safetensors").resolve()),
             "best": best,
             "topk": self._registry,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

@@ -141,7 +141,8 @@ class OptimizerConfig:
 @dataclass
 class SchedulerConfig:
     name: str = "constant_with_warmup"           # "constant" | "constant_with_warmup"
-    warmup_steps: int = 1000
+    warmup_steps: int = 250
+    # NOTE: 目前前100步梯度下降稳定 随后波动 所以warmup_steps设置为250合理
 
 
 @dataclass
@@ -158,10 +159,11 @@ class TrainConfig:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
-    log_every_steps: int = 10
-    val_every_steps: int = 500
-    save_every_steps: int = 1000
-    start_eval_steps: int = 10000
+    log_every_steps: int = 20
+    val_every_steps: int = 1000             # val-loss cadence
+    save_every_steps: int = 200             # rolling _last snapshot cadence (resume aid)
+    eval_every_steps: int = 2000            # full video generation + light metrics cadence
+    start_eval_steps: int = 5000            # no validation/eval before this step
 
 
 @dataclass
@@ -173,11 +175,16 @@ class RunConfig:
 
 @dataclass
 class LogConfig:
-    """Cloud + console logging."""
+    """
+    Cloud + console logging.
+
+    NOTE: logging cadence is driven by cfg.train.log_every_steps (single source
+    of truth); LogConfig intentionally carries NO log_every_steps to avoid a
+    duplicate knob.
+    """
     backend: str = "mlflow"                      # "mlflow" | "tensorboard" | "none"
     project_name: str = "facet"
     cloud_run_name: Optional[str] = None         # None -> use run_name
-    log_every_steps: int = 10
     log_grad_norm: bool = True
     log_timestep_hist: bool = True
 

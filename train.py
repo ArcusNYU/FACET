@@ -21,8 +21,6 @@ Layout:
 
 from __future__ import annotations
 
-# TODO FIXME: 加入resume training的功能 因为目前训练周期过长
-
 # =============================================================================
 # 0. HF offline lock + env hygiene
 # =============================================================================
@@ -174,6 +172,21 @@ def main() -> None:
     # 3.1 Mark LoRA params trainable (base already frozen in __init__).
     model.set_lora(trainable=True)
 
+    # 3.2 Resume (optional).
+    global_step = 0
+    start_epoch = 0
+    if cfg.run.resume_from:
+        resume_info = trainer.ckpt.find_resume(cfg.paths.run_root, ctx.run_name)
+        if resume_info is not None:
+            model.load_lora(resume_info["path"])
+            global_step = int(resume_info["global_step"])
+            start_epoch = int(resume_info["epoch"])
+            if accelerator.is_main_process:
+                logger.info(
+                    "[train] RESUME %s | global_step=%d start_epoch=%d",
+                    resume_info["path"], global_step, start_epoch,
+                )
+
     # -------- 4. Trainable-parameter stats ----------------------------------
     if accelerator.is_main_process:
         trainer.optim.model_stats(model, lora_targets=cfg.facet.lora.target_modules, output_root=ctx.output_root)
@@ -190,7 +203,9 @@ def main() -> None:
 
     # -------- 6. Optimizer (LoRA-only) + LR scheduler ---
     optimizer = trainer.optim.build_optimizer(model, cfg.train)
-    lr_scheduler = trainer.optim.build_lr_scheduler(optimizer, cfg.train, total_steps=total_steps)
+    lr_scheduler = trainer.optim.build_lr_scheduler(
+        optimizer, cfg.train, total_steps=total_steps, resume_step=global_step,
+    )
 
     # -------- 7. accelerator.prepare ----------------------------------------
     # val_loader is intentionally NOT prepared: trainer.valid forwards through the
@@ -228,9 +243,6 @@ def main() -> None:
                         track_root= _PROJECT_ROOT / "mlflow")
 
     # -------- 10. Loop counters ---------------------------------------------
-    global_step = 0
-    start_epoch = 0
-
     if accelerator.is_main_process:
         logger.info(
             "[train] setup complete.\n"
@@ -247,6 +259,7 @@ def main() -> None:
 
     pbar = tqdm(
         total=total_steps,
+        initial=global_step,             # resume: start the bar at the restored step
         disable=not accelerator.is_main_process,
         desc="train",
         dynamic_ncols=True,
@@ -308,11 +321,11 @@ def main() -> None:
                     trainer.logger.log_step(
                         loss.detach().float().item(),
                         lr_scheduler.get_last_lr()[0],
-                        gn, global_step,
+                        gn, global_step, epoch=epoch,
                     )
 
                 if global_step % int(cfg.train.save_every_steps) == 0:
-                    ckpt_mgr.save_last(model, global_step)
+                    ckpt_mgr.save_last(model, global_step, epoch)
 
                 # f. validation (gated): skip until start_eval_steps, since a full
                 #    val pass (loss over val set + sample generation) is costly.
@@ -331,7 +344,7 @@ def main() -> None:
                     break
 
     pbar.close()
-    ckpt_mgr.save_last(model, global_step)
+    ckpt_mgr.save_last(model, global_step, epoch)
 
     # -------- 12. Final Evaluation -------------------------------------------
     accelerator.wait_for_everyone()

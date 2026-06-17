@@ -123,7 +123,7 @@ class MaskPerturb:
         self.elastic_alpha = elastic_alpha
         self.elastic_sigma = elastic_sigma
 
-    def __call__(self, arr: np.ndarray) -> torch.Tensor:
+    def __call__(self, arr: np.ndarray, perturb: bool = True) -> torch.Tensor:
         m = torch.from_numpy(arr).float()
         if m.max() > 1.5:
             m = m.div_(255.0) # if uint8, normalize to [0, 1]
@@ -132,19 +132,22 @@ class MaskPerturb:
         if m.shape[-2] != self.h or m.shape[-1] != self.w:
             m = _fit_pad(m, self.h, self.w, mode="nearest")
 
-        # Single uniform draw partitions [0, 1) into three buckets:
-        #   [0, p_dilate)                        -> dilate
-        #   [p_dilate, p_dilate + p_erode)       -> erode
-        #   [p_dilate + p_erode, 1)              -> no-op
-        # (e.g. with p_dilate = p_erode = 0.5, both ran 25% of the time).
-        r = random.random()
-        if r < self.p_dilate:
-            m = self._dilate(m, self._odd(random.randint(*self.dilate_range)))
-        elif r < self.p_dilate + self.p_erode:
-            m = self._erode(m, self._odd(random.randint(*self.erode_range)))
-        # elastic is independent and stacks on top of the chosen branch
-        if random.random() < self.p_elastic:
-            m = self._warp(m, self._elastic_grid(self.h, self.w))
+        # NOTE: perturb=False (val / inference): apply ONLY resize + binarize, NO
+        # morphological / elastic distortion. The val loader passes perturb=False for validation consistency.
+        if perturb:
+            # Single uniform draw partitions [0, 1) into three buckets:
+            #   [0, p_dilate)                        -> dilate
+            #   [p_dilate, p_dilate + p_erode)       -> erode
+            #   [p_dilate + p_erode, 1)              -> no-op
+            # (e.g. with p_dilate = p_erode = 0.5, both ran 25% of the time).
+            r = random.random()
+            if r < self.p_dilate:
+                m = self._dilate(m, self._odd(random.randint(*self.dilate_range)))
+            elif r < self.p_dilate + self.p_erode:
+                m = self._erode(m, self._odd(random.randint(*self.erode_range)))
+            # elastic is independent and stacks on top of the chosen branch
+            if random.random() < self.p_elastic:
+                m = self._warp(m, self._elastic_grid(self.h, self.w))
 
         return (m > 0.5).float()
 

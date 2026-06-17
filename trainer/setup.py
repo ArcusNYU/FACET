@@ -191,7 +191,13 @@ def _build_run_name(cfg: MergedConfig, total_steps: int) -> str:
 
     suffix is `cfg.run.suffix` (input by user); when empty the trailing
     underscore is dropped.
+
+    Resume: when cfg.run.resume_from is set it IS the run_name to continue, so
+    it is returned verbatim (the run keeps writing into its existing
+    runs/<resume_from>/ dir rather than spawning a new one).
     """
+    if cfg.run.resume_from:
+        return str(cfg.run.resume_from)
     stamp = dt.datetime.now().strftime("%m%d")
     suffix = (cfg.run.suffix or "").strip()
     suffix = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in suffix)

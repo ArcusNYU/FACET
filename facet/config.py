@@ -85,6 +85,9 @@ class FACETSourceConfig:
 
     # OminiControl-style mask-aware attention
     attention_mode: str = "asymmetric"      # "asymmetric" | "full_iteration"
+    mask_bias: bool = True                   # NOTE: ablation switch: True = apply the mask-aware
+                                             # routing bias on Q_base->K_src/K_ref; False =
+                                             # plain 3-branch attention (model learns routing).
     gamma: float = 1.0
     safe_epsilon: float = 1e-3
     mask_dilation: int = 0                  # 0 = no dilation
@@ -139,8 +142,8 @@ class FACETLoRAConfig:
     target_modules: Tuple[str, ...] = ("q", "k", "v", "o", "ffn.0", "ffn.2")
     on_base_blocks: bool = True             # inject LoRA on dit.blocks.*
     on_cross_attn: bool = False             # if False, q/k/v/o in cross_attn are skipped
-    rank: int = 32
-    alpha: int = 32
+    rank: int = 64                          # recommended start; ablation arms: 32 / 64 / 128
+    alpha: int = 64                         # keep alpha == rank (scale = 1.0)
     dropout: float = 0.0
     init: str = "kaiming_zero"              # only kaiming_zero supported in v1
 

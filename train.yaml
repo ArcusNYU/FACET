@@ -57,7 +57,7 @@ accel:
   # NOTE: <matmul_precision = "high"> matches <allow_tf32 = true>
   find_unused_parameters:    false      # (default) 3-branch attn uses every LoRA param every step
   launcher:                  "auto"     # "auto" | "python" | "accelerate"  (read by launch_train.py)
-  gpu_ids:                   [0]        # which GPU ids this run may use; num_gpus inferred from len()
+  gpu_ids:                   [8]        # which GPU ids this run may use; num_gpus inferred from len()
   main_process_port:         29555      # accelerate DDP rendezvous port; change if the default 29500 is taken
 
 # -----------------------------------------------------------------------------
@@ -82,12 +82,13 @@ train:
 
   scheduler:
     name:          "constant_with_warmup"     # "constant" | "constant_with_warmup"
-    warmup_steps:  1000                        # TODO: 涉及更改
+    warmup_steps:  250                         # LoRA needs only a short ramp (was 1000)
 
-  log_every_steps:  20
-  val_every_steps:  1000
-  save_every_steps: 1000                      # ckpt snapshot cadence (top-K bookkeeping)
-  start_eval_steps: 5000
+  log_every_steps:  20                        # train-loss cadence (single source of truth)
+  val_every_steps:  1000                      # val-loss cadence
+  save_every_steps: 200                       # rolling _last snapshot (resume aid); LoRA ckpt is small
+  eval_every_steps: 2000                      # full video generation + light metrics (PSNR/SSIM/LPIPS)
+  start_eval_steps: 5000                      # no validation/eval before this step
 
 # -----------------------------------------------------------------------------
 # 4. run:
@@ -95,8 +96,9 @@ train:
 #    run_name = f"{MMDD}_s{max_steps}_{suffix}"
 # -----------------------------------------------------------------------------
 run:
-  suffix: "facet_r32"     # short tag; appended to run_name
-  resume_from: null       # path to a runs/<run>/ckpts/step_xxx.pt (reserved; resume is not implemented yet)
+  suffix: "facet_r64"     # short tag; appended to run_name
+  resume_from: null       # null = fresh run. Set to an existing run_name (e.g. "0617_s20000_facet_r64")
+                          # to resume: reloads runs/<run_name>/ckpts/<run_name>_last.safetensors + step/epoch.
 
 # -----------------------------------------------------------------------------
 # 5. log:
@@ -106,7 +108,6 @@ log:
   backend:         "mlflow"     # "mlflow" | "tensorboard" | "none"
   project_name:    "facet"
   cloud_run_name:  null         # null -> use run_name
-  log_every_steps: 50           # console / mlflow scalar cadence
   log_grad_norm:   true
   log_timestep_hist: true       # histogram of sampled t (debug timestep distribution)
 

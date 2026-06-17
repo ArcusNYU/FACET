@@ -6,7 +6,7 @@ Two public entry points
 -----------------------
 run(...)        : called every cfg.train.val_every_steps (gated by start_eval).
                   ALWAYS computes validation loss over the (sharded) val set.
-                  On cfg.train.save_every_steps it ALSO generates a FIXED set of
+                  On cfg.train.eval_every_steps it ALSO generates a FIXED set of
                   videos, scores light metrics (psnr/ssim/lpips), and dumps the
                   generated clips + their ground truth under
                       runs/<run>/samples/step_<global_step>/<clip_id>/{pred,gt}.mp4
@@ -154,9 +154,10 @@ def run(
 
     raw_model.eval()
 
+    # do_gen: full video generation + light metrics 
     do_gen = (
-        int(cfg.train.save_every_steps) > 0
-        and global_step % int(cfg.train.save_every_steps) == 0
+        int(cfg.train.eval_every_steps) > 0
+        and global_step % int(cfg.train.eval_every_steps) == 0
     )
     chosen = (
         _select_gen_ids(

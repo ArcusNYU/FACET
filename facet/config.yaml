@@ -40,7 +40,8 @@ model:
 
     # OminiControl-style mask-aware bias (Q_base attend K_src / K_ref 时叠加)
     attention_mode: "asymmetric"          # "asymmetric" | "full_iteration"
-    gamma: 1.0                            # log-bias 缩放因子(超参  后期可改成 per-layer 可学习参数)
+    mask_bias: true                       # ablation 开关: true=施加 mask-aware routing bias; false=普通三分支注意力(模型自学路由)
+    gamma: 1.0                            # log-bias 缩放因子; 调小=更温和的路由(缓解特定问题*); 1.0=原始强度 消融实验尝试0.5
     safe_epsilon: 1.0e-3                  # 防 log(0) 数值下溢
     mask_dilation: 0                      # mask 在 pool 之前的像素级 dilation 边界泄露时调高
     mask_pool: "avg"                      # "avg" | "nearest"
@@ -60,8 +61,8 @@ model:
     target_modules: ["q", "k", "v", "o", "ffn.0", "ffn.2"]
     on_base_blocks: True      # 对于WAN DiT blocks注入LoRA参数
     on_cross_attn: False      # 当前任务不以文字控制训练为主
-    rank: 32                  # 沿用 DiffSynth 的设置
-    alpha: 32
+    rank: 64                  # ablation: 32 / 64 / 128
+    alpha: 64                 # alpha 与 rank 同步增长, scale=alpha/rank=1.0 保持不变
     dropout: 0.0
     init: "kaiming_zero"
 

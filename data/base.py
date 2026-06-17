@@ -37,8 +37,10 @@ class BaseVideoDataset(Dataset):
         meta = self._load(idx)
         # tgt_video: clean ground-truth signal; in [-1, 1]
         tgt_video = self.tfm.video(meta["video"])             # [T,3,H,W]
-        # src_mask : perturbed binary mask in {0, 1}
-        src_mask  = self.tfm.mask(meta["mask"])               # [T,1,H,W]
+        # src_mask : perturbed binary mask in {0, 1}.
+        # Perturbation (dilate/erode/elastic) is a TRAIN-ONLY augmentation; the
+        # val split passes perturb=False for validation consistency.
+        src_mask  = self.tfm.mask(meta["mask"], perturb=(self.split == "train"))  # [T,1,H,W]
         # src_video: tgt_video with the masked region painted to neutral gray 127.
         GRAY_127_NORM = 0.0
         src_video = torch.where(
