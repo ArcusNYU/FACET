@@ -75,20 +75,20 @@ train:
 
   optimizer:
     name:          "adamw"
-    lr:            1.0e-4                     # DiffSynth Wan2.2-TI2V-5B.sh default
+    lr:            1.0e-4                     # DiffSynth Wan2.2-TI2V-5B.sh default 当使用r=128时 如果出现梯度不收敛 则调小至5e-5
     betas:         [0.9, 0.999]
     weight_decay:  1.0e-2                     # DiffSynth default; set 0.0 if you find LoRA drift
     eps:           1.0e-8
 
   scheduler:
     name:          "constant_with_warmup"     # "constant" | "constant_with_warmup"
-    warmup_steps:  250                         # LoRA needs only a short ramp (was 1000)
+    warmup_steps:  250                        # LoRA needs only a short ramp (was 1000)
 
   log_every_steps:  20                        # train-loss cadence (single source of truth)
-  val_every_steps:  1000                      # val-loss cadence
+  val_every_steps:  500                       # val-loss cadence
   save_every_steps: 200                       # rolling _last snapshot (resume aid); LoRA ckpt is small
-  eval_every_steps: 2000                      # full video generation + light metrics (PSNR/SSIM/LPIPS)
-  start_eval_steps: 5000                      # no validation/eval before this step
+  eval_every_steps: 500                       # full video generation + light metrics (PSNR/SSIM/LPIPS)
+  start_eval_steps: 2000                      # no validation/eval before this step
 
 # -----------------------------------------------------------------------------
 # 4. run:
@@ -97,7 +97,7 @@ train:
 # -----------------------------------------------------------------------------
 run:
   suffix: "facet_r64"     # short tag; appended to run_name
-  resume_from: null       # null = fresh run. Set to an existing run_name (e.g. "0617_s20000_facet_r64")
+  resume_from: null       # null = fresh run. Set to an existing run_name (e.g. "xxxx_s20000_facet_r64")
                           # to resume: reloads runs/<run_name>/ckpts/<run_name>_last.safetensors + step/epoch.
 
 # -----------------------------------------------------------------------------

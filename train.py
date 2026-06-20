@@ -18,6 +18,7 @@ Layout:
     11. training loop (loss/log/save + gated trainer.valid.run -> top-K)
     12. heavy metrics on best checkpoint + trainer.logger.finish()
 """
+# FIXME: 设置衰减的学习率 根据 train loss / valid loss 可视化曲线结果
 
 from __future__ import annotations
 
@@ -249,10 +250,12 @@ def main() -> None:
             "  total_steps      = %d\n"
             "  epochs           = %d\n"
             "  len(train_loader)= %d  (per-rank)\n"
+            "  len(valid_loader)= %d  (per-rank)\n"
             "  log_every        = %d   val_every = %d   save_every = %d\n"
             "  run_name         = %s\n"
             "  output_root      = %s",
-            total_steps, int(cfg.train.epochs), len(train_loader),
+            total_steps, int(cfg.train.epochs), 
+            len(train_loader), len(val_loader),
             int(cfg.train.log_every_steps), int(cfg.train.val_every_steps),
             int(cfg.train.save_every_steps), ctx.run_name, ctx.output_root,
         )
@@ -329,7 +332,7 @@ def main() -> None:
 
                 # f. validation (gated): skip until start_eval_steps, since a full
                 #    val pass (loss over val set + sample generation) is costly.
-                if (global_step > int(cfg.train.start_eval_steps)
+                if (global_step >= int(cfg.train.start_eval_steps)
                         and global_step % int(cfg.train.val_every_steps) == 0):
                     metrics_dict = trainer.valid.run(
                         prepare_batch, raw_model, flow,

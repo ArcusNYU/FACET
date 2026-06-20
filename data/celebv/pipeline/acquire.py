@@ -439,7 +439,7 @@ def main():
     p.add_argument("--dl-timeout", type=int, default=900, help="per-video yt-dlp timeout (s)")
     p.add_argument("--crop-pad", type=float, default=0.20,
                    help="symmetric bbox outer padding (fraction of bbox side)")
-    p.add_argument("--crop-top-extra", type=float, default=0.20,
+    p.add_argument("--crop-top-extra", type=float, default=0.25,
                    help="extra upward padding for hair (fraction of bbox height)")
     p.add_argument("--keep-raw", action="store_true",
                    help="keep _raw_tmp youtube downloads instead of deleting them")

@@ -29,6 +29,8 @@ Design notes
   are scored at every validation pass -> metric deltas reflect weight changes,
   not a moving sample set.
 """
+# FIXME: 现在validation loader的step采样有无固定? 如果没有固定的话 那么评测的loss结果也不固定
+# 需要均匀铺开 查看在不同step上的loss结果
 
 from __future__ import annotations
 

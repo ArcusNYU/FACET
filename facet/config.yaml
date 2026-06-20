@@ -58,7 +58,7 @@ model:
     kv_cache: true            # 仅 inference 使用 training中暂不使用
 
   lora:
-    target_modules: ["q", "k", "v", "o", "ffn.0", "ffn.2"]
+    target_modules: ["q", "k", "v", "o", "ffn.0", "ffn.2"]  #NOTE: 在LoRA rank扩充到128并且需要减少参数时 优先考虑丢弃ffn
     on_base_blocks: True      # 对于WAN DiT blocks注入LoRA参数
     on_cross_attn: False      # 当前任务不以文字控制训练为主
     rank: 64                  # ablation: 32 / 64 / 128
