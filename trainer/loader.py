@@ -26,13 +26,27 @@ collate design:
 """
 
 from __future__ import annotations
+import random
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from data.datasets import build_datasets
 from data.sampler import MultiSampler
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Make per-worker augmentation RNG deterministic from the DataLoader seed.
+
+    Mirroring the worker's torch seed into random + numpy makes the augmentation 
+    reproducible run-to-run for a fixed cfg.train.seed, while staying distinct per worker.
+    """
+    base = torch.initial_seed() % (2 ** 32)
+    # torch.initial_seed() returns the seed assgined to the current worker from PyTorch
+    np.random.seed(base)
+    random.seed(base)
 
 
 def build_loaders(
@@ -62,6 +76,14 @@ def build_loaders(
         drop_last=False,
     )
 
+    # NOTE: Explicit per-loader generators so the worker base seed (and thus the
+    # augmentation RNG seeded in _seed_worker) is a deterministic function of
+    # cfg.train.seed, independent of how much global RNG was consumed before the
+    # loaders are first iterated (model/LoRA init, etc.). Offset val by rank so
+    # different ranks still draw distinct augmentation.
+    train_gen = torch.Generator().manual_seed(int(seed) + int(rank))
+    val_gen = torch.Generator().manual_seed(int(seed) + 10_000 + int(rank))
+
     train_loader = DataLoader(
         train_concat,
         batch_size=batch_size,
@@ -71,6 +93,8 @@ def build_loaders(
         drop_last=drop_last_train,
         pin_memory=False,
         persistent_workers=(num_workers > 0),
+        worker_init_fn=_seed_worker,
+        generator=train_gen,
     )
     val_loader = DataLoader(
         val_concat,
@@ -81,6 +105,8 @@ def build_loaders(
         drop_last=False,
         pin_memory=False,
         persistent_workers=(num_workers > 0),
+        worker_init_fn=_seed_worker,
+        generator=val_gen,
     )
     return train_loader, val_loader, train_sampler, val_sampler
 

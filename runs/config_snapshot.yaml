@@ -1,0 +1,222 @@
+facet:
+  name: FACET-WAN2.2
+  dtype: bf16
+  device: cuda
+  gradient_checkpointing: true
+  base:
+    load_from: local
+    id: Wan-AI/Wan2.2-TI2V-5B
+    dir: ./weights/WAN2.2
+    dit: diffusion_pytorch_model*.safetensors
+    t5: models_t5_umt5-xxl-enc-bf16.pth
+    vae: Wan2.2_VAE.pth
+    tokenizer: google/umt5-xxl
+  wan:
+    model_type: ti2v
+    patch_size:
+    - 1
+    - 2
+    - 2
+    vae_temporal_stride: 4
+    vae_spatial_stride: 16
+    token_temporal_stride: 4
+    token_spatial_stride: 32
+  target:
+    height: 480
+    width: 832
+    num_frames: 81
+    hw_multiple: 32
+  source:
+    f_offset: 0
+    timestep: 0.0
+    injection_mode: branch_attention
+    attention_mode: asymmetric
+    mask_bias: true
+    gamma: 1.0
+    safe_epsilon: 0.001
+    mask_dilation: 0
+    mask_pool: avg
+    q_chunk: 2048
+    detach_latent: true
+    kv_cache: true
+  reference:
+    image_size: 480
+    h_offset: 0
+    w_offset: 26
+    detach_latent: true
+    timestep: 0.0
+    injection_mode: branch_attention
+    kv_cache: true
+  lora:
+    target_modules:
+    - q
+    - k
+    - v
+    - o
+    - ffn.0
+    - ffn.2
+    on_base_blocks: true
+    on_cross_attn: false
+    rank: 64
+    alpha: 64
+    dropout: 0.0
+    init: kaiming_zero
+  text:
+    max_text_len: 512
+  inference:
+    num_inference_steps: 50
+    cfg_scale: 5.0
+    reference_guidance_scale: 1.0
+    seed: null
+    output_type: video
+training:
+  prediction_type: velocity
+  timestep_sampling: uniform
+  sigma_shift: 5.0
+  loss_weighting: bsmnt
+  loss_type: mse
+  cfg_training: false
+  text_dropout_prob: 0.0
+  ref_dropout_prob: 0.0
+  cached_t5: true
+  cached_tgt_latent: true
+train:
+  seed: 42
+  epochs: 5
+  max_steps: 20000
+  batch_size: 1
+  num_workers: 4
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer:
+    name: adamw
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+    weight_decay: 0.01
+    eps: 1.0e-08
+  scheduler:
+    name: constant_with_warmup
+    warmup_steps: 250
+  log_every_steps: 20
+  val_every_steps: 1000
+  save_every_steps: 200
+  eval_every_steps: 2000
+  start_eval_steps: 5000
+accel:
+  precision: bf16
+  cudnn_benchmark: true
+  cudnn_deterministic: false
+  allow_tf32: true
+  matmul_precision: high
+  find_unused_parameters: false
+  launcher: auto
+  gpu_ids:
+  - 2
+  main_process_port: 29555
+run:
+  suffix: facet_r64
+  resume_from: null
+log:
+  backend: mlflow
+  project_name: facet
+  cloud_run_name: null
+  log_grad_norm: true
+  log_timestep_hist: true
+validate:
+  num_samples: 20
+  num_inference_steps: 50
+  cfg_scale: 5.0
+  metrics:
+  - psnr
+  - ssim
+  - lpips
+  - fid
+  - fvd
+  primary_metric: lpips
+  topk: 3
+paths:
+  facet_config: /nvmedata/workspace2/users/Arcus/Facet/facet/config.yaml
+  data_config: /nvmedata/workspace2/users/Arcus/Facet/data/config.yaml
+  weight_dir: /nvmedata/workspace2/users/Arcus/Facet/weights/WAN2.2
+  run_root: /nvmedata/workspace2/users/Arcus/Facet/runs
+  ckpt_root: /nvmedata/workspace2/users/Arcus/Facet/ckpts
+  fvd_dir: /nvmedata/workspace2/users/Arcus/Facet/weights/I3D
+  inception_dir: /nvmedata/workspace2/users/Arcus/Facet/weights/INC
+_train_yaml_raw:
+  paths:
+    facet_config: facet/config.yaml
+    data_config: data/config.yaml
+    weight_dir: weights/WAN2.2
+    run_root: runs
+    ckpt_root: ckpts
+    fvd_dir: weights/I3D
+    inception_dir: weights/INC
+  training:
+    prediction_type: velocity
+    timestep_sampling: uniform
+    sigma_shift: 5.0
+    loss_weighting: bsmnt
+    loss_type: mse
+    cfg_training: false
+    text_dropout_prob: 0.0
+    ref_dropout_prob: 0.0
+    cached_t5: true
+    cached_tgt_latent: true
+  accel:
+    precision: bf16
+    cudnn_benchmark: true
+    cudnn_deterministic: false
+    allow_tf32: true
+    matmul_precision: high
+    find_unused_parameters: false
+    launcher: auto
+    gpu_ids:
+    - 2
+    main_process_port: 29555
+  train:
+    seed: 42
+    epochs: 5
+    max_steps: 20000
+    batch_size: 1
+    num_workers: 4
+    gradient_accumulation_steps: 1
+    max_grad_norm: 1.0
+    optimizer:
+      name: adamw
+      lr: 0.0001
+      betas:
+      - 0.9
+      - 0.999
+      weight_decay: 0.01
+      eps: 1.0e-08
+    scheduler:
+      name: constant_with_warmup
+      warmup_steps: 250
+    log_every_steps: 20
+    val_every_steps: 1000
+    save_every_steps: 200
+    eval_every_steps: 2000
+    start_eval_steps: 5000
+  run:
+    suffix: facet_r64
+    resume_from: null
+  log:
+    backend: mlflow
+    project_name: facet
+    cloud_run_name: null
+    log_grad_norm: true
+    log_timestep_hist: true
+  validate:
+    num_samples: 20
+    num_inference_steps: 50
+    cfg_scale: 5.0
+    metrics:
+    - psnr
+    - ssim
+    - lpips
+    - fid
+    - fvd
+    primary_metric: lpips
+    topk: 3

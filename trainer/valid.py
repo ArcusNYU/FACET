@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 
 _LIGHT_KEYS: Tuple[str, ...] = ("psnr", "ssim", "lpips")
+_LIGHT_MASK_KEYS: Tuple[str, ...] = ("psnr_mask", "ssim_mask", "lpips_mask")
+_ALL_LIGHT_KEYS: Tuple[str, ...] = _LIGHT_KEYS + _LIGHT_MASK_KEYS
 
 # resued on light metrics evaluation
 _GEN_IDS: Optional[set] = None
@@ -216,9 +218,8 @@ def run(
                 _eval_gen(
                     raw_model, prep, batch, b, cid, cfg, device,
                     seed=int(ctx.seed), step_dir=step_dir,
-                    light_sum=light_sum,
+                    light_sum=light_sum, light_cnt=light_cnt,
                 )
-                light_cnt += 1
             except Exception as e:  # noqa: BLE001 - never let one clip kill a long run
                 logger.warning("[trainer.valid] generation failed for clip %s: %s", cid, e)
 
@@ -230,11 +231,12 @@ def run(
         results["loss"] = float(total_loss / total_lcnt)
 
     if do_gen:
-        total_gcnt = acc.reduce(light_cnt.clone(), reduction="sum")
-        for k in _LIGHT_KEYS:
+        for k in _ALL_LIGHT_KEYS:
             ksum = acc.reduce(light_sum[k].clone(), reduction="sum")
-            if float(total_gcnt) > 0:
-                results[k] = float(ksum / total_gcnt)
+            kcnt = acc.reduce(light_cnt[k].clone(), reduction="sum")
+            if float(kcnt) > 0:
+                results[k] = float(ksum / kcnt)
+        total_gcnt = float(acc.reduce(light_cnt["psnr"].clone(), reduction="sum"))
         if acc.is_main_process:
             logger.info(
                 "[trainer.valid] step %d: %d generated sample(s) -> %s",
@@ -247,7 +249,8 @@ def run(
 
 def _eval_gen(
     raw_model, prep, batch, b: int, cid: str, cfg, device,
-    *, seed: int, step_dir: Path, light_sum: Dict[str, torch.Tensor],
+    *, seed: int, step_dir: Path,
+    light_sum: Dict[str, torch.Tensor], light_cnt: Dict[str, torch.Tensor],
 ) -> None:
     """Generate one clip, accumulate its light metrics, and save pred + gt."""
     # Per-clip deterministic init noise so improvement reflects weights, not noise.
@@ -283,6 +286,16 @@ def _eval_gen(
     for k in _LIGHT_KEYS:
         if k in lm:
             light_sum[k] += float(lm[k])
+            light_cnt[k] += 1.0
+
+    # Edit-region (mask-bbox) light metrics.
+    src_mask = prep["src_mask"][b]                     # [1, T, H, W]
+    mask = src_mask.permute(1, 0, 2, 3)[:n].contiguous()   # [n, 1, H, W]
+    lm_mask = metrics.light_metrics_mask(pred, gt, mask)   # {"psnr_mask",...}
+    for k in _LIGHT_MASK_KEYS:
+        if k in lm_mask:
+            light_sum[k] += float(lm_mask[k])
+            light_cnt[k] += 1.0
 
 
 # =============================================================================

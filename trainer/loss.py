@@ -312,3 +312,81 @@ class FlowMatch:
         per_sample = se.flatten(1).mean(dim=1)                  # [B]
         w = weights.to(per_sample.device, dtype=torch.float32)
         return (per_sample * w).mean()
+
+#     # ---- 3.7 masked (edit-region) loss -- MONITORING ONLY -------------------
+#     @torch.no_grad()
+#     def masked_loss(
+#         self,
+#         pred: torch.Tensor,
+#         target: torch.Tensor,
+#         timesteps: torch.Tensor,
+#         latent_mask: torch.Tensor,
+#         eps: float = 1e-6,
+#     ) -> torch.Tensor:
+#         """
+#         FlowMatch loss restricted to the masked (edit) region, in latent space.
+
+#         This is a DETACHED diagnostic, NOT part of the optimized objective: for a
+#         video-editing task the global MSE is dominated by the (near copy-paste)
+#         background, so an edit-region loss tracks what the model is actually
+#         learning. It mirrors compute_loss exactly (fp32 MSE + the same per-sample
+#         BSMNT weighting) but averages the squared error over the latent positions
+#         covered by `latent_mask` instead of over all elements.
+
+#         Args:
+#             pred / target : [B, C, F_lat, h, w] velocity tensors (as in compute_loss).
+#             timesteps     : [B] (for the BSMNT per-sample weight).
+#             latent_mask   : [B, 1, F_lat, h, w] soft coverage in [0, 1], pooled from
+#                             the pixel src_mask via pool_mask_to_latent(). Broadcast
+#                             over the channel dim.
+
+#         Returns a scalar tensor (caller does .item()). Returns the global MSE if
+#         the mask is empty everywhere (degenerate guard).
+#         """
+#         if pred.shape != target.shape:
+#             raise ValueError(
+#                 f"pred.shape ({tuple(pred.shape)}) != target.shape ({tuple(target.shape)})"
+#             )
+#         se = (pred.float() - target.float()).pow(2)                  # [B,C,F,h,w]
+#         w = latent_mask.to(device=se.device, dtype=torch.float32)
+#         if w.dim() != se.dim():
+#             raise ValueError(
+#                 f"latent_mask ndim {w.dim()} != pred ndim {se.dim()} "
+#                 f"(expected [B,1,F_lat,h,w])."
+#             )
+#         w = w.expand_as(se)                                          # broadcast over C
+#         num = (se * w).flatten(1).sum(dim=1)                         # [B]
+#         den = w.flatten(1).sum(dim=1).clamp_min(eps)                 # [B]
+#         per_sample = num / den                                       # masked-mean MSE
+#         bw = self.loss_weights(timesteps)
+#         if bw is not None:
+#             per_sample = per_sample * bw.to(per_sample.device, dtype=torch.float32)
+#         return per_sample.mean()
+
+
+# # 4. Mask pooling helper ------------------------------------------------------
+# def pool_mask_to_latent(
+#     src_mask: torch.Tensor,
+#     latent_shape: Tuple[int, int, int],
+# ) -> torch.Tensor:
+#     """
+#     Average-pool a PIXEL-space mask onto the VAE latent grid for masked_loss().
+
+#     Args:
+#         src_mask     : [B, 1, F_pix, H, W] (or [B, F_pix, 1, H, W]) in [0, 1].
+#         latent_shape : (F_lat, h_lat, w_lat) == pred/target spatial-temporal grid.
+
+#     Returns:
+#         [B, 1, F_lat, h_lat, w_lat] soft coverage in [0, 1].
+
+#     Pooling is done in fp32 (bf16 mantissa is too coarse for small soft coverage
+#     values, mirroring FACETWanModel.compute_mask_coverage).
+#     """
+#     m = src_mask.float()
+#     if m.dim() == 5 and m.shape[1] != 1 and m.shape[2] == 1:
+#         m = m.permute(0, 2, 1, 3, 4).contiguous()   # [B,F,1,H,W] -> [B,1,F,H,W]
+#     if m.dim() != 5 or m.shape[1] != 1:
+#         raise ValueError(
+#             f"src_mask must be [B,1,F,H,W] (or [B,F,1,H,W]); got {tuple(src_mask.shape)}"
+#         )
+#     return F.adaptive_avg_pool3d(m, output_size=tuple(int(s) for s in latent_shape))

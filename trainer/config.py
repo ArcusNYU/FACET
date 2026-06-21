@@ -222,6 +222,7 @@ class MergedConfig:
       cfg.validate   -> ValidateConfig         (valid)
       cfg.paths      -> PathsConfig            (absolute paths)
       cfg._raw       -> dict                   (verbatim train.yaml; for snapshot)
+      cfg._data      -> dict                   (verbatim data/config.yaml; for snapshot)
     """
     facet: FACETConfig
     training: TrainingConfig
@@ -232,6 +233,7 @@ class MergedConfig:
     validate: ValidateConfig
     paths: PathsConfig
     _raw: Dict[str, Any] = field(default_factory=dict)
+    _data: Dict[str, Any] = field(default_factory=dict)
 
     # 3.1  Flat view for mlflow / tensorboard.
     def flat(self) -> Dict[str, Any]:
@@ -257,6 +259,20 @@ class MergedConfig:
 
         for name in ("facet", "training", "train", "accel", "run", "log", "validate", "paths"):
             walk(name, getattr(self, name))
+
+        def walk_plain(prefix: str, obj: Any) -> None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    walk_plain(f"{prefix}.{k}" if prefix else k, v)
+                return
+            if isinstance(obj, (str, int, float, bool)) or obj is None:
+                out[prefix] = obj
+                return
+            if isinstance(obj, (list, tuple)):
+                out[prefix] = ",".join(map(str, obj))
+                return
+
+        walk_plain("data", self._data)
         return out
 
     # 3.2  Snapshot dump.
@@ -283,6 +299,7 @@ class MergedConfig:
             "log":      to_plain(self.log),
             "validate": to_plain(self.validate),
             "paths":    to_plain(self.paths),
+            "data":     to_plain(self._data),
             "_train_yaml_raw": self._raw,    # round-trip the user's literal yaml
         }
         with open(out_path, "w", encoding="utf-8") as f:
@@ -345,6 +362,15 @@ def load_merge(args: argparse.Namespace) -> MergedConfig:
     # 5.2  facet (model) config -- loaded independently from facet/config.yaml
     facet_cfg = FACETConfig.from_yaml(paths.facet_config)
 
+    # 5.2b data (dataset registry + shared augmentation) config from data/config.yaml
+    data_raw: Dict[str, Any] = {}
+    data_cfg_path = Path(paths.data_config)
+    if data_cfg_path.is_file():
+        with open(data_cfg_path, "r", encoding="utf-8") as f:
+            data_raw = yaml.safe_load(f) or {}
+    else:
+        print(f"[trainer.config] data_config not found: {data_cfg_path}; snapshot 'data' will be empty.")
+
     # 5.3  trainer-side blocks
     training = TrainingConfig()
     _load_into_dataclass(training, raw.get("training", {}))
@@ -374,4 +400,5 @@ def load_merge(args: argparse.Namespace) -> MergedConfig:
         validate=validate_cfg,
         paths=paths,
         _raw=copy.deepcopy(raw),
+        _data=copy.deepcopy(data_raw),
     )

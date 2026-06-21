@@ -119,6 +119,10 @@ validate:
   num_samples:        20           # videos generated per validation pass
   num_inference_steps: 50
   cfg_scale:          5.0
-  metrics:            ["psnr", "ssim", "lpips", "fid", "fvd"]  # TODO: may adjust later
-  primary_metric:     "lpips"
+  # Light metrics are reported BOTH whole-frame and restricted to the edit-region
+  # mask bbox (psnr_mask / ssim_mask / lpips_mask). For editing, the *_mask
+  # variants reflect actual quality; the whole-frame ones are inflated by the
+  # copy-paste background. fid/fvd are the heavy (end-of-run) metrics.
+  metrics:            ["psnr", "ssim", "lpips", "psnr_mask", "ssim_mask", "lpips_mask", "fid", "fvd"]
+  primary_metric:     "lpips"      # "lpips_mask" for edit-quality-driven top-K
   topk:               3

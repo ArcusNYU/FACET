@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "psnr", "ssim", "lpips", "fid", "fvd",
     "light_metrics", "heavy_metrics",
+    "psnr_mask", "ssim_mask", "lpips_mask", "light_metrics_mask",
 ]
 
 ValueRange = Tuple[float, float]
@@ -158,6 +159,147 @@ def light_metrics(
         "ssim": ssim(pred, gt, value_range),
         "lpips": lpips(pred, gt, value_range, net=lpips_net),
     }
+
+
+# =============================================================================
+# masked light metrics — PSNR / SSIM / LPIPS restricted to the EDIT region
+# =============================================================================
+# Convention: pred/gt are [T, C, H, W] (a single clip); mask is [T, 1, H, W] or
+# [T, H, W] in {0, 1}, PIXEL-aligned with pred/gt. A leading batch dim of size 1
+# is accepted and squeezed.
+# NOTE: 在针对mask区域的轻量指标测评中 由于mask及其bbox区域不断变动 所以无法组成batch tensor stack
+_SSIM_MIN_SIDE = 16   # SSIM gaussian window is 11x11 -> crop must exceed it
+_LPIPS_MIN_SIDE = 32  # AlexNet has several 2x downsamples -> keep crops sane
+_MASK_MIN_SIDE = max(_SSIM_MIN_SIDE, _LPIPS_MIN_SIDE)  # one shared crop for all 3
+
+
+def _as_clip_tchw(x: torch.Tensor) -> torch.Tensor:
+    """[B,T,C,H,W] with B==1 -> [T,C,H,W]; [T,C,H,W] passes through."""
+    # FIXME: 取决于传入函数的形式 如果是for传入 那么不一定需要batch维度
+    # 因为没有第五个维度的时候 默认是单个batch 可直接使用
+    if x.dim() == 5:
+        if x.shape[0] != 1:
+            raise ValueError(
+                f"masked metrics expect a single clip; got batch dim {x.shape[0]}."
+            )
+        x = x[0]
+    if x.dim() != 4:
+        raise ValueError(f"expected [T,C,H,W] (or [1,T,C,H,W]); got {tuple(x.shape)}")
+    return x
+
+
+def _as_mask_thw(mask: torch.Tensor) -> torch.Tensor:
+    """[T,1,H,W] / [1,T,H,W] / [T,H,W] -> [T,H,W] float in {0,1}."""
+    m = mask
+    if m.dim() == 5 and m.shape[0] == 1:
+        m = m[0]                      # [T,1,H,W] or [1,T,H,W]?  -> handled below
+    if m.dim() == 4:
+        if m.shape[1] == 1:           # [T,1,H,W]
+            m = m[:, 0]
+        elif m.shape[0] == 1:         # [1,T,H,W]
+            m = m[0]
+        else:
+            raise ValueError(f"ambiguous mask shape {tuple(mask.shape)}")
+    if m.dim() != 3:
+        raise ValueError(f"expected mask [T,1,H,W] or [T,H,W]; got {tuple(mask.shape)}")
+    return (m.float() > 0.5).float()
+
+
+def _frame_bbox(
+    m2d: torch.Tensor, h: int, w: int, min_side: int, pad: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Tight bbox (y0,y1,x0,x1) of a 2D binary mask, padded + grown to min_side.
+
+    Returns None for an empty mask. The box is symmetric-grown to at least
+    `min_side` on each axis and clamped to the frame so the downstream SSIM
+    window / LPIPS backbone always receive a large-enough crop.
+    """
+    ys, xs = torch.where(m2d > 0.5)
+    if ys.numel() == 0:
+        return None
+    y0 = int(ys.min().item()) - pad
+    y1 = int(ys.max().item()) + 1 + pad
+    x0 = int(xs.min().item()) - pad
+    x1 = int(xs.max().item()) + 1 + pad
+
+    def _grow(a: int, b: int, hi: int) -> Tuple[int, int]:
+        if b - a < min_side:
+            c = (a + b) / 2.0
+            a = int(round(c - min_side / 2.0))
+            b = a + min_side
+        a = max(0, a)
+        b = min(hi, b)
+        if b - a < min_side:          # frame smaller than min_side: take full extent
+            a, b = 0, hi
+        return a, b
+
+    y0, y1 = _grow(y0, y1, h)
+    x0, x1 = _grow(x0, x1, w)
+    return y0, y1, x0, x1
+
+
+def _masked_metric(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    metric_fn: Callable[..., float],
+    value_range: ValueRange,
+    **fn_kwargs,
+) -> Optional[float]:
+    """Average `metric_fn` over per-frame mask-bbox crops. None if no valid frame."""
+    p = _as_clip_tchw(pred)
+    g = _as_clip_tchw(gt)
+    if p.shape != g.shape:
+        raise ValueError(f"pred/gt shape mismatch: {tuple(p.shape)} vs {tuple(g.shape)}")
+    m = _as_mask_thw(mask)
+    T = min(p.shape[0], m.shape[0]) # frame dim match
+    H, W = p.shape[-2], p.shape[-1]
+
+    vals: list[float] = []
+    for t in range(T):
+        bb = _frame_bbox(m[t], H, W, _MASK_MIN_SIDE, pad=0)
+        if bb is None:
+            continue
+        y0, y1, x0, x1 = bb
+        cp = p[t : t + 1, :, y0:y1, x0:x1].contiguous()   # [1,C,h,w]
+        cg = g[t : t + 1, :, y0:y1, x0:x1].contiguous()
+        vals.append(metric_fn(cp, cg, value_range, **fn_kwargs))
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
+
+
+def psnr_mask(pred, gt, mask, value_range: ValueRange = _DEFAULT_RANGE) -> Optional[float]:
+    """Mean per-frame PSNR over the mask bbox (higher = better)."""
+    return _masked_metric(pred, gt, mask, psnr, value_range)
+
+
+def ssim_mask(pred, gt, mask, value_range: ValueRange = _DEFAULT_RANGE) -> Optional[float]:
+    """Mean per-frame SSIM over the mask bbox (higher = better)."""
+    return _masked_metric(pred, gt, mask, ssim, value_range)
+
+
+def lpips_mask(
+    pred, gt, mask, value_range: ValueRange = _DEFAULT_RANGE, net: str = "alex",
+) -> Optional[float]:
+    """Mean per-frame LPIPS over the mask bbox (lower = better)."""
+    return _masked_metric(pred, gt, mask, lpips, value_range, net=net)
+
+
+def light_metrics_mask(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    value_range: ValueRange = _DEFAULT_RANGE,
+    lpips_net: str = "alex",
+) -> Dict[str, float]:
+    """Edit-region reconstruction metrics (bbox-cropped); drops any that are None."""
+    out = {
+        "psnr_mask": psnr_mask(pred, gt, mask, value_range),
+        "ssim_mask": ssim_mask(pred, gt, mask, value_range),
+        "lpips_mask": lpips_mask(pred, gt, mask, value_range, net=lpips_net),
+    }
+    return {k: v for k, v in out.items() if v is not None}
 
 
 # =============================================================================

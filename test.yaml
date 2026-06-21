@@ -1,0 +1,53 @@
+# =============================================================================
+# FACET test / inference config.
+#
+# Loaded by launch_test.py (accel block) and test.py (everything).
+# test.py is NOT a held-out test-set evaluator (trainer/valid.py already covers that); 
+#
+# Target H/W/num_frames are taken from the MODEL config (paths.facet_config ->
+# model.target) so the produced src/mask/ref always match the latent grid the
+# LoRA was trained on. Do not duplicate them here.
+# =============================================================================
+
+paths:
+  src_dir:       "test"                # default input material root (recursively scanned)
+  save_dir:      "test/results"        # default results root
+  facet_config:  "facet/config.yaml"   # default model config; 
+                                       # NOTE: override with a run's 
+                                       # runs/<run>/config_snapshot.yaml to inherit
+                                       # its exact lora rank / geometry.
+  weight_dir:    "weights/WAN2.2"      # WAN2.2 base
+  ckpt_root:     "ckpts"               # where exported LoRA *_best.safetensors live
+  ckpt_name:     "xxx"                 # LoRA file under ckpt_root (w/ or w/o .safetensors)
+  fvd_dir:       "weights/I3D"         # local I3D for FVD (offline); null to skip
+  inception_dir: "weights/INC"         # local InceptionV3 for FID (offline)
+
+# SCHP human-parsing (only used when a source video / ref image needs masking).
+# Mirrors data/openvid/config.yaml prepare.* so test preprocessing == training.
+schp:
+  weight:        "weights/SCHP/schp.pth"
+  hair_ids:      [2]                   # LIP class id(s) ("2" == hair)
+  smooth_k:      3                     # temporal majority filter window
+  batch_size:    32                    # frames per SCHP forward
+
+accel:
+  precision:         "bf16"            # "no" | "fp16" | "bf16"
+  launcher:          "auto"            # "auto" | "python" | "accelerate"
+  gpu_ids:           [8]
+  main_process_port: 29555
+
+test:
+  seed:                42
+  num_inference_steps: 50
+  sigma_shift:         5.0            # WAN2.2 flow shift (match training)
+  cfg_scale:           1.0            # TODO: CFG NOT supported yet
+  output_type:         "video"
+  fps:                 24             # output mp4 fps (OpenHumanVid is ~24)
+  suffix:              "test"         # run_name for runs/<run> + mlflow run name
+  # GT-conditional metrics:
+  metrics:             ["psnr", "ssim", "lpips", "psnr_mask", "ssim_mask", "lpips_mask", "fid", "fvd"]
+
+log:
+  backend:         "mlflow"           # "mlflow" | "tensorboard" | "none"
+  project_name:    "facet_test"
+  cloud_run_name:  null               # null -> use run_name (test.suffix)

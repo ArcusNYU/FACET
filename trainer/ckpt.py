@@ -44,6 +44,8 @@ _HIGHER = {"psnr", "ssim", "clipsim", "clip", "clipsim_var", "clip_sim"}
 def _direction(metric: str) -> str:
     """Return 'min' or 'max' for a metric name (defaults to 'min' if unknown)."""
     m = metric.lower()
+    if m.endswith("_mask"):
+        m = m[: -len("_mask")]
     if m in _HIGHER:
         return "max"
     if m in _LOWER:
