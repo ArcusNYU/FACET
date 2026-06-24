@@ -3,36 +3,23 @@ test.py
 
 FACET / WAN2.2-TI2V-5B + OmniControl LoRA inference entry point.
 
-Edits the hairstyle of the person in user-provided material (NOT a held-out
-test-set scorer -- trainer/valid.py already does that). It is the offline twin
-of the future gradio demo, so its structure mirrors train.py (step 0/1/2 ...)
-minus everything training-specific.
-
-Material layout (paths.src_dir, default ./test, scanned RECURSIVELY):
+Required Material layout (paths.src_dir, default ./test, scanned RECURSIVELY):
     <src_dir>/<sample_name>/
-        *.mp4   source / mask / (optional) ground-truth video(s)
-        *.png|*.jpg   reference image (the target hairstyle)
+        *.mp4 / **mask**.mp4 / **gt**.mp4(optional):
+            source / mask / (optional) ground-truth video(s)
+        * / *mask*.png | * / *mask*.jpg | * / *mask*.webp:
+            reference / masked reference image
         [caption.txt | prompt.txt]   optional text prompt
-  - >=1 subfolder  -> one sample each  -> result named <sample_name>_pred.mp4
-  - no subfolder   -> the material lives directly in <src_dir> (single sample)
+  result -> subfolder named <sample_name>_pred.mp4 or directly in <src_dir> (single sample)
 
-Per-sample material resolution
+Adaptive per-sample material resolution
     videos:
-      * ground-truth video: stem has gt / target / ground  (enables metrics)
+      * ground-truth video: stem has "gt" / "target" / "ground"  (enables metrics)
       * mask video:         stem has "mask"                 (binary mask sequence)
       * source video:       the remaining video
-          - 1 video, no mask video  -> SCHP-parse it -> hair mask + masked src
-          - source stem has source/original/raw/src + a mask video -> apply mask
-          - otherwise (a mask video present, source not raw-tagged) -> the source
-            is treated as an ALREADY-masked src video; the mask video supplies the
-            binary mask the model needs.
     reference image:
-      * stem has "mask" -> already a masked ref (bg=127); used as-is
-      * otherwise       -> SCHP-parse it -> hair bbox crop + 127-gray background
-
-All preprocessing matches the training pipeline (data/transform.py fit-pad +
-[-1,1] norm, masked region painted gray=127) and applies NO mask perturbation /
-geometric augmentation.
+      * masked image:       stem has "mask" 
+      * original image:     otherwise
 
 Layout:
     0.  argparse + HF offline lock
@@ -86,8 +73,7 @@ from data.utils import load_cfg
 from data.transform import VideoTfm, MaskPerturb, RefTfm
 from facet.config import FACETConfig
 from facet.model import FACETWanModel, FACETPipeline
-from trainer.valid import heavy_eval
-from utils import _resolve_dtype, video_to_uint8, mask_to_uint8, write_mp4, write_png
+from utils import _resolve_dtype, video_to_uint8, write_mp4, read_mp4
 
 logger = logging.getLogger("facet.test")
 
@@ -95,7 +81,7 @@ logger = logging.getLogger("facet.test")
 # Keyword routing for the per-sample material files.
 _SRC_KEYS = ("source", "original", "raw", "src")
 _GT_KEYS = ("gt", "target", "ground", "groundtruth", "ground_truth")
-_MASK_KEY = "mask"
+_MASK_KW = ("mask",)        # filename keyword marking a mask file
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
 _LIGHT_KEYS = ("psnr", "ssim", "lpips")
@@ -105,6 +91,9 @@ _ALL_LIGHT_KEYS = _LIGHT_KEYS + _MASK_KEYS
 _DTYPE_TO_ACC = {"no": "no", "fp32": "no", "fp16": "fp16", "bf16": "bf16"}
 
 
+# TODO: 在设置gradio demo的时候需要将ckpt放在指定位置 然后采用默认的facet/config.yaml
+# 即最后提交github的时候 将config与权重一同提交到huggingface 然后下载到指定文件夹
+# 最后 gradio demo 固定从那一个文件夹读取 但是把结果输出为 ./results 方便用户查看
 # =============================================================================
 # 2. argparse
 # =============================================================================
@@ -112,8 +101,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="FACET inference / hairstyle-editing entry point.")
     p.add_argument("--test_yaml", type=str, default=str(_PROJECT_ROOT / "test.yaml"),
                    help="Path to test.yaml.")
-    # Overrides (None -> use test.yaml). ckpt_name + facet_config are the two the
-    # user changes most often (which checkpoint, which model geometry/rank).
     p.add_argument("--ckpt_name", type=str, default=None,
                    help="LoRA checkpoint under paths.ckpt_root (w/ or w/o .safetensors).")
     p.add_argument("--facet_config", type=str, default=None,
@@ -147,7 +134,7 @@ def seed_everything(seed: int, rank: int) -> None:
 
 
 def setup_logger(accelerator, cfg, output_root: Path, track_root: Path):
-    """Minimal mlflow + console + jsonl logger (simplified trainer.logger)."""
+    """mlflow + console + jsonl logger."""
     backend = str(cfg.log.get("backend", "none")).lower()
     state = {"accelerator": accelerator, "tracking": False,
              "jsonl": None, "is_main": accelerator.is_main_process}
@@ -155,8 +142,7 @@ def setup_logger(accelerator, cfg, output_root: Path, track_root: Path):
     if accelerator.is_main_process:
         output_root.mkdir(parents=True, exist_ok=True)
         state["jsonl"] = output_root / "metrics.jsonl"
-        # Dump the effective test config for reproducibility.
-        (output_root / "test_config_snapshot.yaml").write_text(
+        (output_root / "test_config.yaml").write_text(
             json.dumps(dict(cfg), ensure_ascii=False, indent=2), encoding="utf-8",
         )
         if backend == "mlflow":
@@ -200,8 +186,8 @@ def _flat_cfg(cfg) -> Dict[str, Any]:
 def log_scalars(state, scalars: Dict[str, float], step: int = 0, phase: str = "test") -> None:
     if not state["is_main"]:
         return
-    pretty = ", ".join(f"{k}={v:.5f}" for k, v in scalars.items())
-    logger.info("[test] %s", pretty)
+    msg = ", ".join(f"{k}={v:.5f}" for k, v in scalars.items())
+    logger.info("[test] %s", msg)
     if state["tracking"]:
         try:
             state["accelerator"].log({f"{phase}/{k}": float(v) for k, v in scalars.items()}, step=step)
@@ -213,10 +199,10 @@ def log_scalars(state, scalars: Dict[str, float], step: int = 0, phase: str = "t
 
 
 # =============================================================================
-# 4. SCHP parser (lazy, one per process)
+# 4. SCHP parser
 # =============================================================================
 class _Schp:
-    """Lazy SchpParser holder so SCHP weights load only if a sample needs them."""
+    """SchpParser holder."""
 
     def __init__(self, cfg, device):
         self.cfg = cfg
@@ -239,12 +225,12 @@ class _Schp:
             )
         return self._parser
 
-    def hair_mask(self, video_rgb: np.ndarray) -> np.ndarray:
-        """[T,H,W,3] uint8 RGB -> [T,H,W] uint8 in {0,1} (hair, temporally smoothed)."""
+    def target_mask(self, video_rgb: np.ndarray) -> np.ndarray:
+        """[T,H,W,3] uint8 RGB -> [T,H,W] uint8 in {0,1} (temporally smoothed)."""
         from data.openvid.pipeline.parse import SchpParser
         parser = self._ensure()
         parsing = parser.parse_video(video_rgb)
-        ids = [int(x) for x in self.cfg.schp.get("hair_ids", [2])]
+        ids = [int(x) for x in self.cfg.schp.get("cls_ids", [2])]
         mask = SchpParser.select(parsing, ids)
         return SchpParser.smooth(mask, k=int(self.cfg.schp.get("smooth_k", 3)))
 
@@ -262,8 +248,10 @@ def _has_mp4(d: Path) -> bool:
 
 
 def discover_samples(src_dir: Path, save_dir: Path) -> List[Tuple[Path, str]]:
-    """Recursively find sample dirs (any dir holding >=1 mp4), excluding save_dir."""
+    """Recursively find INPUT sample dirs (any dir holding >=1 mp4) under src_dir.
+    """
     def excluded(p: Path) -> bool:
+        # True if p lives under save_dir -> skip; else keep.
         try:
             p.resolve().relative_to(save_dir.resolve())
             return True
@@ -285,6 +273,8 @@ def discover_samples(src_dir: Path, save_dir: Path) -> List[Tuple[Path, str]]:
     return []
 
 
+# TODO: read_rgb_video, _fit_frames, read_mask_video, read_mask_np函数迁移至utils.py
+# 后期可被gradio demo再次利用
 def read_rgb_video(path: Path, num_frames: int) -> np.ndarray:
     """mp4 -> [num_frames, H, W, 3] uint8 RGB (first num_frames, repeat-last pad)."""
     from decord import VideoReader, cpu
@@ -294,11 +284,38 @@ def read_rgb_video(path: Path, num_frames: int) -> np.ndarray:
     return vr.get_batch(idx).asnumpy()
 
 
+def _fit_frames(arr: np.ndarray, num_frames: int) -> np.ndarray:
+    """Trim to / repeat-last-pad along axis 0 to exactly num_frames."""
+    n = arr.shape[0]
+    if n >= num_frames:
+        return arr[:num_frames]
+    pad = np.repeat(arr[-1:], num_frames - n, axis=0)
+    return np.concatenate([arr, pad], axis=0)
+
+
 def read_mask_video(path: Path, num_frames: int) -> np.ndarray:
     """mp4 -> [num_frames, H, W] uint8 {0,1} (luminance threshold @127)."""
     v = read_rgb_video(path, num_frames)                 # [T,H,W,3]
     gray = v.mean(axis=-1)                                # [T,H,W]
     return (gray > 127).astype(np.uint8)
+
+
+def read_mask_npz(path: Path, num_frames: int) -> np.ndarray:
+    """npz -> [num_frames, H, W] uint8 {0,1}.
+
+    Matches the training cache layout (data/.../cache writes masks.npz with key
+    "mask", shape [T,H,W] uint8); falls back to the first stored array otherwise.
+    Accepts {0,1} or {0,255} encodings and a trailing channel axis.
+    """
+    with np.load(path) as data:
+        key = "mask" if "mask" in getattr(data, "files", []) else data.files[0]
+        arr = np.asarray(data[key])
+    if arr.ndim == 4 and arr.shape[-1] == 1:             # [T,H,W,1] -> [T,H,W]
+        arr = arr[..., 0]
+    if arr.ndim != 3:
+        raise ValueError(f"mask npz {path.name}: expected [T,H,W]; got {arr.shape}")
+    arr = _fit_frames(arr, num_frames)
+    return (arr > 0).astype(np.uint8)
 
 
 def read_image_rgb(path: Path) -> np.ndarray:
@@ -307,8 +324,31 @@ def read_image_rgb(path: Path) -> np.ndarray:
     return np.asarray(Image.open(path).convert("RGB"))
 
 
-# ---- ref crop helpers (inlined from data/openvid/pipeline/main.py to avoid
-#      importing its heavy IQA/VLM deps) ----
+def heavy_metrics_eval(save_dir: Path, fvd_dir: Optional[str], fid_dir: Optional[str]) -> Dict[str, float]:
+    """FID/FVD over the flat {name}_pred.mp4 / {name}_gt.mp4 pairs in save_dir.
+
+    flat layout: pair each *_gt.mp4 with its sibling *_pred.mp4 -> metrics.heavy_metrics
+    """
+    suffix = "_gt.mp4"
+    preds: List[torch.Tensor] = []
+    gts: List[torch.Tensor] = []
+    for gp in sorted(save_dir.glob(f"*{suffix}")):
+        pp = gp.with_name(gp.name[: -len(suffix)] + "_pred.mp4")
+        pv, gv = read_mp4(pp), read_mp4(gp)
+        if pv is None or gv is None:
+            continue
+        preds.append(pv)
+        gts.append(gv)
+    if not preds:
+        return {}
+    t_min = min(min(p.shape[0] for p in preds), min(g.shape[0] for g in gts))
+    pred = torch.stack([p[:t_min] for p in preds], dim=0)   # [N,T,3,H,W]
+    gt = torch.stack([g[:t_min] for g in gts], dim=0)
+    logger.info("[test] heavy metrics: %d pred/gt pair(s), %d frames each.", pred.shape[0], t_min)
+    return metrics.heavy_metrics(pred, gt, fvd_dir=fvd_dir, fid_dir=fid_dir)
+
+
+# ---- ref crop helpers ----
 def _mask_bbox(m2d: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     ys, xs = np.where(m2d > 0)
     if ys.size == 0:
@@ -318,10 +358,9 @@ def _mask_bbox(m2d: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
 
 def build_masked_ref(frame_rgb: np.ndarray, mask_2d: np.ndarray, ref_size: int,
                      pad_ratio: float = 0.20, gray: int = 127) -> Optional[np.ndarray]:
-    """Bbox-crop the hair, square-pad, resize to ref_size, fill bg with `gray`.
+    """Bbox-crop the target, square-pad, resize to ref_size, fill bg with `gray`.
 
-    Mirrors main.build_ref_rgba + ref_sampler 127-gray fill so the test ref looks
-    exactly like a training ref. Returns [ref_size,ref_size,3] uint8 or None.
+    Returns [ref_size,ref_size,3] uint8 or None.
     """
     import cv2
     H, W = mask_2d.shape
@@ -352,11 +391,11 @@ def build_masked_ref(frame_rgb: np.ndarray, mask_2d: np.ndarray, ref_size: int,
 # 6. Per-sample preprocessing
 # =============================================================================
 class Prepared:
-    def __init__(self, masked_src, src_mask, ref, mask_metric, gt, prompt):
-        self.masked_src = masked_src   # [3, F, H, W] in [-1,1]
+    def __init__(self, masked_video, src_mask, ref, mask_raw, gt, prompt):
+        self.masked_video = masked_video   # [3, F, H, W] in [-1,1]
         self.src_mask = src_mask       # [1, F, H, W] in {0,1}
         self.ref = ref                 # [3, rs, rs] in [-1,1]
-        self.mask_metric = mask_metric # [F, 1, H, W] in {0,1} (for *_mask metrics)
+        self.mask_raw = mask_raw # [F, 1, H, W] in {0,1} (for *_mask metrics)
         self.gt = gt                   # [F, 3, H, W] in [-1,1] or None
         self.prompt = prompt           # str
 
@@ -378,42 +417,49 @@ def preprocess_sample(
     if not mp4s:
         logger.warning("[test] %s: no mp4 found; skipping.", sample_dir.name)
         return None
-    gt_vids = [m for m in mp4s if _stem_has(m.stem, _GT_KEYS) and not _stem_has(m.stem, (_MASK_KEY,))]
+    gt_vids = [m for m in mp4s if _stem_has(m.stem, _GT_KEYS) and not _stem_has(m.stem, _MASK_KW)]
     rest = [m for m in mp4s if m not in gt_vids]
-    mask_vids = [m for m in rest if _stem_has(m.stem, (_MASK_KEY,))]
+    mask_vids = [m for m in rest if _stem_has(m.stem, _MASK_KW)]
     src_vids = [m for m in rest if m not in mask_vids]
     if not src_vids:
         logger.warning("[test] %s: no source video (only mask/gt); skipping.", sample_dir.name)
         return None
-    src_path = src_vids[0]
+    src_path = src_vids[0] # dafault: using the first detected none-masked video as src
+
+    # A mask sequence may also be supplied as a (more compact) .npz archive.
+    mask_npzs = sorted(p for p in sample_dir.glob("*.npz")
+                       if p.suffix.lower() in (".npz",) and _stem_has(p.stem, _MASK_KW))
 
     src_raw = read_rgb_video(src_path, F)                  # [F,Hraw,Wraw,3]
 
-    if mask_vids:
-        # Mask provided -> no SCHP for the source branch.
+    if mask_npzs:
+        # Mask provided as .npz (priority: explicit + lossless) -> no SCHP.
+        mask_raw = read_mask_npz(mask_npzs[0], F)          # [F,Hraw,Wraw] {0,1}
+    elif mask_vids:
+        # Mask provided as mp4 -> no SCHP for the source branch.
         mask_raw = read_mask_video(mask_vids[0], F)        # [F,Hraw,Wraw] {0,1}
     else:
-        # No mask video -> SCHP-parse the source for the hair mask.
-        mask_raw = schp.hair_mask(src_raw)                 # [F,Hraw,Wraw] {0,1}
+        # No mask supplied -> SCHP-parse the source for the hair mask.
+        mask_raw = schp.target_mask(src_raw)                 # [F,Hraw,Wraw] {0,1}
 
     src_video = video_tfm(src_raw)                         # [F,3,H,W] in [-1,1]
-    src_mask = mask_tfm(mask_raw, perturb=False)           # [F,1,H,W] in {0,1}
+    mask_raw = mask_tfm(mask_raw, perturb=False)           # [F,1,H,W] in {0,1}
 
     # Paint the masked region gray=127 (normalized 0.0), matching data/base.py.
     GRAY_127_NORM = 0.0
-    masked_src = torch.where(src_mask > 0.5, torch.full_like(src_video, GRAY_127_NORM), src_video)
+    masked_video = torch.where(mask_raw > 0.5, torch.full_like(src_video, GRAY_127_NORM), src_video)
 
     # ---- reference image ----
     imgs = sorted([p for p in sample_dir.iterdir() if p.suffix.lower() in _IMG_EXTS])
     if not imgs:
         logger.warning("[test] %s: no reference image (png/jpg); skipping.", sample_dir.name)
         return None
-    ref_masked_imgs = [p for p in imgs if _stem_has(p.stem, (_MASK_KEY,))]
+    ref_masked_imgs = [p for p in imgs if _stem_has(p.stem, _MASK_KW)]
     if ref_masked_imgs:
         ref_rgb = read_image_rgb(ref_masked_imgs[0])       # already masked (bg=127)
     else:
         raw_ref = read_image_rgb(imgs[0])                  # [Hr,Wr,3]
-        ref_mask = schp.hair_mask(raw_ref[None, ...])[0]   # [Hr,Wr] {0,1}
+        ref_mask = schp.target_mask(raw_ref[None, ...])[0]   # [Hr,Wr] {0,1}
         ref_rgb = build_masked_ref(raw_ref, ref_mask, rs)
         if ref_rgb is None:
             logger.warning("[test] %s: SCHP found no hair in ref; skipping.", sample_dir.name)
@@ -432,10 +478,11 @@ def preprocess_sample(
             break
 
     return Prepared(
-        masked_src=masked_src.permute(1, 0, 2, 3).contiguous(),  # [3,F,H,W]
-        src_mask=src_mask.permute(1, 0, 2, 3).contiguous(),      # [1,F,H,W]
+        masked_video=masked_video.permute(1, 0, 2, 3).contiguous(),  # [3,F,H,W]
+        src_mask=mask_raw.permute(1, 0, 2, 3).contiguous(),      # [1,F,H,W]
+        # NOTE: FACET pipe requires src_mask in [B, 1, F, H, W] for computing mask coverage
         ref=ref,
-        mask_metric=src_mask,                                    # [F,1,H,W]
+        mask_raw=mask_raw, # [F,1,H,W]
         gt=gt,
         prompt=prompt,
     )
@@ -462,7 +509,7 @@ def main() -> None:
     save_dir = _to_abs(cfg.paths.save_dir)
     facet_config_path = _to_abs(cfg.paths.facet_config)
     ckpt_root = _to_abs(cfg.paths.ckpt_root)
-    fvd_dir = _to_abs(cfg.paths.fvd_dir) if cfg.paths.get("fvd_dir") else None
+    fvd_dir = _to_abs(cfg.paths.fvd_dir) if cfg.paths.get("fvd_dir") else None # metric weights optional
     inception_dir = _to_abs(cfg.paths.inception_dir) if cfg.paths.get("inception_dir") else None
 
     # -------- 2. Setup: accelerator + seed + dirs + logger ----------------
@@ -477,7 +524,6 @@ def main() -> None:
 
     run_name = f"{dt.datetime.now():%m%d_%H%M}_{cfg.test.get('suffix', 'test')}"
     output_root = _to_abs(cfg.paths.run_root) / run_name if cfg.paths.get("run_root") else (_PROJECT_ROOT / "runs" / run_name)
-    eval_root = output_root / "eval"   # pred/gt pairs for heavy_eval (GT samples)
     if accelerator.is_main_process:
         save_dir.mkdir(parents=True, exist_ok=True)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -509,10 +555,10 @@ def main() -> None:
     for p in model.parameters():
         p.requires_grad_(False)
     model.eval()
-    model.to(device)                               # incl. T5 text_encoder (kept on device)
+    model.to(device) # incl. T5 text_encoder (kept on device)
     pipeline = FACETPipeline(model)
 
-    # CFG is not wired into training yet -> force scale 1.0 (no guidance).
+    #TODO: CFG not implemented yet
     cfg_scale = float(cfg.test.get("cfg_scale", 1.0))
     if cfg_scale != 1.0:
         logger.warning("[test] cfg_scale=%.2f but CFG is unsupported; forcing 1.0.", cfg_scale)
@@ -523,11 +569,11 @@ def main() -> None:
     if accelerator.is_main_process:
         logger.info("[test] discovered %d sample(s) under %s", len(samples), src_dir)
     if not samples:
-        logger.warning("[test] nothing to do; exiting.")
+        logger.warning("[test] no available samples to process.")
         _finish(accelerator, log_state)
         return
 
-    my_samples = samples[accelerator.process_index :: accelerator.num_processes]
+    _samples = samples[accelerator.process_index :: accelerator.num_processes]
 
     # Per-key metric accumulators (summed across ranks at the end).
     light_sum = {k: torch.zeros((), device=device) for k in _ALL_LIGHT_KEYS}
@@ -538,10 +584,10 @@ def main() -> None:
     sigma_shift = float(cfg.test.get("sigma_shift", 5.0))
     fps = int(cfg.test.get("fps", 24))
 
-    for sample_dir, name in my_samples:
+    for sample_dir, name in _samples:
         try:
             prep = preprocess_sample(sample_dir, cfg, facet_cfg, schp=_get_schp(cfg, device))
-        except Exception as e:  # noqa: BLE001 - one bad sample must not kill the batch
+        except Exception as e:  # noqa: BLE001 - continue processing
             logger.warning("[test] preprocess failed for %s: %s", name, e)
             continue
         if prep is None:
@@ -549,7 +595,7 @@ def main() -> None:
 
         try:
             video = pipeline(
-                src_video=prep.masked_src.to(device=device, dtype=dtype),
+                src_video=prep.masked_video.to(device=device, dtype=dtype),
                 src_mask=prep.src_mask.to(device=device),
                 reference_images=prep.ref.to(device=device, dtype=dtype),
                 prompt=prep.prompt,
@@ -565,20 +611,18 @@ def main() -> None:
 
         pred = video[0].permute(1, 0, 2, 3).contiguous()   # [F,3,H,W]
 
-        # ---- save results (single-sample -> bare names; subfolder -> name_*) ----
-        stem = "pred" if (sample_dir == src_dir) else f"{name}_pred"
-        write_mp4(video_to_uint8(pred), save_dir / f"{stem}.mp4", fps=fps, allow_fallback=True)
-        write_mp4(mask_to_uint8(prep.mask_metric), save_dir / f"{stem.replace('pred', 'mask')}.mp4",
-                  fps=fps, allow_fallback=True)
-        write_png(((prep.ref.permute(1, 2, 0).clamp(-1, 1) + 1) * 127.5).byte().cpu().numpy(),
-                  save_dir / f"{stem.replace('pred', 'ref')}.png")
+        # ---- save results FLAT into save_dir as {name}_pred.mp4 (+ _gt.mp4) ----
+        write_mp4(video_to_uint8(pred), save_dir / f"{name}_pred.mp4", fps=fps, allow_fallback=True)
+        if prep.gt is not None:
+            write_mp4(video_to_uint8(prep.gt), save_dir / f"{name}_gt.mp4", fps=fps, allow_fallback=True)
         n_done += 1
-        logger.info("[test] %s -> %s.mp4", name, stem)
+        logger.info("[test] %s -> %s_pred.mp4%s", name, name,
+                    " (+ _gt.mp4)" if prep.gt is not None else "")
 
-        # ---- GT-conditional metrics ----
+        # ---- GT-conditional light metrics (whole-frame + mask-bbox) ----
         if prep.gt is not None:
             gt = prep.gt.to(device=device)
-            mask = prep.mask_metric.to(device=device)
+            mask = prep.mask_raw.to(device=device)
             n = min(pred.shape[0], gt.shape[0])
             p_, g_, m_ = pred[:n], gt[:n], mask[:n]
             lm = metrics.light_metrics(p_, g_)
@@ -586,11 +630,6 @@ def main() -> None:
             for k, v in lm.items():
                 light_sum[k] += float(v)
                 light_cnt[k] += 1.0
-            # persist pred/gt for the heavy (FID/FVD) distribution metrics
-            pair = eval_root / name
-            pair.mkdir(parents=True, exist_ok=True)
-            write_mp4(video_to_uint8(p_), pair / "pred.mp4", fps=fps, allow_fallback=True)
-            write_mp4(video_to_uint8(g_), pair / "gt.mp4", fps=fps, allow_fallback=True)
 
     # -------- 5. Reduce + report metrics ----------------------------------
     accelerator.wait_for_everyone()
@@ -600,7 +639,7 @@ def main() -> None:
         kcnt = accelerator.reduce(light_cnt[k].clone(), reduction="sum")
         if float(kcnt) > 0:
             results[k] = float(ksum / kcnt)
-    total_done = int(accelerator.reduce(n_done.clone(), reduction="sum"))
+    total = int(accelerator.reduce(n_done.clone(), reduction="sum"))
 
     if results:
         log_scalars(log_state, results, step=0, phase="test")
@@ -608,27 +647,28 @@ def main() -> None:
         logger.info("[test] no ground-truth videos found -> light metrics skipped "
                     "(pure inference/demo mode).")
 
-    # Heavy metrics (distribution-level) on main process over the saved GT pairs.
+    # Heavy metrics (distribution-level) on main process over the {name}_pred/_gt
+    # pairs written flat into save_dir (all ranks share the filesystem).
     if accelerator.is_main_process:
-        if eval_root.is_dir() and any(eval_root.iterdir()):
-            heavy = heavy_eval(eval_root, fvd_dir=str(fvd_dir) if fvd_dir else None,
-                               fid_dir=str(inception_dir) if inception_dir else None)
-            if heavy:
-                log_scalars(log_state, {f"heavy_{k}": v for k, v in heavy.items()}, step=0, phase="test")
+        heavy = heavy_metrics_eval(
+            save_dir,
+            fvd_dir=str(fvd_dir) if fvd_dir else None,
+            fid_dir=str(inception_dir) if inception_dir else None,
+        )
+        if heavy:
+            log_scalars(log_state, {f"heavy_{k}": v for k, v in heavy.items()}, step=0, phase="test")
         else:
-            logger.info("[test] no GT pairs -> heavy metrics (FID/FVD) skipped.")
-        logger.info("[test] done. %d sample(s) -> %s", total_done, save_dir)
+            logger.info("[test] no GT pairs in %s -> heavy metrics (FID/FVD) skipped.", save_dir)
+        logger.info("[test] done. %d sample(s) -> %s", total, save_dir)
 
     # -------- 6. Tear-down ------------------------------------------------
     _finish(accelerator, log_state)
 
 
-# A single SCHP holder per process (created lazily on first use).
+
 _SCHP_SINGLETON: Optional[_Schp] = None
-
-
 def _get_schp(cfg, device) -> _Schp:
-    global _SCHP_SINGLETON
+    global _SCHP_SINGLETON # model cache holder
     if _SCHP_SINGLETON is None:
         _SCHP_SINGLETON = _Schp(cfg, device)
     return _SCHP_SINGLETON

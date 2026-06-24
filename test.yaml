@@ -26,7 +26,7 @@ paths:
 # Mirrors data/openvid/config.yaml prepare.* so test preprocessing == training.
 schp:
   weight:        "weights/SCHP/schp.pth"
-  hair_ids:      [2]                   # LIP class id(s) ("2" == hair)
+  cls_ids:      [2]                   # LIP class id(s) ("2" == hair)
   smooth_k:      3                     # temporal majority filter window
   batch_size:    32                    # frames per SCHP forward
 

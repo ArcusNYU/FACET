@@ -9,9 +9,8 @@ Launcher selection (`accel.launcher` in test.yaml):
 GPU visibility is pinned via CUDA_VISIBLE_DEVICES = accel.gpu_ids.
 
 Usage:
-    python launch_test.py   # uses ./test.yaml
-    python launch_test.py --ckpt_name 0620_s20000_facet_r64_best
-    python launch_test.py --facet_config runs/<run>/config_snapshot.yaml
+    python launch_test.py # default using ./test.yaml
+    python launch_test.py --test_yaml runs/<run>/test.yaml
     python launch_test.py --launcher accelerate
     python launch_test.py --dry-run
 """
@@ -45,15 +44,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override accel.launcher from test.yaml.",
     )
-    # p.add_argument("--ckpt_name", type=str, default=None,
-    #                help="LoRA checkpoint name under paths.ckpt_root "
-    #                     "(with or without the .safetensors suffix).")
-    # p.add_argument("--facet_config", type=str, default=None,
-    #                help="Model config yaml (default facet/config.yaml).")
-    # p.add_argument("--src_dir", type=str, default=None,
-    #                help="Input material root (default test/).")
-    # p.add_argument("--save_dir", type=str, default=None,
-    #                help="Results root (default test/results/).")
     p.add_argument(
         "--dry-run",
         action="store_true",

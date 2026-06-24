@@ -174,17 +174,12 @@ _MASK_MIN_SIDE = max(_SSIM_MIN_SIDE, _LPIPS_MIN_SIDE)  # one shared crop for all
 
 
 def _as_clip_tchw(x: torch.Tensor) -> torch.Tensor:
-    """[B,T,C,H,W] with B==1 -> [T,C,H,W]; [T,C,H,W] passes through."""
-    # FIXME: 取决于传入函数的形式 如果是for传入 那么不一定需要batch维度
-    # 因为没有第五个维度的时候 默认是单个batch 可直接使用
-    if x.dim() == 5:
-        if x.shape[0] != 1:
-            raise ValueError(
-                f"masked metrics expect a single clip; got batch dim {x.shape[0]}."
-            )
+    """[T,C,H,W] passes through (4D == single clip, batch 1); [1,T,C,H,W] -> [T,C,H,W].
+    """
+    if x.dim() == 5 and x.shape[0] == 1:
         x = x[0]
     if x.dim() != 4:
-        raise ValueError(f"expected [T,C,H,W] (or [1,T,C,H,W]); got {tuple(x.shape)}")
+        raise ValueError(f"expected [T,C,H,W] or [1,T,C,H,W]; got {tuple(x.shape)}")
     return x
 
 

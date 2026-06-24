@@ -177,8 +177,9 @@ def run(
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float32)
     loss_cnt = torch.zeros((), device=device, dtype=torch.float32)
-    light_sum = {k: torch.zeros((), device=device, dtype=torch.float32) for k in _LIGHT_KEYS}
-    light_cnt = torch.zeros((), device=device, dtype=torch.float32)
+    # Per-key accumulators over whole-frame AND mask-bbox light metrics.
+    light_sum = {k: torch.zeros((), device=device, dtype=torch.float32) for k in _ALL_LIGHT_KEYS}
+    light_cnt = {k: torch.zeros((), device=device, dtype=torch.float32) for k in _ALL_LIGHT_KEYS}
 
     for batch in val_loader:
         prep = prepare_batch(raw_model, batch, cfg, device, dtype)

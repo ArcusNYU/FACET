@@ -19,6 +19,7 @@ Layout:
     12. heavy metrics on best checkpoint + trainer.logger.finish()
 """
 # FIXME: 设置衰减的学习率 根据 train loss / valid loss 可视化曲线结果
+# TODO: 是否需要针对 train.py (valid) & test.py 设置 heavy_metrics_mask? 指标计算
 
 from __future__ import annotations
 
