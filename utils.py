@@ -108,6 +108,100 @@ def write_png(arr: np.ndarray, out_path: Path) -> None:
     Image.fromarray(arr).save(out_path)
 
 
+# ============================================================
+# Material readers (raw video / mask / image) + ref crop
+#
+# Shared by test.py and (later) the gradio demo: turn on-disk material into the
+# raw numpy arrays the preprocessing transforms expect.
+# ============================================================
+def read_rgb_video(path: Union[str, Path], num_frames: int) -> np.ndarray:
+    """mp4 -> [num_frames, H, W, 3] uint8 RGB (first num_frames, repeat-last pad)."""
+    from decord import VideoReader, cpu
+    vr = VideoReader(str(path), ctx=cpu(0))
+    n = len(vr)
+    idx = list(range(num_frames)) if n >= num_frames else list(range(n)) + [n - 1] * (num_frames - n)
+    return vr.get_batch(idx).asnumpy()
+
+
+def _fit_frames(arr: np.ndarray, num_frames: int) -> np.ndarray:
+    """Trim to / repeat-last-pad along axis 0 to exactly num_frames."""
+    n = arr.shape[0]
+    if n >= num_frames:
+        return arr[:num_frames]
+    pad = np.repeat(arr[-1:], num_frames - n, axis=0)
+    return np.concatenate([arr, pad], axis=0)
+
+
+def read_mask_video(path: Union[str, Path], num_frames: int) -> np.ndarray:
+    """mp4 -> [num_frames, H, W] uint8 {0,1} (luminance threshold @127)."""
+    v = read_rgb_video(path, num_frames)                 # [T,H,W,3]
+    gray = v.mean(axis=-1)                                # [T,H,W]
+    return (gray > 127).astype(np.uint8)
+
+
+def read_mask_npz(path: Union[str, Path], num_frames: int) -> np.ndarray:
+    """npz -> [num_frames, H, W] uint8 {0,1}.
+
+    Matches the training cache layout (data/.../cache writes masks.npz with key
+    "mask", shape [T,H,W] uint8); falls back to the first stored array otherwise.
+    Accepts {0,1} or {0,255} encodings and a trailing channel axis.
+    """
+    with np.load(path) as data:
+        key = "mask" if "mask" in getattr(data, "files", []) else data.files[0]
+        arr = np.asarray(data[key])
+    if arr.ndim == 4 and arr.shape[-1] == 1:             # [T,H,W,1] -> [T,H,W]
+        arr = arr[..., 0]
+    if arr.ndim != 3:
+        raise ValueError(f"mask npz {Path(path).name}: expected [T,H,W]; got {arr.shape}")
+    arr = _fit_frames(arr, num_frames)
+    return (arr > 0).astype(np.uint8)
+
+
+def read_image_rgb(path: Union[str, Path]) -> np.ndarray:
+    """png/jpg -> [H,W,3] uint8 RGB."""
+    from PIL import Image
+    return np.asarray(Image.open(path).convert("RGB"))
+
+
+def _mask_bbox(m2d: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """Tight (y0, y1, x0, x1) bbox of the foreground in a 2-D mask; None if empty."""
+    ys, xs = np.where(m2d > 0)
+    if ys.size == 0:
+        return None
+    return int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+
+
+def build_masked_ref(frame_rgb: np.ndarray, mask_2d: np.ndarray, ref_size: int,
+                     pad_ratio: float = 0.20, gray: int = 127) -> Optional[np.ndarray]:
+    """Bbox-crop the target, square-pad, resize to ref_size, fill bg with `gray`.
+
+    Returns [ref_size,ref_size,3] uint8 or None.
+    """
+    import cv2
+    H, W = mask_2d.shape
+    bb = _mask_bbox(mask_2d)
+    if bb is None:
+        return None
+    y0, y1, x0, x1 = bb
+    bh, bw = y1 - y0, x1 - x0
+    py, px = int(round(bh * pad_ratio)), int(round(bw * pad_ratio))
+    y0, x0 = max(0, y0 - py), max(0, x0 - px)
+    y1, x1 = min(H, y1 + py), min(W, x1 + px)
+    bh, bw = y1 - y0, x1 - x0
+
+    crop_rgb = frame_rgb[y0:y1, x0:x1]
+    crop_m = (mask_2d[y0:y1, x0:x1] > 0)
+    side = max(bh, bw)
+    sq = np.full((side, side, 3), gray, dtype=np.uint8)   # background pre-filled gray
+    top, left = (side - bh) // 2, (side - bw) // 2
+    region = sq[top:top + bh, left:left + bw]
+    region[crop_m] = crop_rgb[crop_m]                      # paste only the hair pixels
+    sq[top:top + bh, left:left + bw] = region
+    if side != ref_size:
+        sq = cv2.resize(sq, (ref_size, ref_size), interpolation=cv2.INTER_AREA)
+    return sq
+
+
 # ------------------------------------------------------------
 # Project root
 # ------------------------------------------------------------
