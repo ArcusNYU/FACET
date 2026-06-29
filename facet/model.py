@@ -469,7 +469,7 @@ class FACETWanModel(nn.Module):
         self._lora_replaced = replaced
 
         logger.info("[FACET] Injected LoRA into %d modules.", len(replaced))
-        # TODO: 打印lora的模块名 可以删除 仅用于debug
+        # NOTE: 打印lora的模块名 可以删除 仅用于debug
         # for name in replaced[:20]:
         #    logger.info("  - %s", name)
         # if len(replaced) > 20:
