@@ -1,0 +1,28 @@
+目前的整个项目的metrics - evaluation 部分分为 light metrics / heavy metrics
+light metrics 用于train pipeline中validation周期性计算 从而用于选出topk权重
+具体的做法是选择num samples个样本 在其上进行 full generation 得到 pred 原始视频作为gt 保存
+随后在其上进行light metrics计算 从而得到score打分 决定其在topk中的位置
+在最后训练结束后 程序会对topk权重在validation生成的视频进行heavy metrics计算 
+
+light metrics:
+- <Region>:
+    - lpips, psnr, ssim  对于视频序列的帧进行整帧测评
+    - lpips_roi, psnr_roi, ssim_roi 对于帧中mask的bbox区域进行测评 (保留 也就是老版本的 xxx_mask)
+    - lpips_mask, psnr_mask, ssim_mask 
+    - lpips_bg, psnr_bg, ssim_bg
+- <Boundary>:
+    - lpips_boundary
+- <Temporal>:
+    - tlpips_mask, tlpips_bg
+
+heavy metrics:
+- fiv
+- fvd
+- VBench
+- user study(暂不设置)
+
+
+
+
+
+

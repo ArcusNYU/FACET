@@ -23,6 +23,8 @@ train.py can reload LoRA + restore (global_step, epoch). Optimizer state is NOT
 persisted (lr is constant post-warmup; Adam moments re-warm quickly for LoRA).
 """
 
+# further possible TODO: 按mask-ratio分bucket 每个bucket内先平均 再对bucket做macro-average
+
 from __future__ import annotations
 
 import json
@@ -81,6 +83,8 @@ def find_resume(run_root, run_name: str) -> Optional[Dict[str, Any]]:
     return {"path": str(weights), "global_step": step, "epoch": epoch}
 
 
+# FIXME: 目前已经在 train.yaml中设置了针对各项指标的权重 需要传入 checkpointmanager管理器中用于计算score
+# 由于LPIPS/PSNR/SSIM的范围分布不同 在计算score之前还需要对这些指标进行归一化
 class CheckpointManager:
     """
     Owns top-K state for one run.
@@ -93,6 +97,8 @@ class CheckpointManager:
         topk           : how many best snapshots to keep.
         primary_metric : metric driving the ranking (e.g. "lpips").
     """
+    # NOTE: LPIPS is more close to human perception than PSNR/SSIM
+    # while PSNR and SSIM can constrain the structure and color consistency respectively
 
     def __init__(
         self,
@@ -175,6 +181,9 @@ class CheckpointManager:
             self.accelerator.wait_for_everyone()
             return
 
+        # FIXME: score的计算方式调整为 以 lpips_mask 作为primary_metric 并且赋予最大的权重值 
+        # 并且score计算的时候采用 robust Z-score 并且需要扩大测试样本的数量maybe
+        # NOTE: 暂时不针对score的计算设置EMA 因为validation阶段的样本选择都通过了hash进行锁定
         score = None if not metrics else metrics.get(self.primary_metric)
         if score is None:
             logger.info(

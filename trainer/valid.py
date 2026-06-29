@@ -29,8 +29,6 @@ Design notes
   are scored at every validation pass -> metric deltas reflect weight changes,
   not a moving sample set.
 """
-# FIXME: 现在validation loader的step采样有无固定? 如果没有固定的话 那么评测的loss结果也不固定
-# 需要均匀铺开 查看在不同step上的loss结果
 
 from __future__ import annotations
 
@@ -40,6 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from tqdm import tqdm
 
 import metrics
 from utils import read_mp4, video_to_uint8, write_mp4
@@ -181,7 +180,13 @@ def run(
     light_sum = {k: torch.zeros((), device=device, dtype=torch.float32) for k in _ALL_LIGHT_KEYS}
     light_cnt = {k: torch.zeros((), device=device, dtype=torch.float32) for k in _ALL_LIGHT_KEYS}
 
-    for batch in val_loader:
+    for batch in tqdm(
+        val_loader,
+        total=len(val_loader),
+        desc=f"valid@{global_step}",
+        disable=not acc.is_main_process,   # only rank-0 prints the bar
+        leave=False,
+    ):
         prep = prepare_batch(raw_model, batch, cfg, device, dtype)
         # NOTE: though valid loader is not put on acc.device(normally CUDA),
         # prepare_batch will move the batch to the correct device and dtype
@@ -257,14 +262,23 @@ def _eval_gen(
     # Per-clip deterministic init noise so improvement reflects weights, not noise.
     g = torch.Generator(device=device).manual_seed(_stable_hash(seed, str(cid)) & 0x7FFFFFFF)
 
+    # Two CFG axes (both default 1.0 = disabled). Keep them at 1.0 while
+    # cfg_training=False: the LoRA has no usable uncond/zero-ref branch yet, so
+    # scale>1 would only inject OOD noise into the metrics. Text uncond reuses the
+    # cached null "" embedding (T5 is offloaded during training).
+    cfg_scale = float(cfg.validate.get("cfg_scale", 1.0))
+    reference_guidance_scale = float(cfg.validate.get("reference_guidance_scale", 1.0))
+    neg = [raw_model.null_prompt_embed()] if cfg_scale > 1.0 else None
     video = raw_model.generate(
         prompt_embeds=[prep["prompt_embeds"][b]],
+        negative_prompt_embeds=neg,
         ref_latents=prep["ref_latents"][b : b + 1],
         src_latents=prep["src_latents"][b : b + 1],
         # [b: b+1]: preserve the batch dimension for the single-frame latents
         src_mask=prep["src_mask"][b : b + 1],
         num_inference_steps=int(cfg.validate.num_inference_steps),
-        cfg_scale=1.0,  # TODO: CFG validation (wire cfg.validate.cfg_scale once CFG lands)
+        cfg_scale=cfg_scale,
+        reference_guidance_scale=reference_guidance_scale,
         sigma_shift=float(cfg.training.sigma_shift),
         generator=g,
     )  # [1, 3, F, H, W] in [-1, 1]
@@ -302,6 +316,7 @@ def _eval_gen(
 # =============================================================================
 # end-of-run / test.py validation (heavy metrics)
 # =============================================================================
+# FIXME: 由于heavy_eval的机制中加入 VBench 所以传入该函数的变量可能包含额外的测评模型权重
 def heavy_eval(
     step_dir,
     fvd_dir=None,

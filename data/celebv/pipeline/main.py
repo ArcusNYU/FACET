@@ -1,5 +1,5 @@
 """
-CelebV-HQ Dataset Pipeline Stage 2 - main entry-point.
+CelebV-HQ Dataset Pipeline Stage 3 - main entry-point.
 
 Per clip:
   1. Resolve raw mp4: {raw_video_root}/clip/{cid}.mp4
@@ -17,6 +17,12 @@ fcntl.flock so concurrent shard appends never interleave (safe on NFS/Lustre).
 
 # TODO: 可能涉及fps重采样
 # TODO: 后期把openvid/celebv重复的 fit_pad / ref-crop / jsonl helpers 抽到 data/utils.py 共享
+# TODO: 后期使用Qwen2.5-plus来增加caption prompt生成的多样化 
+
+# NOTE: appearance + action attributes (carried from candidate.json via downloaded.json):
+#       (a) synthesized into a structured caption -> meta.json["caption"]
+#       (b) stored raw -> meta.json["appearance"] + meta.json["action"] + meta.json["hair_color"]
+#           for later per-attribute / per-action evaluation tables.
 
 
 from __future__ import annotations
@@ -47,6 +53,7 @@ from tqdm import tqdm
 from data.utils import load_cfg
 from data.celebv.pipeline.parse import SchpParser
 from data.celebv.pipeline.score import IqaScorer, VlmFilter, cv_check
+from data.celebv.pipeline.attributes import build_caption
 from utils import write_mp4
 
 
@@ -231,15 +238,26 @@ def append_jsonl(path: Path, obj: dict) -> None:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
-def read_downloaded(path: Path) -> List[Tuple[str, str]]:
-    """Read acquire.py's downloaded.json -> [(clip_id, ytb_id), ...] in file order."""
+def read_downloaded(path: Path) -> Dict[str, dict]:
+    """Read acquire.py's downloaded.json -> {clip_id: {ytb_id, appearance, action,
+    hair_color}} in file order (Python dicts preserve insertion order).
+    """
     if not path.exists():
         raise FileNotFoundError(
             f"downloaded.json not found: {path}; run data/celebv/pipeline/acquire.py first"
         )
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return [(cid, (v or {}).get("ytb_id", "")) for cid, v in data.items()]
+    out: Dict[str, dict] = {}
+    for cid, v in data.items():
+        v = v or {}
+        out[cid] = {
+            "ytb_id":     v.get("ytb_id", ""),
+            "appearance": list(v.get("appearance", [])),
+            "action":     list(v.get("action", [])),
+            "hair_color": v.get("hair_color", ""),
+        }
+    return out
 
 
 # ============================================================
@@ -336,6 +354,7 @@ def prepare_clip(
     vlm: VlmFilter,
     raw_root: Path,
     out_root: Path,
+    attrs: Optional[dict] = None,    # {appearance, hair_color} carried from downloaded.json
 ) -> dict:
     src = raw_clip_path(raw_root, cid)
     if not src.exists():
@@ -399,7 +418,12 @@ def prepare_clip(
             "bbox_hw":   r["bbox_hw"],
         })
 
-    # 5.4 meta.json (CelebV has no caption -> empty string; cache.py encodes a blank T5 emb)
+    # 5.4 meta.json. captions are synthesized from appearance + action attributes
+    appearance = list(attrs.get("appearance", [])) if attrs else []
+    action = list(attrs.get("action", [])) if attrs else []
+    hair_color = (attrs.get("hair_color", "") if attrs else "") or ""
+    caption = build_caption(appearance, action) if appearance else ""
+
     rel_path = f"clip/{cid}"
     meta = {
         "clip_id":        cid,
@@ -409,19 +433,24 @@ def prepare_clip(
         "fps":            FPS,
         "height":         H,
         "width":          W,
-        "caption":        "",
+        "caption":        caption,
         "category":       cfg_prepare.category,
+        "hair_color":     hair_color,
+        "appearance":     appearance,       # raw 40-d 0/1 vector (per-attribute tables)
+        "action":         action,           # raw 35-d 0/1 vector (per-action tables / Qwen prompts)
         "ref_candidates": ref_meta,
     }
     with open(cdir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     return {
-        "_status": "ok",
-        "clip_id": cid,
-        "ytb_id":  ytb_id,
-        "n_refs":  len(refs),
-        "path":    rel_path,
+        "_status":    "ok",
+        "clip_id":    cid,
+        "ytb_id":     ytb_id,
+        "n_refs":     len(refs),
+        "path":       rel_path,
+        "hair_color": hair_color,           
+        # hair_color lands in index.jsonl for downstream use, for example, ablation test on hair_color
     }
 
 
@@ -455,7 +484,8 @@ def main():
     failed_path = out_root / cfg.get("failed_file", "failed.jsonl")
     downloaded_path = raw_root / "downloaded.json"
 
-    clips = read_downloaded(downloaded_path)
+    downloaded = read_downloaded(downloaded_path)   # {cid: {ytb_id, appearance, action, hair_color}}
+    clips = [(cid, v["ytb_id"]) for cid, v in downloaded.items()]
     print(f"[prepare] downloaded.json clips: {len(clips)} from {downloaded_path}")
 
     # ---- load models once (resolve all paths against weight_dir) ----
@@ -498,7 +528,8 @@ def main():
     counters: Dict[str, int] = {}
     for cid, ytb in tqdm(todo, total=len(todo), desc="celebv"):
         try:
-            res = prepare_clip(cid, ytb, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
+            res = prepare_clip(cid, ytb, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root,
+                               attrs=downloaded.get(cid))
         except Exception as e:
             res = {
                 "_status": "error",

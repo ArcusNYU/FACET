@@ -33,6 +33,9 @@ Layout:
     5.  GT-conditional metrics (light incl. *_mask + heavy FID/FVD) -> mlflow
     6.  tear-down
 """
+# FIXME: NOTE: TODO: 在gradio demo推理的时候非常重要的一点是 需要将目标人物的hat也解析出来作为mask区域 
+# 否则无法实现对于人物头顶部的编辑
+# TODO: 对生成的视频计算VBench
 
 from __future__ import annotations
 
@@ -63,6 +66,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -474,11 +478,14 @@ def main() -> None:
     model.to(device) # incl. T5 text_encoder (kept on device)
     pipeline = FACETPipeline(model)
 
-    #TODO: CFG not implemented yet
+    # Two CFG axes (model.generate):
+    #   cfg_scale (text)              -> cond + uncond("") passes; needs text dropout in training.
+    #   reference_guidance_scale (ref)-> ref + zero-ref passes;   needs ref dropout in training.
     cfg_scale = float(cfg.test.get("cfg_scale", 1.0))
-    if cfg_scale != 1.0:
-        logger.warning("[test] cfg_scale=%.2f but CFG is unsupported; forcing 1.0.", cfg_scale)
-        cfg_scale = 1.0
+    reference_guidance_scale = float(cfg.test.get("reference_guidance_scale", 1.0))
+    if (cfg_scale != 1.0 or reference_guidance_scale != 1.0) and accelerator.is_main_process:
+        logger.info("[test] CFG enabled: cfg_scale=%.2f, reference_guidance_scale=%.2f.",
+                    cfg_scale, reference_guidance_scale)
 
     # -------- 4. Discover samples + rank-sharded inference loop ------------
     samples = discover_samples(src_dir, save_dir) # save_dir is for exclusion filter
@@ -500,7 +507,12 @@ def main() -> None:
     sigma_shift = float(cfg.test.get("sigma_shift", 5.0))
     fps = int(cfg.test.get("fps", 24))
 
-    for sample_dir, name in _samples:
+    for sample_dir, name in tqdm(
+        _samples,
+        total=len(_samples),
+        desc="test",
+        disable=not accelerator.is_main_process,   # only rank-0 prints the bar
+    ):
         try:
             prep = preprocess_sample(sample_dir, cfg, facet_cfg, schp=_get_schp(cfg, device))
         except Exception as e:  # noqa: BLE001 - continue processing
@@ -517,6 +529,7 @@ def main() -> None:
                 prompt=prep.prompt,
                 num_inference_steps=num_steps,
                 cfg_scale=cfg_scale,
+                reference_guidance_scale=reference_guidance_scale,
                 sigma_shift=sigma_shift,
                 seed=seed,
                 output_type="video",

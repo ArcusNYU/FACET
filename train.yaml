@@ -38,9 +38,12 @@ training:
   sigma_shift:        5.0              # 1.0 = linear sigma, 5.0 = WAN2.2 default flow shift
   loss_weighting:     "bsmnt"          # "none" | "bsmnt"  (DiffSynth BSMNT gaussian weight)
   loss_type:          "mse"
-  cfg_training:       false            # drop text/ref to train uncond branch (Phase 2+)
-  text_dropout_prob:  0.0              # only consulted when cfg_training=true
-  ref_dropout_prob:   0.0              # only consulted when cfg_training=true
+  cfg_training:       false            # MASTER SWITCH for CFG dropout.
+  text_dropout_prob:  0.10             # 0.10 ~ 0.20
+                                       # (T5-droppable) inference robustness.
+  ref_dropout_prob:   0.00             # P(blank reference -> zero latent). Raise to 0.05~0.10 only for a ref-CFG ablation.
+  # NOTE: the two draws are INDEPENDENT (a sample may drop text, ref, both, or neither).
+  #       src_latents / src_mask are NEVER dropped (inpainting hard constraint).
   cached_t5:          true             # if true, batch["t5_emb"] is used directly
   cached_tgt_latent:  true             # if true, batch["tgt_latent"] is used directly
 
@@ -87,8 +90,8 @@ train:
   log_every_steps:  20                        # train-loss cadence (single source of truth)
   val_every_steps:  500                       # val-loss cadence
   save_every_steps: 200                       # rolling _last snapshot (resume aid); LoRA ckpt is small
-  eval_every_steps: 500                       # full video generation + light metrics (PSNR/SSIM/LPIPS)
-  start_eval_steps: 2000                      # no validation/eval before this step
+  eval_every_steps: 1000                      # full video generation + light metrics (PSNR/SSIM/LPIPS)
+  start_eval_steps: 1000                      # no validation/eval before this step
 
 # -----------------------------------------------------------------------------
 # 4. run:
@@ -116,13 +119,25 @@ log:
 #    Knobs for the in-loop validation (Phase 3). primary_metric drives top-K;
 # -----------------------------------------------------------------------------
 validate:
-  num_samples:        20           # videos generated per validation pass
+  num_samples:        40           # videos generated per validation pass
   num_inference_steps: 50
-  cfg_scale:          5.0
-  # Light metrics are reported BOTH whole-frame and restricted to the edit-region
-  # mask bbox (psnr_mask / ssim_mask / lpips_mask). For editing, the *_mask
-  # variants reflect actual quality; the whole-frame ones are inflated by the
-  # copy-paste background. fid/fvd are the heavy (end-of-run) metrics.
-  metrics:            ["psnr", "ssim", "lpips", "psnr_mask", "ssim_mask", "lpips_mask", "fid", "fvd"]
-  primary_metric:     "lpips"      # "lpips_mask" for edit-quality-driven top-K
-  topk:               3
+  cfg_scale:          1.0          # cfg_training=False -> cfg_scale=1.0 | cfg_training=True -> cfg_scale=5.0
+  reference_guidance_scale: 1.0    # 1.0 ~ 3.0
+  # Light metrics: PSNR / SSIM / LPIPS / tLPIPS_err 
+  # heavy metrics: FID / FVD / VBench
+  metrics:            ["psnr", "ssim", "lpips",
+                      "psnr_mask", "ssim_mask", "lpips_mask", 
+                      "psnr_bg", "ssim_bg", "lpips_bg", 
+                      "tLPIPS_bg_err", "tLPIPS_mask_err",
+                      "lpips_boundary",
+                      "fid", "fvd", "vbench"]
+  metrics_weights:    [0.50, 0.25, 0.25,
+                      0.60, 0.25, 0.15, 
+                      0.60, 0.25, 0.15,
+                      0.50, 0.50,
+                      1.0,
+                      0.0, 0.0, 0.0] # 由于heavy metrics不用于评选 所以不需要权重
+  scores:             [frame_score, mask_score, bg_score, temporal_score, boundary_score]
+  scores_weights:     [0.10, 0.40, 0.25, 0.15, 0.10]
+  primary_metric:     "lpips_mask"   # NOTE: 该变量条目目前来讲意义不大
+  topk:               8  # 5 ~ 10

@@ -98,7 +98,7 @@ def facet_block_forward(
     freqs_base: torch.Tensor,
     freqs_src: torch.Tensor,
     freqs_ref: torch.Tensor,
-    mask_coverage: torch.Tensor,
+    mask_coverage: Optional[torch.Tensor],
     gamma: float = 1.0,
     safe_epsilon: float = 1e-3,
     bias_floor: float = -1e4,
@@ -121,7 +121,8 @@ def facet_block_forward(
         freqs_src         : [L_src,  1, head_dim/2]  full (f, h, w) RoPE  (shares base coords)
         freqs_ref         : [L_ref,  1, head_dim/2]  RoPE with w_offset; ref has 1 frame so its
                                                      f-component is naturally f_freqs[0:1] = identity.
-        mask_coverage     : [B, L_base]  in [0, 1], token-grid-aligned soft mask
+        mask_coverage     : [B, L_base]  in [0, 1], token-grid-aligned soft mask.
+                            May be None ONLY when mask_bias=False.
         gamma             : scalar bias scale
         safe_epsilon      : numerical floor inside log
         bias_floor        : clamp lower bound after log (-1e4 keeps bf16 stable)
@@ -538,7 +539,7 @@ class FACETWanModel(nn.Module):
         prompt_embeds: List[torch.Tensor],
         ref_latents: torch.Tensor,
         src_latents: torch.Tensor,
-        src_mask: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[Dict[str, torch.Tensor], torch.Tensor]:
         """
@@ -550,7 +551,8 @@ class FACETWanModel(nn.Module):
             prompt_embeds:  List length B, each [L_i, 4096]            (REQUIRED)
             ref_latents:    [B, 48, 1, h_ref, w_ref]                   (REQUIRED)
             src_latents:    [B, 48, F_lat, h, w]                       (REQUIRED)
-            src_mask:       [B, 1, F, H, W] in [0, 1]                  (REQUIRED)
+            src_mask:       [B, 1, F, H, W] in [0, 1]                  (REQUIRED iff
+                            cfg.source.mask_bias=True; optional/None otherwise)
             return_dict:    if True returns {"pred": ...}, else returns tensor
 
         Returns:
@@ -620,12 +622,6 @@ class FACETWanModel(nn.Module):
         )
 
         # ---- 7. Mask coverage (Q_base routing prior) ----
-        # [B, L_base], same flatten order as patch_embedding output.
-        mask_coverage = self.compute_mask_coverage(
-            src_mask,
-            f_lat=f_base, h_tok=h_base, w_tok=w_base,
-        )
-
         gamma = float(self.cfg.source.gamma)
         safe_epsilon = float(self.cfg.source.safe_epsilon)
         attention_mode = self.cfg.source.attention_mode
@@ -634,6 +630,20 @@ class FACETWanModel(nn.Module):
         # Query-chunk size for the base-branch attention (caps O(L^2) VRAM). Tunable
         # via cfg.source.q_chunk; <=0 disables chunking (full-length attention).
         q_chunk = int(getattr(self.cfg.source, "q_chunk", 2048)) # for A100-80GB
+
+        # mask_coverage is ONLY consumed by the mask-aware routing bias.
+        if mask_bias:
+            if src_mask is None:
+                raise ValueError(
+                    "src_mask is required when cfg.source.mask_bias=True "
+                    "(mask-aware routing bias). Provide src_mask or set mask_bias=False."
+                )
+            # [B, L_base], same flatten order as patch_embedding output.
+            mask_coverage = self.compute_mask_coverage(
+                src_mask, f_lat=f_base, h_tok=h_base, w_tok=w_base,
+            )
+        else:
+            mask_coverage = None
 
         # ---- 8. Iterate DiT blocks with custom branch attention ----
         gc_enabled = bool(self.cfg.gradient_checkpointing) and self.training
@@ -698,6 +708,7 @@ class FACETWanModel(nn.Module):
         num_frames: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
         cfg_scale: float = 1.0,
+        reference_guidance_scale: float = 1.0,
         latents: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
         sigma_shift: float = 5.0,
@@ -715,12 +726,13 @@ class FACETWanModel(nn.Module):
             1. src_video.shape[0] / src_latents.shape[0] if provided
             2. else inferred from prompt / ref shapes.
 
-        CFG (classifier-free guidance) - TODO scaffolding:
-            Currently implements text-only CFG. cfg_scale > 1.0 triggers two
-            forward passes: cond (full prompt) and uncond (negative prompt or "").
-            src + ref + mask are ALWAYS provided to both branches (the task
-            inherently requires them; the user always uploads ref + masked video).
-            TODO: reference_guidance_scale / image-CFG variants. 
+        CFG (classifier-free guidance) - two INDEPENDENT guidance axes:
+            cfg_scale (text)              : >1 amplifies the prompt; uncond = "" /
+                                            negative_prompt_embeds.
+            reference_guidance_scale (ref): >1 amplifies reference adherence; the
+                                            ref-uncond branch is a ZERO ref latent
+                                            (same sentinel as training ref dropout).
+            src + mask are ALWAYS provided to every branch (inpainting hard constraint).
 
         TODO: KV-cache for src/ref branches (cfg.source.kv_cache / cfg.reference.kv_cache) 
         """
@@ -739,10 +751,6 @@ class FACETWanModel(nn.Module):
         # ---- 1. src branch + mask ----
         if src_latents is None and src_video is None:
             raise ValueError("Either src_video or src_latents must be provided.")
-        if src_mask is None:
-            raise ValueError(
-                "src_mask is required for FACET inference (mask-aware attention bias)."
-            )
 
         # Latent grid the model will operate on.
         f_lat = latent_frames_from_num_frames(
@@ -786,24 +794,24 @@ class FACETWanModel(nn.Module):
                 )
             src_latents = self.encode_src_video(src_video)
 
-        # src_mask: must be at PIXEL resolution (same H/W/F as src_video).
-        if src_mask.ndim == 4:
-            src_mask = src_mask.unsqueeze(0)
-        if src_mask.ndim != 5:
-            raise ValueError(
-                f"src_mask should be [B, 1, F, H, W] or [1, F, H, W], "
-                f"got shape {tuple(src_mask.shape)}"
-            )
-        if src_mask.shape[1] != 1:
-            raise ValueError(
-                f"src_mask must have exactly 1 channel; got {src_mask.shape[1]}."
-            )
-        if tuple(src_mask.shape[2:]) != (num_frames, height, width):
-            raise ValueError(
-                f"src_mask spatial/temporal shape mismatch: got "
-                f"{tuple(src_mask.shape[2:])}, expected ({num_frames}, {height}, {width}). "
-                "src_mask must live in PIXEL space; compute_mask_coverage pools it down."
-            )
+        if src_mask is not None:
+            if src_mask.ndim == 4:
+                src_mask = src_mask.unsqueeze(0)
+            if src_mask.ndim != 5:
+                raise ValueError(
+                    f"src_mask should be [B, 1, F, H, W] or [1, F, H, W], "
+                    f"got shape {tuple(src_mask.shape)}"
+                )
+            if src_mask.shape[1] != 1:
+                raise ValueError(
+                    f"src_mask must have exactly 1 channel; got {src_mask.shape[1]}."
+                )
+            if tuple(src_mask.shape[2:]) != (num_frames, height, width):
+                raise ValueError(
+                    f"src_mask spatial/temporal shape mismatch: got "
+                    f"{tuple(src_mask.shape[2:])}, expected ({num_frames}, {height}, {width}). "
+                    "src_mask must live in PIXEL space; compute_mask_coverage pools it down."
+                )
 
         batch_size = src_latents.shape[0]
 
@@ -827,14 +835,16 @@ class FACETWanModel(nn.Module):
                 f"{name} batch size {t.shape[0]} cannot be broadcast to {batch_size}."
             )
 
-        src_mask = _broadcast_tensor(src_mask, "src_mask")
+        if src_mask is not None:
+            src_mask = _broadcast_tensor(src_mask, "src_mask")
 
         # ---- 2. Prompt embeddings (cond + optional uncond for text CFG) ----
         cond_context = self.encode_prompt(prompt=prompt, prompt_embeds=prompt_embeds)
         cond_context = _broadcast_list(cond_context, "prompt")
 
-        do_cfg = cfg_scale > 1.0
-        if do_cfg:
+        do_text_cfg = cfg_scale > 1.0
+        do_ref_cfg = reference_guidance_scale > 1.0
+        if do_text_cfg:
             if negative_prompt is None and negative_prompt_embeds is None:
                 negative_prompt = ""
             uncond_context = self.encode_prompt(
@@ -908,6 +918,20 @@ class FACETWanModel(nn.Module):
         )
 
         # ---- 6. Denoising loop ----
+        # ref-uncond sentinel = ZERO latent. Only allocated when ref CFG is active.
+        ref_null = torch.zeros_like(ref_latents) if do_ref_cfg else None
+
+        def _eps(ctx, ref, lat, t_batch):
+            return self.forward(
+                noisy_latents=lat,
+                timesteps=t_batch,
+                prompt_embeds=ctx,
+                ref_latents=ref,
+                src_latents=src_latents,
+                src_mask=src_mask,
+                return_dict=True,
+            )["pred"]
+
         for t in timesteps:
             # fp32 timestep avoids bf16 quantization (e.g. 999 -> 998) inside
             # sinusoidal_embedding_1d / time_embedding.
@@ -939,6 +963,30 @@ class FACETWanModel(nn.Module):
                 pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
             else:
                 pred = pred_cond
+
+            # NOTE: currently do ablation study on caption prompt only
+            # if do_text_cfg and do_ref_cfg:
+            #     # Dual CFG: InstructPix2Pix-style composition. 
+            #     # Reference is the inner (primary) guidance, text the outer. 
+            #     # Reduces exactly to either single axis when its scale -> 1.0.
+            #     e_uu = _eps(uncond_context, ref_null,    cur_latents, t_batch)  # text=null, ref=0
+            #     e_uc = _eps(uncond_context, ref_latents, cur_latents, t_batch)  # text=null, ref=R
+            #     e_cc = _eps(cond_context,   ref_latents, cur_latents, t_batch)  # text=cond, ref=R
+            #     pred = (
+            #         e_uu
+            #         + reference_guidance_scale * (e_uc - e_uu)
+            #         + cfg_scale * (e_cc - e_uc)
+            #     )
+            # elif do_text_cfg:
+            #     e_uc = _eps(uncond_context, ref_latents, cur_latents, t_batch)  # text=null, ref=R
+            #     e_cc = _eps(cond_context,   ref_latents, cur_latents, t_batch)  # text=cond, ref=R
+            #     pred = e_uc + cfg_scale * (e_cc - e_uc)
+            # elif do_ref_cfg:
+            #     e_c0 = _eps(cond_context, ref_null,    cur_latents, t_batch)    # text=cond, ref=0
+            #     e_cc = _eps(cond_context, ref_latents, cur_latents, t_batch)    # text=cond, ref=R
+            #     pred = e_c0 + reference_guidance_scale * (e_cc - e_c0)
+            # else:
+            #     pred = _eps(cond_context, ref_latents, cur_latents, t_batch)
 
             cur_latents = self._scheduler_step(
                 pred=pred, timestep=t, latents=cur_latents,
@@ -998,6 +1046,17 @@ class FACETWanModel(nn.Module):
         context = self.text_encoder(ids, mask)    # [B, L_max, 4096]
         # strip padding per sample to match WAN forward's expected list format.
         return [u[: int(l)] for u, l in zip(context, seq_lens)] # strip padding using ":int(l)"
+
+    @torch.no_grad()
+    def null_prompt_embed(self) -> torch.Tensor:
+        """
+        Cached T5 embedding of the empty prompt ""
+        """
+        cached = getattr(self, "_null_prompt_embed", None)
+        if cached is None:
+            cached = self.encode_prompt(prompt="")[0].detach()
+            self._null_prompt_embed = cached
+        return cached
 
     @torch.no_grad()
     def encode_reference_image(
@@ -1489,6 +1548,7 @@ class FACETPipeline:
         num_frames: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
         cfg_scale: float = 1.0,
+        reference_guidance_scale: float = 1.0,
         seed: Optional[int] = None,
         latents: Optional[torch.Tensor] = None,
         output_type: Optional[str] = None,
@@ -1514,6 +1574,7 @@ class FACETPipeline:
             height=height, width=width, num_frames=num_frames,
             num_inference_steps=num_inference_steps,
             cfg_scale=cfg_scale,
+            reference_guidance_scale=reference_guidance_scale,
             latents=latents,
             generator=generator,
             sigma_shift=sigma_shift,

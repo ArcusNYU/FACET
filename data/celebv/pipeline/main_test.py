@@ -49,6 +49,7 @@ from data.celebv.pipeline.main import (
     raw_clip_path,
     read_downloaded,
 )
+from data.celebv.pipeline.attributes import build_caption
 
 
 _HAS_DISPLAY = bool(os.environ.get("DISPLAY"))
@@ -309,7 +310,8 @@ def main():
     out_root = Path(cfg.out_root)
     weight_dir = Path(cfg.weight_dir)
 
-    clips = read_downloaded(raw_root / "downloaded.json")
+    downloaded = read_downloaded(raw_root / "downloaded.json")   # {cid: {ytb_id, appearance, action, hair_color}}
+    clips = [(cid, v["ytb_id"]) for cid, v in downloaded.items()]
     if args.limit > 0:
         clips = clips[:args.limit]
     print(f"[test] inspecting {len(clips)} clips from {raw_root / 'downloaded.json'}")
@@ -333,6 +335,10 @@ def main():
 
     counters: Dict[str, int] = {}
     for cid, ytb in clips:
+        a = downloaded.get(cid)
+        if a and a.get("appearance"):
+            print(f"[clip {cid}] hair_color={a.get('hair_color', '')} | "
+                  f"caption: {build_caption(a['appearance'], a.get('action'))}")
         try:
             res = prepare_clip_test(cid, ytb, cfg_top, cfg, schp, iqa, vlm, raw_root, out_root)
         except Exception as e:

@@ -1,6 +1,6 @@
 """
 CelebV-HQ downloader + raw clip extractor.
-Dataset Pipeline Stage 1 - Acquisition.
+Dataset Pipeline Stage 2 - Acquisition.
 Reference: https://github.com/celebv-text/CelebV-Text/blob/main/download_and_process.py
 
 It produces the raw_root layout:
@@ -28,9 +28,13 @@ Concurrency:
 
 Example:
     python data/celebv/pipeline/acquire.py \
-        --info data/celebv/pipeline/celebvhq_info.json \
+        --info data/celebv/pipeline/candidate.json \
         --raw-root /mnt/highspeed/users/Arcus/CELEBV \
         --limit 500 --pool 100 --workers 6 --proc-workers 12
+
+downloaded.json entries carry the stage1 attributes when present, e.g.
+    {"M2Ohb0FAaJU_1": {"ytb_id": "M2Ohb0FAaJU", "appearance": [0,1,...],
+                       "action": [0,0,...], "hair_color": "brown_hair"}}
 """
 # TODO: a detailed explanation for FINAL configuration of yt-dlp and ffmpeg
 
@@ -64,22 +68,39 @@ Clip = Tuple[str, str, Tuple[float, float], Tuple[float, float, float, float]]
 # (clip_id, ytb_id, (start_sec, end_sec), (top, bottom, left, right) normalized)
 
 
-def load_clips(info_path: Path) -> List[Clip]:
+def load_clips(info_path: Path) -> Tuple[List[Clip], Dict[str, dict]]:
     """
-    celebvhq_info.json -> clip tuples
-    Flatten celebvhq_info.json['clips'] into an ordered list of Clip tuples.
-    Order follows json insertion order, so clips sharing a ytb_id stay adjacent.
+    Parse {info_path}['clips'] -> (clip tuples, attribute side-table).
+
+    Works for candidate.json AND the full celebvhq_info.json (shared
+    {clips: {cid: {ytb_id, duration, bbox}}} schema).
+      - clips : ordered [(clip_id, ytb_id, (start,end), (top,bottom,left,right)), ...]
+      - attrs : {clip_id: {appearance, action, hair_color}} carrying whatever extra
+                fields exist, to forward into downloaded.json. candidate.json stores
+                them flat; the full info json nests them under `attributes`.
     """
     with open(info_path, "r", encoding="utf-8") as f:
         info = json.load(f)
-    out: List[Clip] = []
+    clips: List[Clip] = []
+    attrs: Dict[str, dict] = {}
     for clip_id, val in info["clips"].items():
         ytb_id = val["ytb_id"]
         time = (float(val["duration"]["start_sec"]), float(val["duration"]["end_sec"]))
         b = val["bbox"]
         bbox = (float(b["top"]), float(b["bottom"]), float(b["left"]), float(b["right"]))
-        out.append((clip_id, ytb_id, time, bbox))
-    return out
+        clips.append((clip_id, ytb_id, time, bbox))
+
+        nested = val["attributes"] if isinstance(val.get("attributes"), dict) else {}
+        entry: dict = {}
+        for key in ("appearance", "action"):
+            if key in val:
+                entry[key] = list(val[key])
+            elif key in nested:
+                entry[key] = list(nested[key])
+        if "hair_color" in val:
+            entry["hair_color"] = val["hair_color"]
+        attrs[clip_id] = entry
+    return clips, attrs
 
 
 # ============================================================
@@ -415,7 +436,7 @@ def pending_per_ytb(selected: List[Clip]) -> Dict[str, int]:
 # ============================================================
 def main():
     p = argparse.ArgumentParser("CelebV-HQ downloader + raw clip extractor")
-    p.add_argument("--info", default="data/celebv/pipeline/celebvhq_info.json")
+    p.add_argument("--info", default="data/celebv/pipeline/candidate.json")
     p.add_argument("--raw-root", default="/mnt/highspeed/users/Arcus/CELEBV_DATA")
     p.add_argument("--limit", type=int, default=200,
                    help="clips to acquire this run (-1 = all remaining)")
@@ -455,7 +476,7 @@ def main():
     clip_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    clips = load_clips(Path(args.info))
+    clips, clip_attrs = load_clips(Path(args.info))   # clips + {cid: {appearance, action, hair_color}}
     downloaded = load_record(downloaded_path)
     failed = load_record(failed_path)
     print(f"[celebv] total clips in info.json : {len(clips)}")
@@ -520,7 +541,7 @@ def main():
                 except Exception as e:  # noqa: BLE001
                     ok, reason = False, f"exc:{type(e).__name__}"
                 if ok:
-                    downloaded[cid] = {"ytb_id": ytb}
+                    downloaded[cid] = {"ytb_id": ytb, **clip_attrs.get(cid, {})}
                     failed.pop(cid, None)
                     n_ok += 1
                 else:

@@ -42,6 +42,12 @@ __all__ = [
 ValueRange = Tuple[float, float]
 _DEFAULT_RANGE: ValueRange = (-1.0, 1.0)
 
+# FIXME: 添加 light_metrics_bg? 做法依然是套壳psnr/ssim/lpips 但是在valid.py&ckpt.py中将light_metrics改为使用light_metrics_bg
+# TODO: 在light_metrics中加入temporal proxy - tLPIPS / boundary proxy (/ subject consistency proxy)
+# 即视频任务必须添加 目前还不确定针对 temporal proxy 是选择 rLPIPS_err还是选择 temporal_l1 需要选择两者中相对更好的
+# boundary proxy目前还不清楚具体做法 但可用的为 LPIPS_boundary / L1_boundary / gradient_boundary_err
+# TODO: 在heavy_metrics中加入VBench / VACE-like metrics
+
 
 # =============================================================================
 # shape / range normalisation helpers

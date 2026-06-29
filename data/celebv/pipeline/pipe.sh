@@ -9,14 +9,25 @@ set -euo pipefail
 CFG=./data/celebv/config.yaml
 
 # ============================================================
-# Stage 1: acquire (download + trim + bbox-crop) -> raw_root/clip/{cid}.mp4
+# Stage 1: filter (hair-color-balanced subset) -> candidate.json
 # ============================================================
-python data/celebv/pipeline/acquire.py \
-    --limit 500 --pool 100 --workers 3
+# Reads the full celebvhq_info.json ONCE and writes a balanced 10k-clip manifest.
+# Run once; re-run with --force to regenerate (changes which clips get downloaded).
+python -m data.celebv.pipeline.filter \
+    # --info data/celebv/pipeline/celebvhq_info.json \
+    # --out data/celebv/pipeline/candidate.json \
+    # --total 10000 --seed 42
+
+# ============================================================
+# Stage 2: acquire (download + trim + bbox-crop) -> raw_root/clip/{cid}.mp4
+# ============================================================
+python -m data.celebv.pipeline.acquire \
+    --limit 500 --pool 100 --workers 3 \
+    # --info data/celebv/pipeline/candidate.json \
     # --proxy ... --cookies ...
 
 # ============================================================
-# Stage 2: per-clip preprocessing -> dataset_root/clip/{cid}/...
+# Stage 3: per-clip preprocessing -> dataset_root/clip/{cid}/...
 # ============================================================
 # Single worker:
 python -m data.celebv.pipeline.main --config "$CFG"
@@ -29,11 +40,11 @@ python -m data.celebv.pipeline.main --config "$CFG"
 # Re-attempt previously failed clips (e.g. after fixing a transient issue):
 # python -m data.celebv.pipeline.main --config "$CFG" --retry-failed
 #
-# Stage 2 smoke test:
-# python -m data.celebv.pipeline.main --config "$CFG" --limit 50
+# Stage 3 smoke test (verbose ref-selection + caption preview, writes no outputs):
+# python -m data.celebv.pipeline.main_test --config "$CFG" --limit 50
 
 # ============================================================
-# Stage 3: T5 caption + Wan VAE video latent cache -> dataset_root/latents/{cid}.pt
+# Stage 4: T5 caption + Wan VAE video latent cache -> dataset_root/latents/{cid}.pt
 # ============================================================
 # Single GPU:
 python -m data.celebv.pipeline.cache --config "$CFG"
@@ -49,6 +60,6 @@ python -m data.celebv.pipeline.cache --config "$CFG"
 # wait
 
 # ============================================================
-# Stage 4: train/val split -> data/celebv/splits/{train,val}.jsonl
+# Stage 5: train/val split (leakage-safe group-by-ytb) -> data/celebv/splits/{train,val}.jsonl
 # ============================================================
-# python -m data.celebv.split --config "$CFG" --val-ratio 0.1
+python -m data.celebv.split --config "$CFG" --val-ratio 0.1

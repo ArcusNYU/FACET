@@ -19,7 +19,7 @@ Layout:
     12. heavy metrics on best checkpoint + trainer.logger.finish()
 """
 # FIXME: 设置衰减的学习率 根据 train loss / valid loss 可视化曲线结果
-# TODO: 是否需要针对 train.py (valid) & test.py 设置 heavy_metrics_mask? 指标计算
+# TODO: model.py 模型推推理(与训练)时的cache构建
 
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 # =============================================================================
 # 3. batch preparation (OmniControl-specific data path)
 # =============================================================================
-def prepare_batch(raw_model, batch, cfg, device, dtype):
+def prepare_batch(raw_model, batch, cfg, device, dtype, *, gpu_gen=None, cfg_dropout=False):
     """
     Turn a collated dataloader batch into FACETWanModel.forward kwargs.
 
@@ -100,6 +100,13 @@ def prepare_batch(raw_model, batch, cfg, device, dtype):
         src_latents   : [B, 48, F_lat, h, w]
         src_mask      : [B, 1, T, H, W]
         tgt_latents   : [B, 48, F_lat, h, w]
+
+    CFG dropout (kwargs):
+        gpu_gen     : torch.Generator for the per-sample dropout coin flips. 
+                      Required iff cfg_dropout.
+        cfg_dropout : enable classifier-free-guidance dropout.
+                      src_latents / src_mask are the task's hard constraint and are
+                      NEVER dropped.
     """
     # a. src branch: [B,T,3,H,W] -> [B,3,T,H,W], VAE-encode (encode moves to device).
     src_video = batch["src_video"].permute(0, 2, 1, 3, 4)            # [B,3,T,H,W]
@@ -136,8 +143,27 @@ def prepare_batch(raw_model, batch, cfg, device, dtype):
     else:
         prompt_embeds = raw_model.encode_prompt(batch["caption"])
 
-    # f. (Phase 2+) CFG dropout fork: when cfg.training.cfg_training, randomly
-    #    blank prompt_embeds / ref_latents here. Disabled for now.
+    # f. CFG dropout (training only): 
+    #    independently blank the text and/or reference condition per sample:
+    #      - text drop  -> null "" T5 embedding (matches generate()'s negative="" path)
+    #      - ref  drop  -> zero ref latent (the image-CFG unconditional sentinel)
+    #    src_latents / src_mask are NEVER dropped: inpainting hard constraint.
+    if cfg_dropout:
+        B = ref_latents.shape[0]
+        text_p = float(cfg.training.text_dropout_prob)
+        ref_p = float(cfg.training.ref_dropout_prob)
+        if text_p > 0.0 or ref_p > 0.0:
+            # [B, 2]: column 0 = text prob, column 1 = ref prob (independent draws).
+            prob = torch.rand(B, 2, generator=gpu_gen, device=device)
+            if text_p > 0.0:
+                null_text = raw_model.null_prompt_embed().to(device=device, dtype=dtype)
+                for i in range(B):
+                    if float(prob[i, 0]) < text_p:
+                        prompt_embeds[i] = null_text
+            if ref_p > 0.0:
+                for i in range(B):
+                    if float(prob[i, 1]) < ref_p:
+                        ref_latents[i] = torch.zeros_like(ref_latents[i])
 
     return {
         "prompt_embeds": prompt_embeds,   # List[[L_i, 4096]]
@@ -218,7 +244,7 @@ def main() -> None:
     )
 
     # -------- 8. Objective + checkpoint manager + grad-clip view -----------
-    raw_model = accelerator.unwrap_model(model)             # for VAE/T5 encode calls
+    raw_model = accelerator.unwrap_model(model) # for VAE/T5 encode calls
 
     # Offload T5 when captions are pre-cached.
     if cfg.training.cached_t5 and raw_model.text_encoder is not None:
@@ -228,7 +254,7 @@ def main() -> None:
         if accelerator.is_main_process:
             logger.info("[train] cached_t5=True -> T5 text_encoder offloaded to CPU (freed ~11GB).")
 
-    flow = trainer.loss.FlowMatch(cfg.training)             # builds BSMNT table once
+    flow = trainer.loss.FlowMatch(cfg.training) # builds BSMNT table once
     ckpt_mgr = trainer.ckpt.CheckpointManager(
         accelerator=accelerator,
         run_name=ctx.run_name,
@@ -282,8 +308,11 @@ def main() -> None:
 
         for batch in train_loader:
             with accelerator.accumulate(model):
-                # a. data batch -> forward kwargs
-                prep = prepare_batch(raw_model, batch, cfg, ctx.device, ctx.dtype)
+                # a. data batch -> forward kwargs (CFG dropout active only in training)
+                prep = prepare_batch(
+                    raw_model, batch, cfg, ctx.device, ctx.dtype,
+                    gpu_gen=ctx.gpu_gen, cfg_dropout=bool(cfg.training.cfg_training),
+                )
                 tgt_latents = prep["tgt_latents"]
                 B = tgt_latents.shape[0]
 
@@ -351,10 +380,12 @@ def main() -> None:
     ckpt_mgr.save_last(model, global_step, epoch)
 
     # -------- 12. Final Evaluation -------------------------------------------
+    # further TODO: 对结果计算VBench
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         # NOTE: heavy metrics are only calculated on main process since it requires gathering all results
         # reason: FIV / FVD is based on global covariance
+        # TODO: 对top-k权重计算heavy metrics 而非仅仅对best checkpoint计算
         best = ckpt_mgr.best()
         if best is not None:
             best_step = int(best["step"])
