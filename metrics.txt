@@ -1,13 +1,13 @@
-目前的整个项目的metrics - evaluation 部分分为 light metrics / heavy metrics
+概述: 目前的整个项目的metrics - evaluation 部分分为 light metrics / heavy metrics
 light metrics 用于train pipeline中validation周期性计算 从而用于选出topk权重
 具体的做法是选择num samples个样本 在其上进行 full generation 得到 pred 原始视频作为gt 保存
 随后在其上进行light metrics计算 从而得到score打分 决定其在topk中的位置
 在最后训练结束后 程序会对topk权重在validation生成的视频进行heavy metrics计算 
 
-light metrics:
+light metrics预览: (phase1)
 - <Region>:
     - lpips, psnr, ssim  对于视频序列的帧进行整帧测评
-    - lpips_roi, psnr_roi, ssim_roi 对于帧中mask的bbox区域进行测评 (保留 也就是老版本的 xxx_mask)
+    # - lpips_roi, psnr_roi, ssim_roi 对于帧中mask的bbox区域进行测评 (保留 也就是老版本的 xxx_mask 但是不用于lighr metrics组计算)
     - lpips_mask, psnr_mask, ssim_mask 
     - lpips_bg, psnr_bg, ssim_bg
 - <Boundary>:
@@ -15,11 +15,267 @@ light metrics:
 - <Temporal>:
     - tlpips_mask, tlpips_bg
 
-heavy metrics:
-- fiv
-- fvd
-- VBench
+heavy metrics预览:
+- fiv (已设置)
+- fvd (已设置)
+- VBench (phase2设置)
 - user study(暂不设置)
+
+在metrics.py中 保留 lpips psnr ssim 原函数 不仅作为frame整帧指标计算的函数
+同时作为lm roi的接口 跟现在的 xxx_mask的操作一样
+不过现在的 xxx_mask 需要改成 xxx_roi 因为现在的并不是真正的 xxx_mask
+
+1. 所以现在针对light metrics需要的函数:
+(下面提到的权重已经在 train.yaml validate部分)
+
+a. metrics_frame: 
+即现在的'light metrics' 需要改名为 metrics_frame 计算的是整帧的指标
+后续light metrics函数返回的结果会被加权用于计算 'full_score'
+frame_score = 0.5LPIPS + 0.25SSIM + 0.25PSNR (这个公式里的 LPIPS / SSIM / PSNR 都是归一化之后的'数值')
+
+b. metrics_roi:
+函数需要返回 lpips roi, psnr roi, ssim roi
+然后 roi_score = 0.60lpips roi + 0.25ssim roi + 0.15psnr roi(公式里的也是已经归一化之后的数值)
+roi这一类的metrics在本项目中只做函数库的书写 不做light metrics组的加权计算 也就是根本不会被使用
+
+c. metrics_mask:
+函数需要返回 lpips mask, psnr mask, ssim mask
+然后 mask_score = 0.60lpips mask + 0.25ssim mask + 0.15psnr mask
+
+d. metrics_bg:
+函数需要返回 lpips bg, psnr bg, ssim bg:
+然后 bg_score = 0.60lpips bg + 0.25ssim bg + 0.15psnr bg
+
+e. lpips_boundary
+boundary_score = lpips_boundary
+
+f. metrics_temporal
+函数需要返回 tlpips_err_mask, tlpips_err_bg, tlpips_err_boundary(变量名就叫做tlpips_err_bd)
+temporal_score = 0.4tlpips_err_mask + 0.4tlpips_err_bg+0.2tlpips_err_bd
+
+最后 score = 0.40mask_score + 0.25bg_score + 0.15temporal_score + 0.10background_score + 0.10frame_score
+
+在上述过程中  full reference spatial LPIPS map 
+可以由一个单独的函数计算 然后这个计算结果为:
+D_t = LPIPS_{spatial}(\bar{I_t}, I_t)
+该计算结果可以被用于计算: lpips_mask, lpips_bg, lpips_boundary
+该内容会在后续详细流程中提到
+
+
+### 上述提到的指标的具体计算流程如下: ###
+
+整个metrics.py可以大致这么组织:
+Implement a PyTorch evaluation module for video editing metrics.
+
+Inputs:
+- pred: FloatTensor [T, 3, H, W], RGB in [0, 1]
+- ref:  FloatTensor [T, 3, H, W], RGB in [0, 1]
+- mask: FloatTensor [T, 1, H, W], binary editing mask, 1=edited foreground, 0=background
+- H=480, W=832 for current Wan2.2-TI2V-5B 480p setting.
+
+Default hyperparameters:
+- r_in = 8
+- r_out = 16
+- r_bg = 32
+- bbox_pad = 32
+- eps = 1e-8
+- psnr_cap_db = 60.0 for normalized scoring only, not necessarily for raw reporting.
+
+Preprocessing:
+1. Clamp pred/ref to [0, 1].
+2. Resize mask to [H, W] if needed using nearest interpolation.
+3. Binarize mask by mask = (mask > 0.5).float().
+4. All metrics must run under torch.no_grad().
+5. LPIPS model:
+   lpips_fn = lpips.LPIPS(net="alex", spatial=True).eval().to(device)
+   Call lpips_fn(x, y, normalize=True) when x,y are in [0,1].
+
+Morphology:
+- Implement dilate(mask, r) and erode(mask, r).
+- Prefer disk/ellipse kernel if using cv2.
+- If pure PyTorch, max_pool2d square kernel is acceptable but record kernel_type="square".
+- boundary ring:
+    ring = dilate(mask, r_out) - erode(mask, r_in)
+    ring = ring.clamp(0, 1)
+- background:
+    bg = 1 - dilate(mask, r_bg)
+    bg = bg.clamp(0, 1)
+
+Weighted pooling:
+- Implement weighted_mean(value_map, weight):
+    resize weight to value_map spatial size with nearest interpolation if needed.
+    return (value_map * weight).sum() / (weight.sum() + eps)
+- If denominator is too small, skip that frame/video for that metric and record valid_count.
+
+Spatial maps:
+1. squared error map:
+    err_map = ((pred - ref) ** 2).mean(dim=1, keepdim=True)  # [T,1,H,W]
+2. SSIM map:
+    implement SSIMMap(pred, ref) using Gaussian window size=11, sigma=1.5,
+    C1=(0.01)^2, C2=(0.03)^2, RGB channel-wise then average channel -> [T,1,H,W].
+3. LPIPS map: (调用 lpips_fn)
+    for each frame or minibatch:
+      lpips_map = lpips_fn(pred_batch, ref_batch, normalize=True)  # [B,1,H,W]
+
+metrics_mask:
+- weight = mask
+- mse_mask = weighted_mean(err_map, mask)
+- psnr_mask = 10 * log10(1.0 / (mse_mask + eps))
+- ssim_mask = weighted_mean(ssim_map, mask)
+- lpips_mask = weighted_mean(lpips_map, mask)
+
+metrics_bg:
+- weight = bg
+- mse_bg = weighted_mean(err_map, bg)
+- psnr_bg = 10 * log10(1.0 / (mse_bg + eps))
+- ssim_bg = weighted_mean(ssim_map, bg)
+- lpips_bg = weighted_mean(lpips_map, bg)
+
+lpips_boundary:
+- weight = ring
+- lpips_boundary = weighted_mean(lpips_map, ring)
+
+metrics_temporal:
+For t = 1..T-1:
+  D_gen = lpips_fn(pred[t:t+1], pred[t-1:t], normalize=True)
+  D_ref = lpips_fn(ref[t:t+1], ref[t-1:t], normalize=True)
+  A = abs(D_gen - D_ref)
+
+  W_mask = max(mask[t], mask[t-1])
+  W_bg = bg[t] * bg[t-1]
+  W_boundary = max(ring[t], ring[t-1])
+
+  accumulate:
+    tlpips_mask_num += sum(A * W_mask)
+    tlpips_mask_den += sum(W_mask)
+    tlpips_bg_num += sum(A * W_bg)
+    tlpips_bg_den += sum(W_bg)
+    tlpips_boundary_num += sum(A * W_boundary)
+    tlpips_boundary_den += sum(W_boundary)
+
+Final:
+  tlpips_mask_err = tlpips_mask_num / (tlpips_mask_den + eps)
+  tlpips_bg_err = tlpips_bg_num / (tlpips_bg_den + eps)
+  tlpips_bd_err = tlpips_boundary_num / (tlpips_boundary_den + eps)
+
+Aggregation:
+- Compute metrics per video first, then average over videos.
+- Do not pool all pixels across the whole dataset directly, otherwise large-mask or long videos dominate.
+- Return both raw per-video metrics and dataset mean.
+
+以上是总体的计算流程 其中某些部分需要展开详细说明:
+
+A. region-weighted pooling通用形式:
+对于任意spatial map Q_t(x, y) 对应的区域权重 W_t(x, y)
+\langle Q\rangle_{W}
+=\frac{\sum_t\sum_{x,y}W_t(x,y)Q_t(x,y)}
+{\sum_t\sum_{x,y}W_t(x,y)+\epsilon}
+例如其中 mask metric中 W_t 就是 M_t
+background_metric中 W_t 就是 B_t boundary_metric中 W_t = R_t
+
+B. lpips_boundary在这里特别写一下流程:
+For each frame t:
+  1. Read GT frame I_t, generated frame Ihat_t, binary mask M_t.
+  2. Build boundary ring:
+       R_t = dilate(M_t, r_out) - erode(M_t, r_in)
+  3. If R_t is empty, skip this frame.
+  4. Compute bbox of R_t and add padding p.
+  5. Crop:
+       gt_crop   = I_t[box]
+       pred_crop = Ihat_t[box]
+       ring_crop = R_t[box]
+  6. Compute spatial LPIPS map:
+       D = LPIPS_spatial(pred_crop, gt_crop)
+  7. Resize ring_crop to D resolution if necessary.
+  8. Accumulate:
+       numerator += sum(D * ring_crop)
+       denominator += sum(ring_crop)
+Final:
+  lpips_boundary = numerator / (denominator + eps)
+在这里设置 r_in = 8; r_out=16; r_bg=32; bbox_pad=32
+原因在于 r_in=8能够覆盖 mask 内侧靠近边界的 foreground hair / clothing edge / texture transition
+r_out =16 覆盖 mask 外侧的 halo、bleeding、seam、background contamination
+r_bg=32：真正的 background metric 不应惩罚 boundary blending，所以背景从 mask 外至少一个 Wan token-scale 附近开始算
+因为在WAN2.2中 图像的降采样率 vae + patchify 之后 是32倍
+r_out > r_in 是合理的，因为编辑模型更容易在 mask 外侧产生 halo / leakage
+目前的mask来自parsing / segmentation，我建议不要太窄，否则 boundary LPIPS 会过度关注 1–2 px 的 mask quantization error，而不是模型真实的 boundary artifact
+上述提到的超参数直接写在 metrics.py里面 不需要注册到 train.yaml中 
+
+C. psnr bg / mask:
+先定义per-pixel MSE map:
+Et(x,y)=
+\frac{1}{3} \sum_{c=1}^{3} \left( \hat I_t(c,x,y)-I_t(c,x,y)\right)^2
+然后 \mathrm{MSE}_{M} = \langle E\rangle_{M}
+{PSNR}_{M} = 10\log_{10} \frac{1}{\mathrm{MSE}_{M}+\epsilon}
+background同理:
+\mathrm{MSE}_{bg} = \langle E\rangle_{B}
+{PSNR}_{bg} = 10\log_{10} \frac{1}{\mathrm{MSE}_{bg}+\epsilon}
+
+D. ssim bg / mask:
+标准做法是先算 SSIM map:
+St​(x,y)=SSIMMap(I^t​,It​)(x,y)
+然后mask加权: SSIM_M​=⟨S⟩M
+对于background: \mathrm{SSIM}_{bg} = \langle S\rangle_{B}
+window_size = 11
+sigma = 1.5
+K1 = 0.01
+K2 = 0.03
+L = 1.0
+C1 = (K1 * L)^2
+C2 = (K2 * L)^2
+得到 per-channel SSIM map 后，先对 RGB channel 平均成：
+ssim_map.shape == [T, 1, H, W]
+再做 region-weighted pooling
+
+E. tLPIPS_mask_err / tLPIPS_bg_err / tLPIPS_boundary_err
+先计算region-aware temporal LPIPS error
+对于相邻帧 t−1,tt-1,tt−1,t，定义生成视频的 temporal LPIPS map：
+D^{gen}_t(x,y) =
+\mathrm{LPIPS}_{spatial} \left( \hat I_t, \hat I_{t-1} \right)(x,y)
+定义 GT 视频的 temporal LPIPS map：
+D^{gt}_t(x,y) =
+\mathrm{LPIPS}_{spatial} \left( I_t, I_{t-1} \right)(x,y)
+然后 temporal error field：
+A_t(x,y) = \left| D^{gen}_t(x,y)-D^{gt}_t(x,y) \right|
+e1. mask temporal weight
+mask 区域用相邻两帧 union：
+Wt^{M,temp}=Mt∨Mt−1​
+于是：
+{tLPIPS\text{-}Err}_{M}
+= \frac{\sum_{t=2}^{T}\sum_{x,y} W^{M,temp}_t(x,y)A_t(x,y)}
+{\sum_{t=2}^{T}\sum_{x,y}W^{M,temp}_t(x,y)+\epsilon}​
+e2. background temporal weight
+background 区域用两帧共同 background：
+Wtbg,temp=Bt∧Bt−1​
+于是：
+tLPIPS-Errbg=∑t=2T∑x,yWtbg,temp(x,y)At(x,y)∑t=2T∑x,yWtbg,temp(x,y)+ϵ\mathrm
+{tLPIPS\text{-}Err}_{bg}
+=\frac{\sum_{t=2}^{T}\sum_{x,y}W^{bg,temp}_t(x,y)A_t(x,y)}
+{\sum_{t=2}^{T}\sum_{x,y} W^{bg,temp}_t(x,y)+\epsilon}​
+e3. boundary temporal weight
+先每帧算 ring：
+Rt=Dilate(Mt,rout)−Erode(Mt,rin)
+然后 temporal boundary weight 用相邻两帧 ring union：
+W^{\partial,temp}_t = R_t \lor R_{t-1}​
+于是：
+{tLPIPS\text{-}Err}_{\partial M}
+= \frac{ \sum_{t=2}^{T}\sum_{x,y} W^{\partial,temp}_t(x,y)A_t(x,y)}
+{ \sum_{t=2}^{T}\sum_{x,y} W^{\partial,temp}_t(x,y)+\epsilon }
+​
+这三个 temporal metrics 全部是 lower is better
+
+
+
+2. heavy metrics: 添加VBench
+在paper中明确说明为 VBench-selected metrics 因为在跑自己的数据集下 VBench只支持部分指标:
+subject_consistency / background_consistency / motion_smoothness / dynamic_degree / aesthetic_quality / imaging quality
+分数计算加权方式在VBench/scripts/constant.py中
+
+
+
+
+
+
 
 
 
